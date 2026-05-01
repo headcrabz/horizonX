@@ -1,0 +1,91 @@
+id: autotrain-001
+name: End-to-end ML training pipeline (churn prediction)
+description: |
+  Build a complete ML pipeline from raw data to deployed model with all
+  intermediate validators (data quality, AUC threshold, deploy smoke test).
+horizon_class: very_long
+estimated_duration_hours: [4.0, 12.0]
+tags: [ml, training, sequential, sklearn]
+
+prompt: |
+  Build a churn prediction pipeline for the dataset in data/customers.csv.
+
+  REQUIREMENTS:
+    1. Verify data quality (schema, missing values, label leakage).
+    2. Engineer at least 10 features with documented rationale.
+    3. Train 3 candidate models (logistic regression, random forest, XGBoost).
+    4. Hyperparameter tune the best candidate.
+    5. Final eval on held-out test set: report AUC, calibration, fairness slices.
+    6. Package the model and smoke-test a /predict endpoint.
+
+  CONSTRAINTS:
+    - All randomness must be seeded for reproducibility.
+    - No data leakage (target_t-1 is excluded from features).
+    - val AUC must beat 0.75 baseline; final model AUC ≥ 0.78 on test.
+    - Save artifacts: model.pkl, metrics.json, feature_importance.json, eval_report.md.
+
+strategy:
+  kind: sequential
+  config:
+    target_subgoals: [6, 12]
+    max_attempts_per_goal: 3
+    git_commit_each_session: true
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 8000
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
+
+environment:
+  type: local
+  setup_commands:
+    - "python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt"
+
+milestone_validators:
+  - id: data_quality
+    type: shell
+    runs: after_every_session
+    config:
+      command: |
+        if [ -f check_data.py ]; then python check_data.py; else echo "no check yet"; fi
+      timeout_seconds: 60
+    on_fail: pause_for_hitl
+  - id: no_test_deletion
+    type: shell
+    runs: after_every_session
+    config:
+      command: "test $(find tests -name 'test_*.py' 2>/dev/null | wc -l) -ge 1 || (echo 'tests missing'; exit 1)"
+    on_fail: pause_for_hitl
+  - id: model_auc_threshold
+    type: metric
+    runs: every_n_sessions
+    n: 3
+    config:
+      command: "python -c 'import json; print(json.load(open(\"metrics.json\")).get(\"val_auc\", 0))' 2>/dev/null || echo 0"
+      threshold: 0.75
+      direction: ge
+    on_fail: continue
+
+handoff_files: [progress.md, goals.json, decisions.jsonl, failures.jsonl, summary.md]
+
+summarizer:
+  enabled: true
+  trigger_at_context_pct: 70
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [validator_paused, spin_detected, subgoal_max_attempts]
+  notification_type: console
+
+resources:
+  max_total_hours: 12
+  max_total_tokens: 5000000
+  max_total_usd: 50
+  max_steps_per_session: 60
+  max_minutes_per_session: 25

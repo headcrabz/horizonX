@@ -1,0 +1,91 @@
+id: data-analysis-001
+name: Comprehensive data analysis project
+description: |
+  Long-horizon data analysis: EDA → hypothesis formation → testing → modeling
+  → synthesis → executive-ready report. Demonstrates HorizonX for data-science workflows.
+horizon_class: long
+estimated_duration_hours: [2.0, 8.0]
+tags: [data_science, eda, sequential, jupyter]
+
+prompt: |
+  Conduct a comprehensive analysis of `data/` and produce an executive report.
+
+  REQUIRED STAGES:
+    1. EDA — understand schema, distributions, missingness, correlations.
+       Produce ≥3 informative visualizations with documented rationale.
+    2. Hypotheses — based on EDA, formulate ≥3 testable hypotheses about the data.
+    3. Tests — design and run appropriate statistical tests for each hypothesis,
+       reporting effect sizes and confidence intervals (not just p-values).
+    4. Model — if a predictive task is appropriate, train a simple interpretable
+       model and analyze feature importance.
+    5. Synthesis — write `report.md` with: Executive summary, Methodology,
+       Findings (claim → evidence pairs), Caveats, Recommendations.
+    6. Deliverable — `analysis.ipynb` executes top-to-bottom without errors.
+
+  CONSTRAINTS:
+    - Every claim in report.md must reference specific cell output or visualization.
+    - All randomness seeded.
+    - No "p < 0.05 therefore true" — use effect sizes, CIs, multiple-comparison correction.
+
+strategy:
+  kind: sequential
+  config:
+    target_subgoals: [6, 10]
+    max_attempts_per_goal: 3
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 8000
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
+
+environment:
+  type: local
+
+milestone_validators:
+  - id: notebook_executes
+    type: shell
+    runs: every_n_sessions
+    n: 2
+    config:
+      command: "jupyter nbconvert --to notebook --execute analysis.ipynb --output _check.ipynb 2>&1 | tail -20 && rm -f _check.ipynb"
+      timeout_seconds: 300
+    on_fail: pause_for_hitl
+  - id: min_viz
+    type: shell
+    runs: after_every_session
+    config:
+      command: "grep -c 'plt\\.show\\|fig\\.show\\|ax\\.set' analysis.ipynb 2>/dev/null || echo 0"
+    on_fail: continue
+  - id: report_sections
+    type: shell
+    runs: every_n_sessions
+    n: 3
+    config:
+      command: |
+        REQUIRED='Executive summary|Methodology|Findings|Caveats|Recommendations'
+        if [ -f report.md ]; then
+          MISSING=$(echo "$REQUIRED" | tr '|' '\n' | while read s; do grep -q "$s" report.md || echo "MISS: $s"; done)
+          if [ -n "$MISSING" ]; then echo "$MISSING"; exit 1; fi
+        else echo "no report yet"; exit 1; fi
+    on_fail: continue
+
+handoff_files: [progress.md, goals.json, decisions.jsonl, failures.jsonl, summary.md]
+
+summarizer: { enabled: true }
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [validator_paused, spin_detected]
+
+resources:
+  max_total_hours: 8
+  max_total_tokens: 4000000
+  max_total_usd: 40
+  max_steps_per_session: 60
+  max_minutes_per_session: 25

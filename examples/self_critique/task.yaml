@@ -1,0 +1,87 @@
+id: self-critique-refactor-001
+name: Self-critiquing Python module refactor
+description: |
+  Iteratively refactor a Python module using a Implementer → Critic loop.
+  The agent improves the code until the LLM critic scores it >= 0.85 or
+  5 rounds are exhausted. Novel use case: code quality uplift without
+  human-in-the-loop on every iteration.
+horizon_class: medium
+estimated_duration_hours: [0.5, 2.0]
+tags: [coding, self_critique, refactor, iterative, quality]
+
+prompt: |
+  Refactor `src/data_processor.py` to:
+  1. Replace all imperative loops with idiomatic pandas/numpy operations
+  2. Add type annotations throughout (mypy --strict must pass)
+  3. Extract reusable helpers into `src/utils.py` with docstrings
+  4. Keep 100% test coverage for existing tests in `tests/test_processor.py`
+  5. Reduce cyclomatic complexity of each function to <= 5 (use `radon cc`)
+
+  Quality bar: `mypy --strict src/` must exit 0; `pytest tests/ -q` must exit 0;
+  `radon cc src/ -n C` must produce no output (no high-complexity functions).
+
+strategy:
+  kind: self_critique
+  config:
+    max_rounds: 5
+    accept_threshold: 0.85
+    critic_type: llm
+    critic_model: claude-haiku-4-5
+    write_progress: true
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 8000
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
+  extra:
+    permission_mode: bypassPermissions
+
+environment:
+  type: local
+  setup_commands:
+    - "pip install mypy radon pytest pandas numpy --quiet"
+
+milestone_validators:
+  - id: type_check
+    type: shell
+    runs: final
+    config:
+      command: "mypy --strict src/ --ignore-missing-imports || true"
+      timeout_seconds: 60
+    on_fail: pause_for_hitl
+  - id: tests_pass
+    type: test_suite
+    runs: final
+    config:
+      command: "pytest tests/ -q"
+      test_dir: tests/
+      test_glob: "test_*.py"
+      min_test_count: 1
+      min_assertion_count: 3
+      min_exec_seconds: 0.1
+    on_fail: pause_for_hitl
+
+handoff_files: [progress.md, critique.md, summary.md]
+
+summarizer:
+  enabled: true
+  trigger_at_context_pct: 70
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  edit_revert_enabled: true
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [spin_detected, validator_paused]
+  notification_type: console
+
+resources:
+  max_total_hours: 2
+  max_total_tokens: 2000000
+  max_total_usd: 20
+  max_steps_per_session: 80
+  max_minutes_per_session: 25

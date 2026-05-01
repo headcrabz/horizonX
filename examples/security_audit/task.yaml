@@ -1,0 +1,88 @@
+id: security-audit-tree-001
+name: Security hardening via tree-of-trials
+description: |
+  Run N parallel agents each attempting a different hardening approach on the same
+  codebase (SAST fixes, dependency updates, secrets scanning, OWASP remediation).
+  The branch with the best security score wins and is merged back.
+  Novel use case: parallel speculative remediation — the human reviews one clean diff
+  instead of N half-baked PRs.
+horizon_class: medium
+estimated_duration_hours: [2.0, 6.0]
+tags: [security, sast, tree_of_trials, parallel, hardening]
+
+prompt: |
+  Harden the codebase against OWASP Top-10 vulnerabilities:
+  1. Run `semgrep --config=auto src/` and fix ALL findings rated high/critical
+  2. Run `bandit -r src/ -ll` and fix all MEDIUM+ issues
+  3. Run `safety check` and update any packages with known CVEs
+  4. Ensure no secrets/credentials are hardcoded (use environment variables)
+  5. Add security headers to all HTTP responses (CSP, HSTS, X-Frame-Options)
+
+  Quality bar: `semgrep --config=auto src/` must produce zero high/critical findings;
+  `bandit -r src/ -ll` must exit 0; `safety check` must exit 0.
+
+strategy:
+  kind: tree
+  config:
+    width: 3
+    max_depth: 2
+    accept_threshold: 0.90
+    scorer_type: shell
+    scorer_command: |
+      score=0
+      semgrep --config=auto src/ --json 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      findings=[f for f in data.get('results',[]) if f.get('extra',{}).get('severity','') in ('ERROR','WARNING')]
+      score=max(0,1.0-len(findings)*0.1)
+      print(score)" || echo 0
+    prune_below: 0.3
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 6000
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
+  extra:
+    permission_mode: bypassPermissions
+
+environment:
+  type: local
+  setup_commands:
+    - "pip install semgrep bandit safety --quiet"
+
+milestone_validators:
+  - id: semgrep_clean
+    type: shell
+    runs: final
+    config:
+      command: "semgrep --config=auto src/ --error 2>/dev/null || true"
+      timeout_seconds: 120
+    on_fail: pause_for_hitl
+  - id: bandit_clean
+    type: shell
+    runs: final
+    config:
+      command: "bandit -r src/ -ll --exit-zero"
+      timeout_seconds: 60
+    on_fail: pause_for_hitl
+
+handoff_files: [progress.md, summary.md]
+
+resources:
+  max_total_hours: 6
+  max_total_tokens: 3000000
+  max_total_usd: 30
+  max_steps_per_session: 60
+  max_minutes_per_session: 30
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  edit_revert_enabled: true
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [spin_detected, validator_paused]
+  notification_type: console

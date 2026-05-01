@@ -1,0 +1,93 @@
+[project]
+name = "horizonx"
+version = "0.1.0"
+description = "Long-horizon agent execution harness — Temporal/Airflow for Claude Code, Codex, OpenHands"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "HorizonX contributors" }]
+keywords = ["llm", "agents", "claude-code", "codex", "long-horizon", "harness", "agent-execution"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+  "pydantic>=2.6",
+  "sqlalchemy[asyncio]>=2.0",
+  "aiosqlite>=0.19",
+  "click>=8.1",
+  "rich>=13.7",
+  "anyio>=4.2",
+  "pyyaml>=6.0",
+  "httpx>=0.27",
+  "anthropic>=0.39",
+]
+
+[project.optional-dependencies]
+postgres = ["asyncpg>=0.29"]
+dashboard = ["fastapi>=0.115", "uvicorn[standard]>=0.27", "sse-starlette>=2.0"]
+slack = ["slack-sdk>=3.27"]
+all = ["horizonx[postgres,dashboard,slack]"]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.4",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+horizonx = "horizonx.cli:main"
+
+[project.entry-points."horizonx.strategies"]
+single = "horizonx.strategies.single:SingleSession"
+sequential = "horizonx.strategies.sequential:SequentialSubgoals"
+ralph = "horizonx.strategies.ralph:RalphLoop"
+tree = "horizonx.strategies.tree:TreeOfTrials"
+monitor = "horizonx.strategies.monitor:MonitorRespond"
+decomposition = "horizonx.strategies.decomposition:DecompositionFirst"
+pair = "horizonx.strategies.pair:PairProgramming"
+self_critique = "horizonx.strategies.self_critique:SelfCritique"
+
+[project.entry-points."horizonx.agents"]
+claude_code = "horizonx.agents.claude_code:ClaudeCodeAgent"
+codex = "horizonx.agents.codex:CodexAgent"
+openhands = "horizonx.agents.openhands:OpenHandsAgent"
+custom = "horizonx.agents.custom:CustomAgent"
+
+[project.entry-points."horizonx.validators"]
+test_suite = "horizonx.validators.test_suite:TestSuiteGate"
+shell = "horizonx.validators.shell:ShellGate"
+llm_judge = "horizonx.validators.llm_judge:LLMJudgeGate"
+metric = "horizonx.validators.metric:MetricGate"
+git = "horizonx.validators.git:GitGate"
+goal_graph = "horizonx.validators.goal_graph:GoalGraphGate"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["horizonx*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "ASYNC"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

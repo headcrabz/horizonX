@@ -1,0 +1,95 @@
+id: api-design-decompose-001
+name: API design and implementation via decomposition-first
+description: |
+  A cheap LLM call decomposes the high-level API spec into an ordered list of
+  concrete sub-goals (schema design, endpoint implementation, auth, tests, docs).
+  A human can review and edit the plan before execution begins.
+  Novel use case: plan-then-execute with an LLM-generated task graph — structured
+  supervision without manual ticket writing.
+horizon_class: long
+estimated_duration_hours: [4.0, 8.0]
+tags: [api, rest, openapi, decomposition, planning]
+
+prompt: |
+  Design and implement a RESTful API for a task management system:
+  1. Design the OpenAPI 3.1 spec (tasks, projects, users, comments)
+  2. Implement FastAPI endpoints with Pydantic models and SQLAlchemy ORM
+  3. Add JWT authentication (login, refresh, logout)
+  4. Write pytest tests with ≥ 80% coverage
+  5. Generate interactive docs at /docs (FastAPI default)
+  6. Add rate limiting (slowapi) and request logging middleware
+
+  Quality bar: `pytest tests/ --cov=app --cov-fail-under=80` must exit 0;
+  `python -c "import app.main; print('ok')"` must exit 0.
+
+strategy:
+  kind: decomposition
+  config:
+    decomposer_model: claude-haiku-4-5
+    max_attempts_per_goal: 3
+    max_subgoals: 10
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 8000
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
+  extra:
+    permission_mode: bypassPermissions
+
+environment:
+  type: local
+  setup_commands:
+    - "pip install fastapi uvicorn sqlalchemy pydantic pytest pytest-cov httpx python-jose slowapi --quiet"
+
+milestone_validators:
+  - id: tests_pass
+    type: test_suite
+    runs: after_every_session
+    config:
+      command: "pytest tests/ -q --tb=short"
+      test_dir: tests/
+      test_glob: "test_*.py"
+      min_test_count: 3
+      min_assertion_count: 5
+      min_exec_seconds: 0.5
+    on_fail: pause_for_hitl
+  - id: app_imports
+    type: shell
+    runs: after_every_session
+    config:
+      command: "python -c 'import app.main' 2>&1 || true"
+      timeout_seconds: 30
+    on_fail: continue
+  - id: openapi_valid
+    type: shell
+    runs: final
+    config:
+      command: "python -c \"import json; import app.main; app=app.main.app; print(json.dumps(app.openapi())); print('openapi ok')\""
+      timeout_seconds: 30
+    on_fail: pause_for_hitl
+
+handoff_files: [progress.md, goals.json, decisions.jsonl, summary.md]
+
+summarizer:
+  enabled: true
+  trigger_at_context_pct: 70
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  edit_revert_enabled: true
+  score_plateau_window: 3
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [spin_detected, validator_paused]
+  notification_type: console
+
+resources:
+  max_total_hours: 8
+  max_total_tokens: 4000000
+  max_total_usd: 40
+  max_steps_per_session: 80
+  max_minutes_per_session: 30

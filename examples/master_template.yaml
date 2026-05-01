@@ -1,0 +1,413 @@
+# =============================================================================
+# HorizonX master task template — every field, annotated
+#
+# This file is a reference, not a runnable task. It shows the complete surface
+# of horizonx/core/types.py with defaults from the source code.
+# One strategy / agent / validator stanza is left active; the rest are
+# commented out. Copy the block you need into your own task.yaml.
+#
+# Authoritative defaults: horizonx/core/types.py + each strategy/validator module.
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# Top-level identity  (Task)
+# ---------------------------------------------------------------------------
+
+id: master-template                     # required; unique run identifier
+name: Master Template Task              # required; human-readable label
+description: |                          # optional; multi-line is fine
+  Extended description of the task's goal and context.
+
+prompt: |                               # required; the full task specification
+  Write the complete prompt here.
+  Multi-line YAML block scalar keeps indentation clean.
+
+# Enum: short | medium | long (default) | very_long | continuous
+horizon_class: long
+
+# Expected wall-clock duration range in hours [min, max].
+# Informational only — does not set a hard cutoff (use resources.max_total_hours).
+estimated_duration_hours: [2.0, 8.0]
+
+tags: [example, reference]              # free-form; used for filtering/search
+
+# Files the runtime copies to a forked workspace and to the session prompt.
+# Default list shown; add your own.
+handoff_files:
+  - progress.md
+  - goals.json
+  - decisions.jsonl
+  - failures.jsonl
+  - summary.md
+
+
+# ---------------------------------------------------------------------------
+# Strategy  (StrategyConfig)
+# kind options: single | sequential | ralph | tree | monitor |
+#               decomposition | pair | self_critique
+# ---------------------------------------------------------------------------
+
+strategy:
+  kind: sequential
+  config:
+    # -- sequential-specific keys -----------------------------------------
+    max_attempts_per_goal: 3            # int; default 3
+    target_subgoals: [40, 80]           # [min, max] subgoal count window
+    git_commit_each_session: true       # bool; default true
+
+# --- single (no config keys) ---
+# strategy:
+#   kind: single
+
+# --- ralph (RALPH optimisation loop) ---
+# strategy:
+#   kind: ralph
+#   config:
+#     fixed_minutes_per_iter: 5.0       # float; minutes per iteration budget
+#     total_minutes: 600.0              # float; total optimisation budget
+#     mutable_paths: []                 # list[str]; paths the agent may change
+#     metric:
+#       command: "python score.py"      # str; scoring shell command (required)
+#       name: metric                    # str; label for logs; default "metric"
+#       direction: minimize             # minimize | maximize; default minimize
+#     early_stopping:
+#       window: 10                      # int; rolling window for plateau check
+#       delta: 0.001                    # float; min improvement to not stop
+
+# --- tree (tree-of-trials) ---
+# strategy:
+#   kind: tree
+#   config:
+#     width: 3                          # int; branches per node; default 3
+#     max_depth: 2                      # int; default 2
+#     accept_threshold: 0.85            # float 0–1; score to accept a branch
+#     scorer_command: "python score.py" # str|null; shell scorer (null = llm)
+#     scorer_type: shell                # shell | llm; default shell
+#     scorer_model: claude-haiku-4-5    # str; used when scorer_type=llm
+#     prune_below: 0.0                  # float; prune branches below this score
+
+# --- monitor (event-driven responder) ---
+# strategy:
+#   kind: monitor
+#   config:
+#     trigger_command: "check_alerts.sh"      # str|null; exit 0 = no trigger
+#     trigger_metric_command: "get_metric.sh" # str|null; outputs a float
+#     trigger_threshold: 1.0                  # float; compare metric against this
+#     trigger_direction: ge                   # ge | le | eq
+#     poll_interval_seconds: 30.0             # float; default 30
+#     max_triggers: null                      # int|null; null = unlimited
+#     responder_prompt_template: |
+#       Metric has crossed threshold. Value: {metric_value}. Fix it.
+
+# --- decomposition (goal-graph decomposer) ---
+# strategy:
+#   kind: decomposition
+#   config:
+#     decomposer_model: claude-haiku-4-5  # str; model used to decompose goals
+#     max_attempts_per_goal: 3            # int; default 3
+#     max_subgoals: 12                    # int; cap on LLM-generated subgoals
+
+# --- pair (pair-programming with navigator/driver) ---
+# strategy:
+#   kind: pair
+#   config:
+#     max_rounds: 4                       # int; default 4
+#     accept_threshold: 0.85              # float 0–1
+#     navigator_model: null               # str|null; null uses agent.model
+
+# --- self_critique (iterative self-review) ---
+# strategy:
+#   kind: self_critique
+#   config:
+#     max_rounds: 5                       # int; default 5
+#     accept_threshold: 0.85              # float 0–1
+#     critic_type: llm                    # llm | agent | shell
+#     critic_model: claude-haiku-4-5      # str; used when critic_type=llm
+#     critic_command: null                # str|null; used when critic_type=shell
+#     write_progress: true                # bool; write progress.md after each round
+
+
+# ---------------------------------------------------------------------------
+# Agent  (AgentConfig)
+# type options: claude_code | codex | openhands | mock
+# ---------------------------------------------------------------------------
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7               # any valid model ID
+
+  # Optional shared fields (all agent types):
+  allowed_tools: null                  # list[str]|null; null = all tools allowed
+  thinking_budget: null                # int|null; extended thinking token budget
+  reasoning_effort: null               # low | medium | high | null
+  mcp_config_path: null                # str|null; path to MCP server config JSON
+
+  # claude_code-specific extra keys:
+  extra:
+    permission_mode: bypassPermissions # bypassPermissions | default | ...
+    additional_dirs: []                # list[str]; extra workspace dirs to expose
+    system_prompt: null                # str|null; fully replaces the system prompt
+    append_system_prompt: null         # str|null; appended to default system prompt
+    max_budget_usd: null               # float|null; per-session USD cap
+    extra_args: []                     # list[str]; raw CLI flags appended to invocation
+
+# --- codex agent ---
+# agent:
+#   type: codex
+#   model: o4-mini
+#   extra:
+#     config_overrides: {}             # dict; passed as -c key=value flags
+#     sandbox: null                    # str|null; sandbox mode flag
+#     full_auto: true                  # bool; --full-auto flag; default true
+#     skip_git_repo_check: true        # bool; default true
+#     ephemeral: false                 # bool; discard session after completion
+#     add_dirs: []                     # list[str]; extra dirs to expose
+#     output_schema_path: null         # str|null; JSON schema for structured output
+#     output_last_message_path: null   # str|null; write last assistant message here
+#     extra_args: []                   # list[str]; raw CLI flags
+
+# --- openhands agent ---
+# agent:
+#   type: openhands
+#   model: gpt-4o
+#   extra:
+#     mode: cli                        # cli | server; default cli
+#     cli_bin: openhands               # str; CLI binary name; default "openhands"
+#     server_url: "http://localhost:3000"  # str; used when mode=server
+#     runtime: null                    # str|null; runtime override
+#     agent_cls: CodeActAgent          # str; OpenHands agent class; default CodeActAgent
+#     max_iterations: 30               # int; default 30
+
+# --- custom agent (any subprocess) ---
+# agent:
+#   type: custom
+#   model: my-agent-v1                 # informational; set as $HORIZONX_MODEL in subprocess
+#   extra:
+#     command: /opt/my_agent/run.sh   # str | list[str]; required — the binary to exec
+#     args: []                         # list[str]; extra CLI args appended after command
+#     prompt_mode: stdin               # stdin | arg | env | file; how the prompt is delivered
+#                                      #   stdin  — written to the process's stdin (default)
+#                                      #   arg    — appended as the last positional argument
+#                                      #   env    — set as $HORIZONX_PROMPT env var
+#                                      #   file   — written to {workspace}/prompt.txt;
+#                                      #            path set as $HORIZONX_PROMPT_FILE
+#     output_format: jsonl             # text | jsonl; how stdout is parsed into Steps
+#                                      #   text   — each non-empty line → THOUGHT step (default)
+#                                      #   jsonl  — each line parsed; expected keys:
+#                                      #            type, tool_name (opt), content (opt)
+#     env: {}                          # dict[str, str]; extra env vars for the subprocess
+#     timeout: 1800.0                  # float; per-session hard timeout in seconds
+#   # Always-available env vars in the subprocess:
+#   #   HORIZONX_WORKSPACE   — absolute path to the session workspace directory
+#   #   HORIZONX_MODEL       — agent.model value
+#   #   HORIZONX_SESSION_ID  — current session ID
+
+
+# ---------------------------------------------------------------------------
+# Environment  (EnvironmentConfig)
+# type options: local | podman | docker | e2b
+# ---------------------------------------------------------------------------
+
+environment:
+  type: local                          # default; no container isolation
+
+  setup_commands:                      # run once before first session
+    - "python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt"
+
+  env: {}                              # dict[str, str]; extra env vars for agent
+
+  mounts: []                           # list[{src: str, dst: str}]; for container types
+
+# --- container environment (podman or docker) ---
+# environment:
+#   type: podman                       # or docker
+#   image: python:3.12-slim
+#   setup_commands:
+#     - "pip install -r requirements.txt"
+#   env:
+#     DATABASE_URL: "sqlite:///app.db"
+#   mounts:
+#     - {src: /host/data, dst: /workspace/data}
+
+# --- e2b sandbox ---
+# environment:
+#   type: e2b
+#   image: python                      # e2b template name
+#   setup_commands: []
+
+
+# ---------------------------------------------------------------------------
+# Validators  (list[ValidatorConfig])
+# type options: test_suite | shell | llm_judge | metric | git | goal_graph
+# runs options: after_every_session (default) | every_n_sessions | final |
+#               before_destructive_action | on_demand
+# on_fail options: pause_for_hitl (default) | continue | abort | retry_with_modification
+# ---------------------------------------------------------------------------
+
+milestone_validators:
+
+  # --- test_suite: assert tests exist, execute, and meet coverage thresholds ---
+  - id: tests_pass
+    type: test_suite
+    runs: after_every_session
+    on_fail: pause_for_hitl
+    weight: 1.0                        # float; relative weight in scoring; default 1.0
+    config:
+      command: "pytest tests/ -q"      # str; test runner command (required)
+      test_dir: tests/                 # str; directory to scan; default "tests/"
+      test_glob: "test_*.py"           # str; file pattern; default "test_*.py"
+      min_test_count: 1                # int; fail if fewer tests found; default 0
+      min_assertion_count: 0           # int; fail if fewer assertions; default 0
+      min_exec_seconds: 0.0            # float; fail if suite finishes too fast; default 0.0
+      timeout_seconds: 300.0           # float; kill test run after this; default 300.0
+
+  # --- shell: arbitrary shell command, pass = exit 0 ---
+  - id: build_check
+    type: shell
+    runs: after_every_session
+    on_fail: continue
+    config:
+      command: "make build"            # str; shell command (required)
+      timeout_seconds: 60.0           # float; default 60.0
+
+  # --- llm_judge: LLM evaluates the trajectory against a rubric ---
+  - id: quality_judge
+    type: llm_judge
+    runs: final
+    on_fail: pause_for_hitl
+    config:
+      rubric: |                        # str; evaluation rubric (required)
+        Did the agent complete the task correctly without introducing regressions?
+      model: claude-haiku-4-5          # str; default "claude-haiku-4-5"
+      threshold: 0.7                   # float 0–1; minimum passing score; default 0.7
+      max_trajectory_steps: 100        # int; how many steps to include; default 100
+
+  # --- metric: compare a shell-computed float against a threshold ---
+  - id: latency_gate
+    type: metric
+    runs: every_n_sessions
+    n: 3                               # int; run every N sessions; required for this runs mode
+    on_fail: abort
+    config:
+      command: "python measure.py"     # str; prints a float to stdout (required)
+      threshold: 0.0                   # float; comparison value; default 0.0
+      direction: ge                    # ge | le | eq; default ge
+
+  # --- git: verify commit history health ---
+  - id: git_health
+    type: git
+    runs: final
+    on_fail: pause_for_hitl
+    config:
+      min_commits: 1                   # int; minimum new commits since base; default 0
+      max_revert_commits: 0            # int; max allowed revert commits; default 0
+      min_files_changed: 0             # int; minimum files touched; default 0
+      base_ref: HEAD~1                 # str; git ref to compare against; default "HEAD~1"
+      require_clean: false             # bool; fail if working tree is dirty; default false
+
+  # --- goal_graph: assert goal completion thresholds ---
+  - id: goals_complete
+    type: goal_graph
+    runs: final
+    on_fail: pause_for_hitl
+    config:
+      min_completion_pct: 0.0          # float 0–100; minimum % of goals done; default 0.0
+      max_blocked_pct: 1.0             # float 0–1; max fraction of goals blocked; default 1.0
+      max_failed_goals: null           # int|null; null = no cap; default null
+      require_no_cycles: false         # bool; fail if goal graph has cycles; default false
+
+
+# ---------------------------------------------------------------------------
+# Summarizer  (SummarizerConfig)
+# Compresses agent trajectory into a summary when context fills up.
+# ---------------------------------------------------------------------------
+
+summarizer:
+  enabled: true                        # bool; default true
+  model: claude-haiku-4-5              # str; model for summarisation; default "claude-haiku-4-5"
+  trigger_at_context_pct: 70.0         # float; % of context window that triggers compression
+  max_tokens_per_summary: 2000         # int; token budget for each summary chunk
+
+
+# ---------------------------------------------------------------------------
+# Spin Detection  (SpinDetectionConfig)
+# Detects unproductive loops and either warns or terminates the session.
+# ---------------------------------------------------------------------------
+
+spin_detection:
+  enabled: true
+
+  # ExactLoopLayer — identical tool-call content repeated N times
+  exact_loop_threshold: 3              # int; hard abort at this count; default 3
+  soft_exact_loop_threshold: 2         # int; soft warn before hard abort; default 2
+  exact_loop_window: 20                # int; rolling window of steps to inspect
+
+  # EditRevertLayer — detects A→B→A→B edit flip-flops
+  edit_revert_enabled: true            # bool; default true
+
+  # ScorePlateauLayer — validator scores stop improving
+  score_plateau_window: 3              # int; number of scores to compare; default 3
+  score_plateau_delta: 0.02            # float; minimum improvement to not trigger
+
+  # SemanticProgressLayer — LLM reviews trajectory for real progress
+  semantic_layer_enabled: true         # bool; default true
+  semantic_check_every_n_steps: 20     # int; check interval; default 20
+  semantic_model: claude-haiku-4-5     # str; model for the progress check
+
+  # BucketedHashLayer — fuzzy-hash detector tolerates minor variation
+  bucketed_hash_enabled: true          # bool; default true
+  bucketed_hash_soft_threshold: 3      # int; soft warn; default 3
+  bucketed_hash_hard_threshold: 5      # int; hard abort; default 5
+  bucketed_hash_window: 30             # int; rolling window; default 30
+
+  # Action when spin is confirmed at hard threshold:
+  # terminate_and_retry | terminate_and_hitl | switch_strategy
+  on_spin: terminate_and_hitl          # default terminate_and_hitl
+
+
+# ---------------------------------------------------------------------------
+# Human-in-the-Loop  (HITLConfig)
+# Pauses the run and notifies a human when a trigger fires.
+# ---------------------------------------------------------------------------
+
+hitl:
+  enabled: true
+
+  # Events that pause the run for human review:
+  # spin_detected | validator_paused | subgoal_max_attempts | budget_threshold_75
+  triggers:
+    - spin_detected
+    - validator_paused
+    - subgoal_max_attempts
+    - budget_threshold_75
+
+  # console | slack | email | webhook
+  notification_type: console
+
+  # Target for slack (#channel), email (address), or webhook (URL). Null for console.
+  notification_target: null
+
+  # If true, the run stays paused until the human explicitly acknowledges.
+  require_acknowledgement: false
+
+
+# ---------------------------------------------------------------------------
+# Resource limits  (ResourceLimits)
+# Run aborts immediately when any hard cap is hit.
+# ---------------------------------------------------------------------------
+
+resources:
+  max_total_hours: 24.0                # float|null; wall-clock budget; default 24.0
+  max_total_tokens: 10000000           # int|null; total input+output tokens; default 10M
+  max_total_usd: 100.0                 # float|null; total cost cap; default 100.0
+  max_sessions: 200                    # int|null; maximum sessions to run; default 200
+
+  # Per-session limits:
+  max_steps_per_session: 50            # int; hard stop per session; default 50
+  max_minutes_per_session: 25.0        # float; wall-clock per session; default 25.0
+  max_tokens_per_session: null         # int|null; null = no per-session token cap
+
+  # Stall watchdog — kills a session that stops making tool calls:
+  stall_soft_seconds: 120.0            # float; inject a nudge prompt; default 120.0
+  stall_hard_seconds: 300.0            # float; hard-abort the session; default 300.0

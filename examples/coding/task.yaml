@@ -1,0 +1,93 @@
+id: coding-oauth-001
+name: Implement OAuth 2.0 Authorization Code Flow with PKCE
+description: |
+  Long-horizon software task: add OAuth 2.0 (authz code + PKCE + refresh + revocation)
+  to an existing FastAPI app, with full test coverage and security scan gates.
+horizon_class: very_long
+estimated_duration_hours: [4.0, 12.0]
+tags: [coding, security, fastapi, anthropic_pattern, sequential]
+
+prompt: |
+  Implement OAuth 2.0 Authorization Code Flow with PKCE in this FastAPI app.
+
+  REQUIRED:
+    1. /authorize endpoint with PKCE (code_challenge S256)
+    2. /token endpoint (code → token exchange)
+    3. /refresh endpoint
+    4. /revoke endpoint
+    5. Client registration table + admin endpoints
+    6. Scope validation middleware on protected routes
+    7. Tests for each endpoint AND an end-to-end integration test
+    8. OpenAPI docs reflect new endpoints
+    9. Security scan (bandit) reports 0 critical issues
+
+  CONSTRAINTS:
+    - It is unacceptable to delete or weaken existing tests.
+    - All persistence goes through the existing SQLAlchemy session pattern.
+    - Tokens never logged; secrets only in env vars; cookies HttpOnly + Secure.
+
+strategy:
+  kind: sequential
+  config:
+    target_subgoals: [40, 80]
+    max_attempts_per_goal: 3
+    git_commit_each_session: true
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 10000
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
+
+environment:
+  type: local
+  setup_commands:
+    - "python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt"
+
+milestone_validators:
+  - id: tests_pass
+    type: test_suite
+    runs: after_every_session
+    config:
+      command: "pytest tests/ -k oauth --tb=short -q"
+      test_dir: tests/
+      test_glob: "test_*.py"
+      min_test_count: 1
+      timeout_seconds: 120
+    on_fail: pause_for_hitl
+  - id: build_works
+    type: shell
+    runs: after_every_session
+    config:
+      command: "timeout 5 uvicorn app.main:app --host 127.0.0.1 --port 0 || true"
+      timeout_seconds: 10
+    on_fail: pause_for_hitl
+  - id: security_scan
+    type: shell
+    runs: every_n_sessions
+    n: 5
+    config:
+      command: "bandit -r app/ --severity-level high -q || true"
+    on_fail: pause_for_hitl
+
+handoff_files: [progress.md, goals.json, decisions.jsonl, failures.jsonl, summary.md]
+
+summarizer: { enabled: true, trigger_at_context_pct: 70 }
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  edit_revert_enabled: true
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [validator_paused, spin_detected, subgoal_max_attempts]
+  notification_type: console
+
+resources:
+  max_total_hours: 12
+  max_total_tokens: 6000000
+  max_total_usd: 60
+  max_steps_per_session: 50
+  max_minutes_per_session: 25

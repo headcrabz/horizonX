@@ -1,0 +1,90 @@
+id: kernel-opt-001
+name: Optimize Triton kernel for matmul throughput
+description: |
+  Iteratively optimize a Triton matmul kernel. Each iteration: edit the kernel,
+  verify correctness against PyTorch reference, benchmark throughput, keep if faster.
+horizon_class: long
+estimated_duration_hours: [4.0, 24.0]
+tags: [gpu, triton, kernel, optimization, ralph_loop]
+
+prompt: |
+  Optimize the Triton kernel in `kernel.py` for matmul throughput on the included benchmark.
+
+  EACH ITERATION YOU MUST:
+    1. Read kernel.py and the recent decisions.jsonl + failures.jsonl.
+    2. Pick ONE specific optimization (block size, swizzle, software pipelining,
+       FP8, async copies, persistent kernel pattern, etc.).
+    3. Rewrite the kernel.
+    4. Append your hypothesis and rationale to decisions.jsonl.
+
+  CONSTRAINTS:
+    - You may only edit kernel.py (and the journaling files).
+    - Output must match reference within rtol=1e-3, atol=1e-3.
+    - Do not weaken or skip the verify step.
+
+strategy:
+  kind: ralph
+  config:
+    fixed_minutes_per_iter: 3
+    total_minutes: 360
+    mutable_paths:
+      - kernel.py
+      - decisions.jsonl
+      - progress.md
+    metric:
+      name: gflops
+      direction: maximize
+      measurement: "python bench.py 2>&1 | grep -oE 'gflops=[0-9.]+' | tail -1 | sed 's/gflops=//'"
+    early_stopping:
+      window: 15
+      delta: 0.5            # absolute GFLOPS
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 6000
+  allowed_tools: [Read, Edit, Bash, Glob, Grep]
+
+environment:
+  type: local
+
+milestone_validators:
+  - id: correctness
+    type: shell
+    runs: after_every_session
+    config:
+      command: "python verify.py"
+      timeout_seconds: 120
+    on_fail: continue        # discard iteration via foreign-files pattern
+  - id: foreign_files_unchanged
+    type: shell
+    runs: after_every_session
+    config:
+      command: |
+        CHANGES=$(git diff --name-only HEAD | grep -vE '^(kernel\.py|decisions\.jsonl|progress\.md|summary\.md|failures\.jsonl|goals\.json)$' || true)
+        if [ -n "$CHANGES" ]; then echo "FOREIGN: $CHANGES"; exit 1; fi
+    on_fail: abort
+
+handoff_files: [progress.md, decisions.jsonl, failures.jsonl, summary.md]
+
+summarizer:
+  enabled: true
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  score_plateau_window: 15
+  score_plateau_delta: 0.5
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [spin_detected, budget_threshold_75]
+  notification_type: console
+
+resources:
+  max_total_hours: 6
+  max_total_tokens: 4000000
+  max_total_usd: 40
+  max_steps_per_session: 50
+  max_minutes_per_session: 6

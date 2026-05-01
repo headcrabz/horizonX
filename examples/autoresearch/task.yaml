@@ -1,0 +1,101 @@
+id: autoresearch-001
+name: Karpathy autoresearch — overnight LLM hyperparameter exploration
+description: |
+  Autonomous overnight ML research. Agent edits train.py, runs 5-min training cycles,
+  measures val_bpb, keeps improvements, discards regressions. Wraps karpathy/autoresearch
+  in HorizonX's Ralph loop with full observability and crash recovery.
+horizon_class: very_long
+estimated_duration_hours: [8.0, 12.0]
+tags: [ml, research, ralph_loop, karpathy]
+
+prompt: |
+  You are running an autoresearch experiment loop on a single-GPU nanochat implementation.
+
+  Your goal: minimize validation bits-per-byte (val_bpb) on the held-out evaluation set.
+  Each iteration you have ~5 minutes of wall-clock training. Pick ONE specific change
+  per iteration (architecture, optimizer, hyperparameter, data ordering, etc.) and make it.
+
+  CONSTRAINTS:
+    - You may modify only `train.py`. The harness will revert any other changes.
+    - Do not delete or weaken the eval routine.
+    - Do not increase training time beyond what's already configured.
+    - Append your hypothesis and rationale to decisions.jsonl before each change.
+
+  See program.md for context on the codebase.
+
+strategy:
+  kind: ralph
+  config:
+    fixed_minutes_per_iter: 5
+    total_minutes: 600
+    mutable_paths:
+      - "train.py"
+      - "decisions.jsonl"
+      - "progress.md"
+    metric:
+      name: val_bpb
+      direction: minimize
+      measurement: "uv run train.py 2>&1 | grep -oE 'val_bpb=[0-9.]+' | tail -1 | sed 's/val_bpb=//'"
+    early_stopping:
+      window: 10
+      delta: 0.001
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 4000
+  allowed_tools: [Read, Edit, Bash, Glob, Grep]
+
+environment:
+  type: local
+
+milestone_validators:
+  - id: foreign_files_unchanged
+    type: shell
+    runs: after_every_session
+    config:
+      command: |
+        CHANGES=$(git diff --name-only HEAD | grep -vE '^(train\.py|decisions\.jsonl|progress\.md|summary\.md|goals\.json|failures\.jsonl)$' || true)
+        if [ -n "$CHANGES" ]; then echo "FOREIGN: $CHANGES"; exit 1; fi
+        exit 0
+    on_fail: abort
+  - id: train_runs
+    type: shell
+    runs: after_every_session
+    config:
+      command: "timeout 360 uv run train.py 2>&1 | tail -20"
+      timeout_seconds: 400
+    on_fail: continue          # discard the iteration but keep going
+
+handoff_files:
+  - progress.md
+  - goals.json
+  - decisions.jsonl
+  - failures.jsonl
+  - summary.md
+
+summarizer:
+  enabled: true
+  model: claude-haiku-4-5
+  trigger_at_context_pct: 70
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  score_plateau_window: 10
+  score_plateau_delta: 0.001
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers:
+    - spin_detected
+    - budget_threshold_75
+  notification_type: console
+
+resources:
+  max_total_hours: 12
+  max_total_tokens: 8000000
+  max_total_usd: 80
+  max_steps_per_session: 80
+  max_minutes_per_session: 8
