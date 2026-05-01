@@ -58,8 +58,8 @@ You can. Until hour 3, when it spins for 40 minutes without progress. Or hour 6,
 
 HorizonX makes several contributions that don't exist as a unified system elsewhere:
 
-**1. The session boundary is the primitive**
-Agent frameworks operate within one context window. Workflow engines orchestrate deterministic functions. HorizonX orchestrates across *stochastic session resets* — where context evaporates, agents drift, and crashes happen mid-goal. It makes those boundaries survivable: durable goal graph, structured handoffs, validator-gated transitions. Nothing else treats the session boundary as the unit of execution.
+**1. A new category — long-horizon agent execution harness**
+Eval harnesses measure agents. Agent frameworks wire their thinking. Workflow engines sequence deterministic steps. None of them run an autonomous agent reliably for 8 hours — surviving context resets, detecting loops, enforcing quality gates, and handing off state across crashes. Anthropic's engineering team named this gap in 2025. HorizonX is the first open-source runtime built specifically to close it.
 
 **2. A 14-mode failure taxonomy for long-horizon agents**
 Premature completion · cyclic loops · edit-revert oscillation · plan drift · test deletion · validation theater · context exhaustion · brittle handoffs · operator blindness · cost runaway · silent stagnation · crash-equals-loss · tool overuse · permission creep. Each failure mode has a structural mitigation in the harness — not a prompt instruction.
@@ -174,136 +174,220 @@ See [docs/EXECUTION_STRATEGIES.md](docs/EXECUTION_STRATEGIES.md) for the full ca
 
 ## Quickstart
 
-### Install
+### Step 1 — Install
 
 ```bash
-pip install horizonx              # core
-pip install horizonx[postgres]    # for team / leaderboard mode
-pip install horizonx[dashboard]   # for the web UI
+# Install from GitHub (v0.1.0)
+pip install git+https://github.com/headcrabz/horizonX.git
+
+# Or clone for development
+git clone https://github.com/headcrabz/horizonX.git
+cd horizonX
+pip install -e ".[dev]"
+
+# Optional extras
+pip install "horizonx[dashboard]"   # FastAPI web UI
+pip install "horizonx[postgres]"    # PostgreSQL backend
+pip install "horizonx[slack]"       # Slack HITL notifications
 ```
 
-### Run an example
+### Step 2 — Try a built-in example
 
 ```bash
-# Folder-based (convention)
-horizonx run examples/coding_oauth/ --agent claude-code --strategy sequential
+# Run the self-critique example (shortest — completes in a few minutes)
+horizonx run examples/self_critique/task.yaml
 
-# YAML config (full control)
-horizonx run --config configs/my_task.yaml --resume run-abc123
+# In another terminal: watch live step-by-step output
+horizonx watch <run-id>             # run-id is printed at startup
 
-# Watch live progress
-horizonx watch run-abc123                      # terminal dashboard
-horizonx serve --port 8080                     # web UI on :8080
+# After it finishes
+horizonx list                       # all runs + status
+horizonx show <run-id>              # full result + validator scores
+horizonx export <run-id> --format json   # dump complete trajectory
 ```
 
-### Define a task in YAML
+### Step 3 — Define your task in YAML
 
 ```yaml
-# examples/coding_oauth/task.yaml
 id: build-oauth-001
-name: Implement OAuth 2.0 Authorization Code Flow
-horizon_class: very_long          # short / medium / long / very_long
-estimated_duration_hours: [4, 12]
+name: Implement OAuth 2.0 Authorization Code Flow with PKCE
+description: |
+  Add OAuth 2.0 (authorization code + PKCE + refresh + revocation) to an
+  existing FastAPI app, with full test coverage and a security scan gate.
+horizon_class: very_long              # short | medium | long | very_long | continuous
+estimated_duration_hours: [4.0, 12.0]
+tags: [coding, security, fastapi]
 
-execution:
-  strategy: sequential_sub_goals
-  initializer:
-    decompose_to_goal_graph: true
-    target_subgoals: [40, 80]      # min, max sub-goals
-  per_session:
-    max_steps: 50
-    max_minutes: 25
-    one_subgoal_at_a_time: true     # Anthropic pattern
+prompt: |
+  Implement OAuth 2.0 Authorization Code Flow with PKCE in this FastAPI app.
 
+  REQUIRED:
+    1. /authorize endpoint with PKCE (code_challenge S256)
+    2. /token endpoint (code → token exchange)
+    3. /refresh and /revoke endpoints
+    4. Client registration table + admin endpoints
+    5. Scope validation middleware on protected routes
+    6. Full test coverage for each endpoint + an end-to-end integration test
+    7. OpenAPI docs reflect new endpoints
+    8. bandit security scan reports 0 critical issues
+
+  CONSTRAINTS:
+    - Do not delete or weaken existing tests.
+    - All persistence through the existing SQLAlchemy session pattern.
+    - Tokens never logged; secrets only in env vars; cookies HttpOnly + Secure.
+
+# ---------------------------------------------------------------------------
+# Execution strategy
+# kind: single | sequential | ralph | tree | monitor | decomposition | pair | self_critique
+# ---------------------------------------------------------------------------
+strategy:
+  kind: sequential
+  config:
+    target_subgoals: [40, 80]         # decompose the task into this many sub-goals
+    max_attempts_per_goal: 3          # retry each sub-goal up to 3× before HITL
+    git_commit_each_session: true     # commit after every session for crash recovery
+
+# ---------------------------------------------------------------------------
+# Agent driver
+# type: claude_code | codex | openhands | custom | mock
+# ---------------------------------------------------------------------------
 agent:
   type: claude_code
   model: claude-opus-4-7
-  thinking_budget: 10000
-  allowed_tools: [Read, Edit, Bash, Glob, Grep]
-  per_session_session_id: true     # resume across crashes
+  thinking_budget: 10000              # extended thinking token budget
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
 
-context_management:
-  handoff_files:
-    - progress.md                   # human-readable narrative
-    - goals.json                    # structured goal graph
-    - decisions.jsonl               # decisions + rationale
-    - failures.jsonl                # what was tried & failed
-  summarizer:
-    trigger_at_context_pct: 70
-    model: claude-haiku-4-5         # cheap summarizer
+# ---------------------------------------------------------------------------
+# Environment
+# type: local | podman | docker | e2b
+# ---------------------------------------------------------------------------
+environment:
+  type: local
+  setup_commands:
+    - "python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt"
 
+# ---------------------------------------------------------------------------
+# Milestone validators — return decisions (not scores)
+# on_fail: continue | pause_for_hitl | abort | retry_with_modification
+# runs: after_every_session | every_n_sessions | final | on_demand
+# ---------------------------------------------------------------------------
 milestone_validators:
   - id: tests_pass
-    runs: after_every_session
     type: test_suite
-    command: pytest tests/ -k oauth --tb=short
-    on_fail: pause_for_hitl
-  - id: build_works
     runs: after_every_session
+    on_fail: pause_for_hitl
+    config:
+      command: "pytest tests/ -k oauth --tb=short -q"
+      test_dir: tests/
+      min_test_count: 1
+      timeout_seconds: 120
+
+  - id: server_starts
     type: shell
-    command: docker build .
-    on_fail: retry_with_modification
-  - id: progress_check
+    runs: after_every_session
+    on_fail: pause_for_hitl
+    config:
+      command: "timeout 5 uvicorn app.main:app --host 127.0.0.1 --port 0 || true"
+      timeout_seconds: 10
+
+  - id: security_scan
+    type: shell
     runs: every_n_sessions
-    n: 5
-    type: llm_judge
-    rubric_file: rubrics/progress.yaml
-    on_fail: switch_strategy
+    n: 5                              # run every 5 sessions
+    on_fail: pause_for_hitl
+    config:
+      command: "bandit -r app/ --severity-level high -q"
 
+# ---------------------------------------------------------------------------
+# Context handoff — files the agent reads at the start of every session
+# ---------------------------------------------------------------------------
+handoff_files:
+  - progress.md        # human-readable narrative of what was done
+  - goals.json         # structured goal graph (runtime-managed)
+  - decisions.jsonl    # key decisions + rationale
+  - failures.jsonl     # what was tried and failed (prevents re-trying broken approaches)
+  - summary.md         # LLM-generated session summary
+
+summarizer:
+  enabled: true
+  trigger_at_context_pct: 70         # compress when context is 70% full
+
+# ---------------------------------------------------------------------------
+# Spin detection — 6 layers catch loops the agent can't catch itself
+# on_spin: terminate_and_retry | terminate_and_hitl | switch_strategy
+# ---------------------------------------------------------------------------
 spin_detection:
-  exact_loop_threshold: 3
-  stagnation_window_sessions: 3
-  stagnation_score_delta: 0.02
-  on_spin: terminate_and_alert
+  enabled: true
+  exact_loop_threshold: 3            # abort after 3 identical tool calls in a row
+  edit_revert_enabled: true          # detect A→B→A→B file flip-flops
+  on_spin: terminate_and_hitl
 
+# ---------------------------------------------------------------------------
+# Human-in-the-loop gates
+# notification_type: console | slack | email | webhook
+# ---------------------------------------------------------------------------
 hitl:
-  gate_on:
-    - milestone_failure
-    - spin_detected
-    - resource_limit_50pct
-  notification: slack
-  channel: "#horizonx-alerts"
+  enabled: true
+  triggers: [validator_paused, spin_detected, subgoal_max_attempts]
+  notification_type: console
 
+# ---------------------------------------------------------------------------
+# Resource limits — hard caps, run aborts when any is hit
+# ---------------------------------------------------------------------------
 resources:
-  max_total_hours: 12
-  max_total_tokens: 5_000_000
-  max_total_usd: 50
+  max_total_hours: 12.0
+  max_total_usd: 60.0
+  max_total_tokens: 6_000_000
+  max_sessions: 100
+  max_steps_per_session: 50
+  max_minutes_per_session: 25.0
 ```
 
-### Define a task in Python (full power)
+Run it:
+
+```bash
+horizonx run task.yaml
+
+# Resume after a crash
+horizonx run task.yaml --resume <run-id>
+```
+
+### Step 4 — Define a task in Python
 
 ```python
-from horizonx import Task, Runtime, ClaudeCodeAgent, SequentialSubgoals
-from horizonx.validators import TestSuiteGate, LLMProgressGate
-from my_validators import SecurityScanGate
+import asyncio
+import yaml
+from horizonx import Runtime, Task
+from horizonx.storage import SqliteStore
 
+# Option A: load from a YAML file
+task = Task.model_validate(yaml.safe_load(open("task.yaml")))
+
+# Option B: build directly from dicts (all fields are Pydantic-validated)
 task = Task(
     id="build-oauth-001",
-    prompt=open("prompts/oauth.md").read(),
-    horizon_class="very_long",
-    strategy=SequentialSubgoals(
-        target_subgoals=(40, 80),
-        per_session_max_steps=50,
-        one_subgoal_at_a_time=True,
-    ),
-    agent=ClaudeCodeAgent(
-        model="claude-opus-4-7",
-        thinking_budget=10000,
-        allowed_tools=["Read", "Edit", "Bash", "Glob", "Grep"],
-    ),
+    name="Implement OAuth 2.0",
+    prompt="...",
+    strategy={"kind": "sequential", "config": {"target_subgoals": [40, 80]}},
+    agent={"type": "claude_code", "model": "claude-opus-4-7"},
     milestone_validators=[
-        TestSuiteGate(runs="after_every_session", command="pytest tests/"),
-        LLMProgressGate(runs_every_n=5, model="claude-haiku-4-5"),
-        SecurityScanGate(runs="after_every_session"),
+        {
+            "id": "tests_pass",
+            "type": "test_suite",
+            "runs": "after_every_session",
+            "on_fail": "pause_for_hitl",
+            "config": {"command": "pytest tests/ -q"},
+        }
     ],
-    handoff_files=["progress.md", "goals.json", "decisions.jsonl"],
-    spin_detection={"exact_loop_threshold": 3, "stagnation_window": 3},
-    resources={"max_hours": 12, "max_tokens": 5_000_000, "max_usd": 50},
+    resources={"max_total_hours": 12.0, "max_total_usd": 60.0},
 )
 
-runtime = Runtime(db_url="sqlite:///horizonx.db")
-report = await runtime.run(task)
+store = SqliteStore("horizonx.db")
+runtime = Runtime(store=store)
+asyncio.run(runtime.run(task))
 ```
+
+See [`examples/python_api.py`](examples/python_api.py) for a complete runnable Python example.
 
 ---
 
