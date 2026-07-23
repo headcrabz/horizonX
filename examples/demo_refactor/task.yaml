@@ -1,0 +1,87 @@
+id: demo-refactor-001
+name: Write then self-critique a stats module
+description: |
+  Self-critique demo. The agent first writes a working but imperfect
+  statistics module, then runs multiple Implementer → Critic rounds to
+  improve it until the LLM critic scores >= 0.85 or 4 rounds exhaust.
+horizon_class: short
+estimated_duration_hours: [0.2, 0.5]
+tags: [demo, coding, self_critique, refactor]
+
+prompt: |
+  Build then improve a Python statistics module through self-critique.
+
+  Step 1 — write working but imperfect code:
+    src/stats.py      — functions: mean, median, mode, std_dev, percentile(data, p)
+    tests/test_stats.py — pytest tests for each function including edge cases
+
+  The initial implementation should be correct but not idiomatic:
+  use manual loops rather than numpy/statistics stdlib so the critic
+  has something concrete to improve.
+
+  Step 2 — self-critique will then iteratively:
+  - Critique the code quality, idioms, type safety, and edge-case handling
+  - Rewrite to use stdlib statistics module where appropriate
+  - Add type annotations (mypy --strict)
+  - Ensure all tests still pass after each revision
+
+  The final module must: export mean, median, mode, std_dev, percentile with
+  type annotations; handle empty input with ValueError; pass all tests.
+
+strategy:
+  kind: self_critique
+  config:
+    max_rounds: 4
+    accept_threshold: 0.85
+    critic_type: llm
+    critic_model: claude-haiku-4-5
+    write_progress: true
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 6000
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
+  extra:
+    permission_mode: bypassPermissions
+
+environment:
+  type: local
+  setup_commands:
+    - "pip install pytest mypy --quiet && mkdir -p src tests"
+
+milestone_validators:
+  - id: tests_pass
+    type: test_suite
+    runs: final
+    on_fail: pause_for_hitl
+    config:
+      command: "pytest tests/ -q"
+      test_dir: tests/
+      test_glob: "test_*.py"
+      min_test_count: 5
+      min_assertion_count: 5
+      timeout_seconds: 30
+
+handoff_files: [progress.md, critique.md, summary.md]
+
+summarizer:
+  enabled: false
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [spin_detected, validator_paused]
+  notification_type: console
+
+resources:
+  max_total_hours: 0.5
+  max_total_usd: 5.0
+  max_total_tokens: 600000
+  max_sessions: 6
+  max_steps_per_session: 50
+  max_minutes_per_session: 12

@@ -1,0 +1,97 @@
+id: demo-rest-api-001
+name: Build a task management REST API (sequential)
+description: |
+  Two-session sequential demo. Session 1 builds the FastAPI data layer
+  and models. Session 2 adds the HTTP routes and integration tests.
+  Shows how HorizonX splits work across session boundaries.
+horizon_class: short
+estimated_duration_hours: [0.2, 0.5]
+tags: [demo, coding, fastapi, sequential]
+
+prompt: |
+  Build a minimal task management REST API using FastAPI from scratch.
+
+  The API manages TODO items. Each item has: id (uuid), title (str),
+  done (bool), created_at (datetime).
+
+  Required endpoints:
+    POST   /tasks           — create a task, return the created item
+    GET    /tasks           — list all tasks (optional ?done=true/false filter)
+    GET    /tasks/{id}      — get one task, 404 if not found
+    PATCH  /tasks/{id}      — update title and/or done flag
+    DELETE /tasks/{id}      — delete task, 404 if not found
+
+  Storage: in-memory dict (no DB needed).
+  Tests: pytest + httpx.AsyncClient against the ASGI app directly (no server needed).
+
+  Files to create:
+    app/models.py    — Pydantic models (Task, CreateTask, UpdateTask)
+    app/store.py     — TaskStore class (in-memory dict)
+    app/routes.py    — FastAPI router with all 5 endpoints
+    app/main.py      — FastAPI app that includes the router
+    tests/test_api.py — httpx AsyncClient tests for all 5 endpoints + edge cases
+
+  All tests must pass. No external services needed.
+
+strategy:
+  kind: sequential
+  config:
+    target_subgoals: [50, 100]
+    max_attempts_per_goal: 2
+    git_commit_each_session: false
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 5000
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
+  extra:
+    permission_mode: bypassPermissions
+
+environment:
+  type: local
+  setup_commands:
+    - "pip install fastapi httpx pytest pytest-asyncio anyio --quiet && mkdir -p app tests"
+
+milestone_validators:
+  - id: tests_pass
+    type: test_suite
+    runs: after_every_session
+    on_fail: pause_for_hitl
+    config:
+      command: "pytest tests/ -q --tb=short"
+      test_dir: tests/
+      test_glob: "test_*.py"
+      min_test_count: 1
+      timeout_seconds: 60
+  - id: server_import
+    type: shell
+    runs: final
+    on_fail: pause_for_hitl
+    config:
+      command: "python -c 'from app.main import app; print(\"app OK\")'"
+      timeout_seconds: 10
+
+handoff_files: [progress.md, goals.json, summary.md]
+
+summarizer:
+  enabled: true
+  trigger_at_context_pct: 75
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [spin_detected, validator_paused]
+  notification_type: console
+
+resources:
+  max_total_hours: 0.5
+  max_total_usd: 6.0
+  max_total_tokens: 800000
+  max_sessions: 4
+  max_steps_per_session: 50
+  max_minutes_per_session: 15

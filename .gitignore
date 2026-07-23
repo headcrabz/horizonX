@@ -61,3 +61,25 @@ horizonx.db
 *.pem
 *.key
 secrets/
+
+# HorizonX knowledge stores (per-project, not committed)
+.horizonx/
+
+# Claude Code / AI tool artifacts
+.claude/worktrees/
+CLAUDE.md.bak
+
+# Workspace files
+*.code-workspace
+
+# Docs — exclude large generated/working files but keep key docs
+docs/*.docx
+docs/build_*.py
+docs/LinkedIn.md
+docs/medium_*.md
+docs/OPENAI_HARNESS_GAP_ANALYSIS.md
+docs/REVIEW_AND_NOVELTY.md
+docs/horizonx.code-workspace
+docs/~$*.docx
+
+# Keep: docs/LONG_HORIZON_AGENT.md, docs/planning/, docs/press/, docs/storage/migrations/
