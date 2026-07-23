@@ -17,6 +17,8 @@ from horizonx.agents.claude_code import ClaudeCodeAgent
 from horizonx.agents.codex import CodexAgent
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
+from horizonx.core.knowledge import RunKnowledgeStore
+from horizonx.core.llm_client import call_llm_json
 from horizonx.core.session_manager import SessionManager
 from horizonx.core.types import (
     GateAction,
@@ -27,18 +29,32 @@ from horizonx.core.types import (
 )
 
 
-def _build_agent(ac: Any):
-    if ac.type == "claude_code":
-        return ClaudeCodeAgent(ac)
-    if ac.type == "codex":
-        return CodexAgent(ac)
-    if ac.type == "custom":
-        from horizonx.agents.custom import CustomAgent
-        return CustomAgent(ac)
-    if ac.type == "mock":
-        from horizonx.agents.mock import MockAgent
-        return MockAgent(config=ac)
-    raise ValueError(f"unknown agent type for SequentialSubgoals: {ac.type}")
+_BUILTIN_AGENTS: dict[str, str] = {
+    "claude_code": "horizonx.agents.claude_code:ClaudeCodeAgent",
+    "codex":       "horizonx.agents.codex:CodexAgent",
+    "custom":      "horizonx.agents.custom:CustomAgent",
+    "mock":        "horizonx.agents.mock:MockAgent",
+}
+
+
+def _build_agent(ac: Any) -> Any:
+    """Build an agent driver from AgentConfig. Supports built-ins and installed entry-points."""
+    import importlib
+    from importlib.metadata import entry_points
+
+    # Fast path: built-ins
+    if ac.type in _BUILTIN_AGENTS:
+        module_path, cls_name = _BUILTIN_AGENTS[ac.type].rsplit(":", 1)
+        cls = getattr(importlib.import_module(module_path), cls_name)
+        return cls(ac)
+
+    # Plugin path: horizonx.agents entry-points
+    eps = {ep.name: ep for ep in entry_points(group="horizonx.agents")}
+    if ac.type in eps:
+        cls = eps[ac.type].load()
+        return cls(ac)
+
+    raise ValueError(f"unknown agent type: {ac.type!r}")
 
 
 class SequentialSubgoals:
@@ -108,6 +124,7 @@ class SequentialSubgoals:
         )
         if result.agent_session_id:
             session.agent_session_id = result.agent_session_id
+        rt.charge(result)
 
         # Verify goals.json was created; if not, we cannot continue.
         graph_path = run.workspace_path / "goals.json"
@@ -175,10 +192,16 @@ class SequentialSubgoals:
         )
         if result.agent_session_id:
             session.agent_session_id = result.agent_session_id
+        rt.charge(result)
 
         # Auto git commit after session
         if self.git_commit_each_session:
             self._git_init_and_commit(run.workspace_path, message=f"session: {goal.id}")
+
+        # Keep FTS5 decision index current for next session's context injection
+        RunKnowledgeStore(run.workspace_path).index_decisions(
+            run.workspace_path / "decisions.jsonl"
+        )
 
         # Run validators after session
         decisions = await rt.run_validators(run, session, when="after_every_session")
@@ -208,8 +231,7 @@ class SequentialSubgoals:
             if decision.action == "modify":
                 graph.append_notes(goal.id, f"HITL guidance: {decision.instruction}", by_session=session.id)
             if decision.action == "re_decompose":
-                # Mark goal for re-decomposition by spawning child goals on the next turn
-                graph.append_notes(goal.id, "HITL: re-decompose requested", by_session=session.id)
+                await self._re_decompose(run, rt, goal, decision.instruction)
             # Continue the loop (do not mark done)
             await rt.end_session(session, result.status or SessionStatus.COMPLETED)
             return
@@ -221,3 +243,83 @@ class SequentialSubgoals:
                 graph.mark_failed(goal.id, by_session=session.id)
 
         await rt.end_session(session, result.status or SessionStatus.COMPLETED)
+
+    # ------------------------------------------------------------------
+    # HITL re-decomposition (HX-10)
+    # ------------------------------------------------------------------
+
+    async def _re_decompose(self, run: Run, rt: Any, current_goal: GoalNode, instruction: str) -> None:
+        """LLM-restructures pending/in-progress goals based on operator instruction."""
+        import sys
+
+        graph_path = run.workspace_path / "goals.json"
+        if not graph_path.exists():
+            return
+
+        graph = GoalGraph.load(graph_path)
+        done_ids = {nid for nid, n in graph._nodes.items() if n.status.value == "done"}
+        restructurable = {
+            nid: n.model_dump(mode="json")
+            for nid, n in graph._nodes.items()
+            if n.status.value != "done"
+        }
+        if not restructurable:
+            return
+
+        prompt = (
+            f"You are restructuring a goal graph for a long-horizon agent task.\n\n"
+            f"TASK: {run.task.name}\n{run.task.prompt[:500]}\n\n"
+            f"OPERATOR INSTRUCTION: {instruction}\n\n"
+            f"CURRENT PENDING/IN-PROGRESS GOALS (JSON):\n{json.dumps(restructurable, indent=2)}\n\n"
+            f"DONE GOALS (preserve, do not include in response): {json.dumps(list(done_ids))}\n\n"
+            "Produce a revised set of pending goals as JSON: "
+            '{\"nodes\": {\"g.root\": {...}, \"g.sub1\": {\"parent_id\": \"g.root\", ...}}}\n'
+            "Rules: all IDs start with 'g.', every non-root node has parent_id, no cycles, "
+            "leaf goals completable in one 25-min session."
+        )
+
+        for attempt in range(2):
+            try:
+                result = await call_llm_json(
+                    system="You are a task decomposition expert. Return only valid JSON.",
+                    user_prompt=prompt,
+                    model="claude-haiku-4-5",
+                )
+                new_nodes_raw = result.get("nodes", {})
+                if not new_nodes_raw:
+                    continue
+
+                merged_nodes: dict[str, GoalNode] = {}
+                for nid, node in graph._nodes.items():
+                    if node.status.value == "done":
+                        merged_nodes[nid] = node
+
+                for nid, raw in new_nodes_raw.items():
+                    raw.setdefault("status", "pending")
+                    raw.setdefault("attempts", 0)
+                    raw.setdefault("notes", "")
+                    raw.setdefault("children", [])
+                    raw.setdefault("verification_criteria", [])
+                    raw.setdefault("description", raw.get("name", ""))
+                    node_data = {k: v for k, v in raw.items() if k != "id"}
+                    merged_nodes[nid] = GoalNode(id=nid, **node_data)
+
+                # Re-attach DONE nodes to their parents so the graph stays connected
+                for nid, node in merged_nodes.items():
+                    if node.status.value == "done" and node.parent_id:
+                        parent = merged_nodes.get(node.parent_id)
+                        if parent is not None and nid not in parent.children:
+                            parent.children.append(nid)
+
+                new_graph = GoalGraph(merged_nodes)
+                new_graph.save(graph_path)
+                for g in new_graph._nodes.values():
+                    await rt.store.save_goal(run.id, g)
+                await rt.bus.publish(Event(
+                    type="goals.re_decomposed",
+                    run_id=run.id,
+                    payload={"instruction": instruction, "new_goal_count": len(new_nodes_raw)},
+                ))
+                return
+            except Exception as exc:
+                sys.stderr.write(f"[re_decompose] attempt {attempt + 1} failed: {exc}\n")

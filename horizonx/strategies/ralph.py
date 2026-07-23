@@ -15,57 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from horizonx.strategies._agent_builder import build_agent as _build_agent
 from horizonx.agents.base import CancelToken, Workspace
-from horizonx.agents.claude_code import ClaudeCodeAgent
-from horizonx.agents.codex import CodexAgent
 from horizonx.core.event_bus import Event
 from horizonx.core.types import Run, SessionStatus
 
-
-def _build_agent(ac: Any):
-    if ac.type == "claude_code":
-        return ClaudeCodeAgent(ac)
-    if ac.type == "codex":
-        return CodexAgent(ac)
-    if ac.type == "custom":
-        from horizonx.agents.custom import CustomAgent
-        return CustomAgent(ac)
-    if ac.type == "mock":
-        from horizonx.agents.mock import MockAgent
-        return MockAgent(config=ac)
-    raise ValueError(f"unknown agent type for RalphLoop: {ac.type}")
-
-
-@dataclass
-class IterationResult:
-    index: int
-    metric: float | None
-    kept: bool
-    elapsed_s: float
-    error: str | None = None
-
-
-RALPH_PROMPT_TEMPLATE = """\
-You are running iteration {iter_index} of a Ralph-loop optimization.
-
-CURRENT METRIC: {current_metric}  (direction: {direction})
-ITERATIONS REMAINING: ~{iters_left}
-TIME BUDGET REMAINING: ~{minutes_left} minutes
-
-YOU MAY ONLY MODIFY THESE FILES:
-{mutable_paths}
-
-DO NOT modify any other files. The harness will revert any foreign changes.
-
-PROCESS:
-  1. Read recent progress.md and decisions.jsonl to see what's been tried.
-  2. Pick ONE specific change (architecture, hyperparameter, optimizer, etc.) likely to improve the metric.
-  3. Make the change and append your hypothesis + rationale to decisions.jsonl.
-  4. Stop. The harness will run the benchmark and decide whether to keep your change.
-
-USER'S BASE INSTRUCTIONS:
-{user_prompt}
-"""
 
 
 class RalphLoop:

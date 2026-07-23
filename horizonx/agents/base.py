@@ -70,11 +70,16 @@ async def stream_subprocess_jsonl(
 ):
     """Spawn a subprocess and yield parsed JSON events from its stdout."""
     import json
+    import os
+
+    # Merge extra env on top of the parent's env so PATH, HOME, and auth
+    # credentials are always available to the child process.
+    effective_env = {**os.environ, **(env or {})}
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd),
-        env=env,
+        env=effective_env,
         stdin=asyncio.subprocess.PIPE if stdin_data else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

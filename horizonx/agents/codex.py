@@ -145,8 +145,14 @@ class CodexAgent:
             status = SessionStatus.SPIN if "spin" in cancel_token.reason else SessionStatus.TIMEOUT
         elif last_error:
             status = SessionStatus.ERRORED
+        totals = self.usage_totals
         return SessionRunResult(
-            agent_session_id=captured_session_id, status=status, error=last_error
+            agent_session_id=captured_session_id,
+            status=status,
+            error=last_error,
+            tokens_in=totals.get("input_tokens", 0) + totals.get("cached_input_tokens", 0),
+            tokens_out=totals.get("output_tokens", 0),
+            cost_usd=0.0,  # codex doesn't report cost directly
         )
 
     # ---------------------------------------------------------------
