@@ -5,7 +5,6 @@ See docs/LONG_HORIZON_AGENT.md §11.
 
 from __future__ import annotations
 
-import asyncio
 import importlib.metadata
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -15,7 +14,7 @@ from typing import Any
 from horizonx.core.event_bus import Event, EventBus, InMemoryBus
 from horizonx.core.governor import ResourceGovernor
 from horizonx.core.recorder import TrajectoryRecorder
-from horizonx.core.spin_detector import SpinDetector
+from horizonx.core.spin_detector import CrossSessionSpinLayer, SpinDetector
 from horizonx.core.summarizer import Summarizer
 from horizonx.core.types import (
     GateAction,
@@ -48,12 +47,30 @@ class Runtime:
         self.workspace_root = workspace_root
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.recorder = TrajectoryRecorder(store=store, bus=self.bus)
+        self._governor_ref: Any = None  # set while a run is active
+
+    async def __aenter__(self) -> Runtime:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        if hasattr(self.store, "close"):
+            await self.store.close()
 
     # ---------------------------------------------------------------
     # Top-level entry
     # ---------------------------------------------------------------
 
     async def run(self, task: Task, *, resume_from: str | None = None) -> Run:
+        # Pre-flight workspace daily budget check
+        if task.workspace and task.workspace.daily_budget_usd is not None:
+            from horizonx.core.usage import UsageStore
+            from horizonx.core.governor import BudgetExceeded
+            spent = await UsageStore(self.store).daily_usd(task.workspace.workspace_id)
+            if spent >= task.workspace.daily_budget_usd:
+                raise BudgetExceeded(
+                    f"workspace {task.workspace.workspace_id!r} daily budget "
+                    f"${task.workspace.daily_budget_usd:.2f} already spent (${spent:.2f} today)"
+                )
         run = await self._load_or_create(task, resume_from)
         await self.store.save_run(run)
         await self.bus.publish(Event(type="run.started", run_id=run.id))
@@ -121,7 +138,11 @@ class Runtime:
         )
 
     async def record_step(self, session: Session, step: Step) -> None:
-        session.steps_count += 1
+        from horizonx.core.housekeeping import is_housekeeping_step
+        if is_housekeeping_step(step):
+            session.housekeeping_steps += 1
+        else:
+            session.steps_count += 1
         await self.recorder.record(session, step)
 
     # ---------------------------------------------------------------
@@ -168,8 +189,12 @@ class Runtime:
     async def check_spin(self, session: Session, run: Run) -> Any:
         if not run.task.spin_detection.enabled:
             return None
+        # In-session layers
         detector = SpinDetector(config=run.task.spin_detection, store=self.store)
         report = await detector.check(session)
+        # Cross-session layer (goal-graph progress check across multiple sessions)
+        if not report.detected:
+            report = await CrossSessionSpinLayer().check_cross_session(run.id, self.store)
         if report.detected:
             await self.store.save_spin_report(session, report)
             await self.bus.publish(
@@ -240,11 +265,33 @@ class Runtime:
 
         return LocalWorkspace(run.workspace_path)
 
+    def charge(self, result: Any) -> None:
+        """Charge the active governor for a completed session. Call after agent.run_session()."""
+        if self._governor_ref is not None and result is not None:
+            self._governor_ref.charge(
+                tokens_in=getattr(result, "tokens_in", 0),
+                tokens_out=getattr(result, "tokens_out", 0),
+                usd=getattr(result, "cost_usd", 0.0),
+            )
+
     @asynccontextmanager
     async def _governor(self, run: Run) -> AsyncIterator[None]:
-        gov = ResourceGovernor(run.task.resources, run, self.bus)
+        usage_store = None
+        velocity_monitor = None
+        if run.task.workspace is not None:
+            from horizonx.core.usage import CostVelocityMonitor, UsageStore
+            usage_store = UsageStore(self.store)
+            velocity_monitor = CostVelocityMonitor()
+        gov = ResourceGovernor(
+            run.task.resources, run, self.bus,
+            hitl_callback=self.request_hitl,
+            usage_store=usage_store,
+            velocity_monitor=velocity_monitor,
+        )
+        self._governor_ref = gov
         async with gov:
             yield
+        self._governor_ref = None
 
     # ---------------------------------------------------------------
     # Loading

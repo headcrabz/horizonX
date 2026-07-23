@@ -38,6 +38,8 @@ EventType = Literal[
     "fork.created",
     "fork.merged",
     "retry.attempted",
+    "goals.re_decomposed",
+    "budget.velocity_alert",
 ]
 
 

@@ -133,7 +133,8 @@ class CumulativeMetrics(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    type: Literal["claude_code", "codex", "openhands", "custom", "mock"]
+    # str allows third-party agent types registered via horizonx.agents entry-points
+    type: str
     model: str
     allowed_tools: list[str] | None = None
     thinking_budget: int | None = None
@@ -224,11 +225,21 @@ class HITLConfig(BaseModel):
     notification_type: Literal["slack", "email", "webhook", "console"] = "console"
     notification_target: str | None = None  # channel / email / url
     require_acknowledgement: bool = False
+    timeout_minutes: int | None = None          # auto-resolve if operator doesn't respond
+    escalation_channel: str | None = None       # secondary Slack channel on timeout
+    escalation_action: Literal["approve", "abort"] | None = None  # default: approve
 
 
 # ---------------------------------------------------------------------------
 # Top-level types
 # ---------------------------------------------------------------------------
+
+
+class WorkspaceConfig(BaseModel):
+    """Per-workspace shared budget and concurrency limits."""
+    workspace_id: str
+    daily_budget_usd: float | None = None   # across all runs today
+    max_concurrent_runs: int = 5
 
 
 class Task(BaseModel):
@@ -259,6 +270,7 @@ class Task(BaseModel):
     spin_detection: SpinDetectionConfig = Field(default_factory=SpinDetectionConfig)
     hitl: HITLConfig = Field(default_factory=HITLConfig)
     resources: ResourceLimits = Field(default_factory=ResourceLimits)
+    workspace: WorkspaceConfig | None = None
 
 
 class Run(BaseModel):
@@ -283,6 +295,7 @@ class Session(BaseModel):
     started_at: datetime = Field(default_factory=utcnow)
     completed_at: datetime | None = None
     steps_count: int = 0
+    housekeeping_steps: int = 0  # cleanup writes/commits — don't consume step budget
     tokens_used: int = 0
     agent_session_id: str | None = None  # Claude Code / Codex session for resume
     handoff_summary_path: Path | None = None
@@ -345,6 +358,9 @@ class SessionRunResult(BaseModel):
     agent_session_id: str | None = None
     status: SessionStatus
     error: str | None = None
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
 
 
 class SpinReport(BaseModel):
