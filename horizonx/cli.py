@@ -141,5 +141,24 @@ def export(ctx: click.Context, run_id: str, fmt: str) -> None:
         click.echo(yaml.safe_dump(data))
 
 
+@main.command()
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8765, type=int, show_default=True)
+@click.option("--workspace-root", default="./horizonx-workspaces", type=Path)
+@click.pass_context
+def serve(ctx: click.Context, host: str, port: int, workspace_root: Path) -> None:
+    """Start the web dashboard (requires horizonx[dashboard])."""
+    try:
+        from horizonx.dashboard.app import create_app
+        import uvicorn
+    except ImportError:
+        raise click.ClickException(
+            "Dashboard extras not installed. Run: pip install horizonx[dashboard]"
+        )
+    app = create_app(db_path=ctx.obj["db"], workspace_root=workspace_root)
+    console.print(f"[bold cyan]HorizonX[/] dashboard → http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 if __name__ == "__main__":
     main()

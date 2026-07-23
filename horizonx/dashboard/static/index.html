@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HorizonX Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen flex flex-col">
+
+  <!-- Nav -->
+  <nav class="border-b border-slate-800 bg-slate-950 px-6 py-3 flex items-center gap-6 shrink-0">
+    <span class="font-bold text-indigo-400 text-lg tracking-tight">HorizonX</span>
+    <a id="nav-runs" href="#/"
+       class="text-slate-400 hover:text-white text-sm transition-colors">Runs</a>
+    <a id="nav-launch" href="#/launch"
+       class="text-slate-400 hover:text-white text-sm transition-colors">Launch</a>
+    <div class="ml-auto">
+      <a href="/api/health" target="_blank"
+         class="text-slate-600 hover:text-slate-400 text-xs">API</a>
+    </div>
+  </nav>
+
+  <!-- ================================================================ -->
+  <!-- View: Runs list                                                   -->
+  <!-- ================================================================ -->
+  <div id="view-runs" class="flex-1 p-6">
+    <div class="flex items-center gap-4 mb-5">
+      <h1 class="text-xl font-semibold text-slate-100">Runs</h1>
+      <select id="runs-filter" onchange="loadRunsList()"
+              class="ml-auto bg-slate-900 border border-slate-700 rounded px-3 py-1.5 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+        <option value="">All statuses</option>
+        <option value="running">Running</option>
+        <option value="completed">Completed</option>
+        <option value="failed">Failed</option>
+        <option value="paused_hitl">Paused (HITL)</option>
+        <option value="aborted">Aborted</option>
+      </select>
+      <button onclick="loadRunsList()"
+              class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-sm text-slate-300 transition-colors">
+        Refresh
+      </button>
+    </div>
+
+    <div class="panel overflow-hidden">
+      <table class="w-full">
+        <thead class="border-b border-slate-800">
+          <tr class="text-slate-500 text-xs uppercase tracking-wider">
+            <th class="text-left px-4 py-3 font-medium">Run ID</th>
+            <th class="text-left px-4 py-3 font-medium">Task</th>
+            <th class="text-left px-4 py-3 font-medium">Status</th>
+            <th class="text-left px-4 py-3 font-medium">Started</th>
+            <th class="text-left px-4 py-3 font-medium">Duration</th>
+            <th class="text-right px-4 py-3 font-medium">Sessions</th>
+            <th class="text-right px-4 py-3 font-medium">Steps</th>
+            <th class="text-right px-4 py-3 font-medium">Cost</th>
+          </tr>
+        </thead>
+        <tbody id="runs-tbody">
+          <tr>
+            <td colspan="8" class="text-center text-slate-500 px-4 py-10 text-sm">Loading…</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- View: Run detail                                                  -->
+  <!-- ================================================================ -->
+  <div id="view-run-detail" class="flex-1 flex flex-col p-6 gap-4" style="display:none">
+
+    <!-- Header -->
+    <div>
+      <div class="text-slate-500 text-sm mb-1">
+        <a href="#/" class="hover:text-slate-300">← Runs</a>
+        <span class="mx-2">/</span>
+        <span id="run-breadcrumb" class="text-slate-300"></span>
+      </div>
+      <div class="flex items-center gap-4 flex-wrap">
+        <div id="run-status-badge"></div>
+        <div id="run-metrics" class="text-sm flex items-center gap-1 flex-wrap"></div>
+        <div class="ml-auto flex gap-2">
+          <button onclick="if(state.currentRunId) api('/api/runs/'+state.currentRunId+'/cancel',{method:'POST'}).then(()=>alert('Cancel signal sent')).catch(e=>alert(e.message))"
+                  class="px-3 py-1 bg-slate-800 hover:bg-slate-700 rounded text-xs text-slate-400">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- HITL banner -->
+    <div id="hitl-banner" style="display:none"
+         class="panel bg-yellow-950 border-yellow-800 px-4 py-3 text-sm">
+    </div>
+
+    <!-- 3-column layout -->
+    <div class="flex-1 grid gap-4 overflow-hidden" style="grid-template-columns: 220px 1fr 300px; grid-template-rows: 1fr 1fr;">
+
+      <!-- Left: sessions + steps -->
+      <div class="panel flex flex-col overflow-hidden row-span-2">
+        <div class="px-3 py-2 border-b border-slate-800 text-xs text-slate-500 uppercase tracking-wider font-medium shrink-0">
+          Sessions
+        </div>
+        <div id="sessions-list" class="overflow-y-auto flex-1">
+          <div class="text-slate-500 text-xs p-3">Loading…</div>
+        </div>
+        <div class="border-t border-slate-800 px-3 py-2 text-xs text-slate-500 uppercase tracking-wider font-medium shrink-0">
+          Steps
+        </div>
+        <div id="steps-panel" class="overflow-y-auto" style="max-height: 50%;">
+          <div class="text-slate-500 text-xs p-3">Select a session</div>
+        </div>
+      </div>
+
+      <!-- Center top: live event stream -->
+      <div class="panel flex flex-col overflow-hidden">
+        <div class="px-3 py-2 border-b border-slate-800 flex items-center gap-2 shrink-0">
+          <span class="text-xs text-slate-500 uppercase tracking-wider font-medium">Live Events</span>
+          <label class="ml-auto flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer">
+            <input type="checkbox" checked onchange="state.pinScroll = this.checked"
+                   class="accent-indigo-500"> Newest first
+          </label>
+        </div>
+        <div id="event-stream" class="overflow-y-auto flex-1 p-1"></div>
+      </div>
+
+      <!-- Center bottom: (placeholder or second panel) -->
+      <div class="panel flex flex-col overflow-hidden" style="display:none"></div>
+
+      <!-- Right: tabs -->
+      <div class="panel flex flex-col overflow-hidden row-span-2">
+        <div class="flex border-b border-slate-800 px-1 shrink-0">
+          <button id="tab-goals" class="tab-btn active" onclick="setRightTab('goals')">Goals</button>
+          <button id="tab-validations" class="tab-btn" onclick="setRightTab('validations')">Validators</button>
+          <button id="tab-hitl" class="tab-btn" onclick="setRightTab('hitl')">HITL</button>
+        </div>
+        <div id="panel-goals" class="overflow-y-auto flex-1"></div>
+        <div id="panel-validations" class="overflow-y-auto flex-1" style="display:none"></div>
+        <div id="panel-hitl" class="overflow-y-auto flex-1" style="display:none"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- View: Launch                                                      -->
+  <!-- ================================================================ -->
+  <div id="view-launch" class="flex-1 p-6 max-w-3xl" style="display:none">
+    <h1 class="text-xl font-semibold text-slate-100 mb-6">Launch a Run</h1>
+    <div class="panel p-5">
+      <label class="block text-slate-400 text-sm mb-2">Task definition (YAML or JSON)</label>
+      <textarea id="launch-yaml" rows="24"
+        class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 font-mono text-xs text-slate-200 focus:outline-none focus:border-indigo-500 resize-none"
+        placeholder="id: my-task&#10;name: My Task&#10;prompt: |&#10;  Do something useful&#10;strategy:&#10;  kind: single&#10;agent:&#10;  type: claude_code&#10;  model: claude-opus-4-7"></textarea>
+      <div class="flex items-center gap-4 mt-4">
+        <button id="launch-btn" onclick="submitLaunch()"
+                class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-medium transition-colors">
+          Launch
+        </button>
+        <span id="launch-status" class="text-sm text-slate-400"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- js-yaml for YAML parsing in the launch form -->
+  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4/dist/js.yaml.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
