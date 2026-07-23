@@ -167,25 +167,73 @@ class ScorePlateauLayer:
         return SpinReport(detected=False)
 
 
+IDEMPOTENT_TOOL_NAMES = frozenset({
+    "Read", "Glob", "Grep", "LS",
+    "WebSearch", "WebFetch",
+    "NotebookRead",
+})
+
+MUTATING_TOOL_NAMES = frozenset({
+    "Write", "Edit", "MultiEdit",
+    "Bash",
+    "NotebookEdit",
+})
+
+
+def _result_hash(step: Step) -> str:
+    """Hash of what the tool returned — for no-progress detection on idempotent reads."""
+    result = step.content.get("output") or step.content.get("result") or step.content.get("stdout") or ""
+    return hashlib.sha256(str(result)[:2000].encode()).hexdigest()[:16]
+
+
 class ToolThrashingLayer:
     name = "tool_thrashing"
 
+    def __init__(
+        self,
+        no_progress_threshold: int = 5,
+        repeat_threshold: int = 4,
+        window: int = 30,
+    ):
+        self.no_progress_threshold = no_progress_threshold
+        self.repeat_threshold = repeat_threshold
+        self.window = window
+
     async def check(self, session: Session, store: Any) -> SpinReport:
-        steps = await store.recent_steps(session.id, 30)
-        tools = [s.tool_name for s in steps if s.type == StepType.TOOL_CALL and s.tool_name]
-        if len(tools) < 10:
-            return SpinReport(detected=False)
-        # If same tool >= 70% of last 20 calls, suspicious
-        c = Counter(tools[-20:])
-        top, n = c.most_common(1)[0]
-        if n / 20 >= 0.7 and top in {"Bash", "bash", "shell"}:
-            return SpinReport(
-                detected=True,
-                layer=self.name,
-                detail={"tool": top, "count": n, "window": 20},
-                action="warn_and_inject_diagnostic",
-            )
-        return SpinReport(detected=False)
+        steps = await store.recent_steps(session.id, self.window)
+        tool_steps = [s for s in steps if s.type == StepType.TOOL_CALL]
+
+        # Idempotent: same tool + same result hash → no progress (reading same thing repeatedly)
+        idempotent = [s for s in tool_steps if s.tool_name in IDEMPOTENT_TOOL_NAMES]
+        if idempotent:
+            result_hashes = Counter(_result_hash(s) for s in idempotent if s.content)
+            if result_hashes:
+                top_count = result_hashes.most_common(1)[0][1]
+                if top_count >= self.no_progress_threshold:
+                    return SpinReport(
+                        detected=True,
+                        layer=self.name,
+                        detail={"kind": "no_progress", "count": top_count,
+                                "threshold": self.no_progress_threshold},
+                        action="warn_and_inject_diagnostic",
+                    )
+
+        # Mutating: same tool + same args hash → stuck loop
+        mutating = [s for s in tool_steps if s.tool_name in MUTATING_TOOL_NAMES]
+        if mutating:
+            arg_hashes = Counter(_hash_step(s) for s in mutating if s.content)
+            if arg_hashes:
+                top_count = arg_hashes.most_common(1)[0][1]
+                if top_count >= self.repeat_threshold:
+                    return SpinReport(
+                        detected=True,
+                        layer=self.name,
+                        detail={"kind": "repeat_mutation", "count": top_count,
+                                "threshold": self.repeat_threshold},
+                        action="terminate_session_and_retry",
+                    )
+
+        return SpinReport(detected=False, layer=self.name)
 
 
 SEMANTIC_SPIN_SYSTEM = """\
@@ -267,6 +315,43 @@ class SemanticProgressLayer:
                 action="terminate_and_re_decompose",
             )
         return SpinReport(detected=False)
+
+
+class CrossSessionSpinLayer:
+    """Detects stagnation across multiple sessions: lots of activity, no goal completions.
+
+    Fires when the last `window` completed sessions have produced zero DONE goal transitions.
+    """
+
+    name = "cross_session"
+
+    def __init__(self, window: int = 8, min_sessions: int = 4):
+        self.window = window
+        self.min_sessions = min_sessions
+
+    async def check_cross_session(self, run_id: str, store: Any) -> SpinReport:
+        sessions = await store.list_sessions(run_id)
+        recent = [s for s in sessions if s.status == "completed"][-self.window:]
+
+        if len(recent) < self.min_sessions:
+            return SpinReport(detected=False, layer=self.name)
+
+        session_ids = {s.id for s in recent}
+        goals = await store.list_goals(run_id)
+        done_in_window = [
+            g for g in goals
+            if g.status == "done" and g.last_updated_by_session in session_ids
+        ]
+
+        if done_in_window:
+            return SpinReport(detected=False, layer=self.name)
+
+        return SpinReport(
+            detected=True,
+            layer=self.name,
+            detail={"sessions_checked": len(recent), "goals_completed_in_window": 0},
+            action="terminate_and_hitl",
+        )
 
 
 class SpinDetector:

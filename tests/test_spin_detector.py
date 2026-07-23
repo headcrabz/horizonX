@@ -148,22 +148,40 @@ class TestScorePlateauLayer:
 class TestToolThrashingLayer:
     @pytest.mark.asyncio
     async def test_no_thrashing(self):
+        """Diverse tools with distinct Read outputs should not trigger."""
         store = MagicMock()
         tools = ["Bash", "Edit", "Read", "Bash", "Edit", "Read", "Bash", "Edit", "Read", "Bash",
                  "Edit", "Read", "Bash", "Edit", "Read", "Bash", "Edit", "Read", "Bash", "Edit"]
-        store.recent_steps = AsyncMock(return_value=[
-            _tool_step(i, tool=t) for i, t in enumerate(tools)
-        ])
+        # Give each Read step a distinct output so no-progress detection doesn't fire
+        steps = []
+        for i, t in enumerate(tools):
+            content = {"output": f"result_{i}"} if t == "Read" else {"command": f"cmd_{i}"}
+            steps.append(_tool_step(i, tool=t, content=content))
+        store.recent_steps = AsyncMock(return_value=steps)
         layer = ToolThrashingLayer()
         session = Session(run_id="r1", sequence_index=0)
         report = await layer.check(session, store)
         assert not report.detected
 
     @pytest.mark.asyncio
-    async def test_thrashing_detected(self):
+    async def test_thrashing_detected_repeat_mutation(self):
+        """Same Bash command repeated ≥4 times triggers repeat_mutation."""
         store = MagicMock()
         store.recent_steps = AsyncMock(return_value=[
-            _tool_step(i, tool="Bash") for i in range(25)
+            _tool_step(i, tool="Bash", content={"command": "make build"}) for i in range(25)
+        ])
+        layer = ToolThrashingLayer()
+        session = Session(run_id="r1", sequence_index=0)
+        report = await layer.check(session, store)
+        assert report.detected
+        assert report.detail.get("kind") == "repeat_mutation"
+
+    @pytest.mark.asyncio
+    async def test_thrashing_detected(self):
+        """Same Bash command repeated many times triggers repeat_mutation detection."""
+        store = MagicMock()
+        store.recent_steps = AsyncMock(return_value=[
+            _tool_step(i, tool="Bash", content={"command": "pytest tests/"}) for i in range(25)
         ])
         layer = ToolThrashingLayer()
         session = Session(run_id="r1", sequence_index=0)
