@@ -467,10 +467,15 @@ class SessionManager:
         # 1. base prompt template
         # 2. goal graph (loaded from goals.json)
         # 3. progress.md (last 100 lines)
-        # 4. decisions.jsonl (last 20 entries)
-        # 5. failures.jsonl (matching this goal)
-        # 6. summary.md (from previous session)
-        # 7. session checklist (Anthropic pattern)
+        # 4. decisions.jsonl — FTS5 relevance search (NOT simple tail-20)
+        #    RunKnowledgeStore searches by goal name+description, returns top-K
+        #    relevant past decisions ranked by similarity. Deduplicates against a
+        #    recency anchor (last 5 entries). Caps combined injection at 4000 chars.
+        # 5. workspace/knowledge/*.md — FTS5 cross-run facts from WorkspaceKnowledgeStore
+        #    Pinned facts always injected. Top-K relevant facts by goal query.
+        # 6. failures.jsonl (matching this goal)
+        # 7. summary.md (from previous session)
+        # 8. session checklist (Anthropic pattern)
         prompt = self._compose_session_prompt(run, target_goal)
         agent_session_id = await self._maybe_resume(run, session)
         return session
@@ -587,6 +592,23 @@ Future sessions read this file and avoid retrying the same failed approaches.
 
 ### `summary.md` — last session's compressed handoff
 The Summarizer (§15) produces this at session close.
+
+### `knowledge/` — cross-run persistent facts
+
+Agents write Markdown files to `workspace/knowledge/<slug>.md` during sessions. HorizonX indexes them after each session into a per-workspace FTS5 SQLite store (`WorkspaceKnowledgeStore`). Future runs — including runs weeks later — receive relevant facts injected automatically into their session prompt.
+
+```markdown
+<!-- workspace/knowledge/auth_findings.md -->
+---
+tags: [jwt, security, python]
+---
+PyJWT 2.8+ requires explicit algorithm parameter in decode().
+Standard session tokens fail on mobile clients due to cookie SameSite=Strict.
+```
+
+**Storage location**: `<workspace_parent>/.horizonx/<workspace_id>/knowledge.db` — relative to the project workspace root, never written to `~/.horizonx/` unconditionally (which would break CI and Docker environments).
+
+**FTS5 retrieval**: `search(query, limit=8)` matches by goal name + description using `unicode61` tokeniser. Pinned facts (`status='pinned'`) are always injected regardless of relevance. A recency anchor (last 3 facts) supplements the relevance results to prevent very old workspaces from serving stale-only context.
 
 ---
 
@@ -768,23 +790,52 @@ Default in-memory pub/sub for single-process; swap in Redis/NATS for multi-proce
 
 ## 19. Resource governor
 
-Enforces hard budgets.
+Enforces hard budgets. `charge()` is called by `Runtime.charge(result)` after every `agent.run_session()` — using real token counts from the agent stream, not estimates.
 
 ```python
 class ResourceGovernor:
-    def __init__(self, limits: ResourceLimits):
-        self.limits = limits
-        self.consumed = ResourceConsumed()
+    def __init__(self, limits, run, bus, *,
+                 hitl_callback=None, usage_store=None, velocity_monitor=None):
+        ...
 
-    def charge(self, *, tokens=0, usd=0.0, seconds=0.0):
-        self.consumed += (tokens, usd, seconds)
-        if self.consumed.exceeds_threshold(self.limits, 0.5):
-            self.bus.publish(BudgetEvent(50))
-        if self.consumed.exceeds(self.limits):
-            raise BudgetExceeded(self.consumed)
+    def charge(self, *, tokens_in=0, tokens_out=0, usd=0.0):
+        # Update cumulative metrics on the Run object
+        c = self.run.cumulative
+        c.tokens_in += tokens_in; c.tokens_out += tokens_out; c.usd += usd
+
+        # Velocity monitoring — fires if $/min doubles twice in succession
+        if self.velocity_monitor:
+            self.velocity_monitor.record(usd)
+            if self.velocity_monitor.is_runaway():
+                asyncio.create_task(self.bus.publish(Event("budget.velocity_alert")))
+                if self.hitl_callback:
+                    asyncio.create_task(self.hitl_callback(
+                        self.run, reason="budget_velocity_runaway", ...))
+
+        # Per-workspace daily accounting (fire-and-forget)
+        if self.usage_store and self.run.task.workspace:
+            asyncio.create_task(self.usage_store.record(
+                self.run.task.workspace.workspace_id, self.run.id,
+                tokens_in, tokens_out, usd))
+
+        self._check_thresholds()
+
+    def _check_thresholds(self):
+        # Fires HITL callback at 75% (non-blocking, from sync context)
+        for pct in (50, 75, 90):
+            if pct not in self._notified and self._utilization() >= pct / 100:
+                self._notified.add(pct)
+                asyncio.create_task(self.bus.publish(
+                    Event("budget.threshold", payload={"pct": pct})))
+                if pct == 75 and self.hitl_callback and \
+                   "budget_threshold_75" in (self.run.task.hitl.triggers or []):
+                    asyncio.create_task(self.hitl_callback(
+                        self.run, reason="budget_threshold_75", ...))
 ```
 
-Budgets: wall-clock seconds · total tokens · total USD (model-priced) · per-session and per-run. Notifications at 50%, 75%, 90%, 100%.
+**Per-workspace daily budget**: `WorkspaceConfig.daily_budget_usd` is checked at the start of `Runtime.run()` before any session begins. If the workspace has already spent its daily allowance, `BudgetExceeded` is raised immediately. `CostVelocityMonitor` uses a sliding-window doubling detector — fires when $/min rate doubles twice in succession, the signature of a runaway loop rather than steady execution.
+
+**`SessionRunResult` carries real token counts**: `tokens_in`, `tokens_out`, `cost_usd` are populated by each agent driver from their internal usage tracking (Claude Code `result` event, Codex usage accumulator). `Runtime.charge(result)` passes these to the active governor. Budget enforcement was previously non-functional because `charge()` was never called in production code paths.
 
 ---
 
@@ -1287,6 +1338,35 @@ class CustomAgent(BaseAgent):
 
 Any binary that can accept a task prompt and emit structured lines is a valid HorizonX agent.
 
+### 24.5 SDK agent driver
+
+For API-based agents that don't need a subprocess shim. Pass any Python async generator that yields `Step` objects:
+
+```python
+async def my_agent(prompt: str, workspace_path: Path):
+    yield Step(session_id="", sequence=0, type=StepType.THOUGHT,
+               content={"text": "planning..."})
+    # call your LLM SDK, yield more steps
+    yield Step(session_id="", sequence=1, type=StepType.THOUGHT,
+               content={"text": "done"})
+
+task = Task(agent=AgentConfig(type="sdk", extra={"callable": my_agent}))
+```
+
+`SDKAgent` is the built-in driver (`agents/sdk.py`). It iterates the generator, stamps each step with the session ID, calls `on_step`, and returns `SessionRunResult.COMPLETED`.
+
+### Entry-point registration
+
+All agent types (built-in and third-party) are registered via Python entry-points. Third-party agents installed via pip are automatically discovered:
+
+```toml
+# your_package/pyproject.toml
+[project.entry-points."horizonx.agents"]
+my_agent = "my_package.agents:MyAgent"
+```
+
+`AgentConfig.type` accepts any string — Pydantic validation does not restrict to built-in types, so third-party types resolve at runtime via the entry-point registry.
+
 ---
 
 ## 25. Milestone validators — gates not graders
@@ -1348,24 +1428,30 @@ class SecurityScanGate(BaseValidator):
 
 ## 26. Spin detection — multi-layer anti-cycling
 
-Spin detection is HorizonX's most distinctive feature. Six layers run in sequence; the first to fire terminates the check and triggers recovery.
+Spin detection is HorizonX's most distinctive feature. **Seven layers** run in sequence — six in-session layers plus one cross-session layer that catches stagnation invisible to per-session checks.
 
 ```python
 class SpinDetector:
+    """Six in-session layers checked per-session."""
     layers = [
         ExactLoopLayer(hard_threshold=3, soft_threshold=2, window=20),
         EditRevertLayer(),
         ScorePlateauLayer(window=3, delta=0.02),
-        ToolThrashingLayer(),
+        ToolThrashingLayer(),          # rewritten — IDEMPOTENT/MUTATING frozensets
         BucketedHashLayer(soft_threshold=3, hard_threshold=5, window=30),
         SemanticProgressLayer(model="claude-haiku-4-5", every_n=20),
     ]
 
     async def check(self, session) -> SpinReport:
         for layer in self.layers:
-            r = await layer.check(session)
+            r = await layer.check(session, self.store)
             if r.detected: return r
         return SpinReport(detected=False)
+
+# Seventh layer — checked by Runtime after in-session layers pass
+class CrossSessionSpinLayer:
+    """Detects when N sessions complete but zero GoalNodes transition to DONE."""
+    async def check_cross_session(self, run_id, store) -> SpinReport: ...
 ```
 
 ### 26.1 Layer 1 — Exact loop (cheap, deterministic)
@@ -1429,7 +1515,15 @@ class ScorePlateauLayer:
 
 ### 26.4 Layer 4 — Tool thrashing
 
-Same tool with contradictory args (`enable=True` then `enable=False`) within K steps, or one tool used exclusively for >80% of the last 20 calls.
+Two independent detection paths using typed frozensets:
+
+```python
+IDEMPOTENT_TOOL_NAMES = frozenset({"Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch", "NotebookRead"})
+MUTATING_TOOL_NAMES   = frozenset({"Write", "Edit", "MultiEdit", "Bash", "NotebookEdit"})
+```
+
+- **No-progress reads**: same idempotent tool returning identical output hash ≥ `no_progress_threshold` times → `warn_and_inject_diagnostic`
+- **Repeat mutations**: same mutating tool with identical arg hash ≥ `repeat_threshold` times → `terminate_session_and_retry`
 
 ### 26.5 Layer 5 — Bucketed hash (fuzzy repetition)
 
@@ -1482,6 +1576,40 @@ This avoids false positives (some tools are legitimately called twice) while sti
 | Bucketed hash (soft) | `warn_and_inject_diagnostic` | Minor variation, not a hard loop yet |
 | Bucketed hash (hard) | `terminate_and_retry` | Fuzzy loop confirmed |
 | Semantic | `terminate_and_re_decompose` | Goal too big or unclear |
+| **Cross-session** | `terminate_and_hitl` | Multiple sessions, zero goal progress — structural issue |
+
+### Layer 7 — Cross-session (run-level, not session-level)
+
+Checked by `Runtime.check_spin()` after all in-session layers pass clean:
+
+```python
+class CrossSessionSpinLayer:
+    """
+    Fires when: last `window` completed sessions produced zero DONE
+    goal transitions in the goal graph.
+
+    Catches the failure mode where each session does real-looking work
+    but the task never actually advances — invisible to per-session layers.
+    """
+    async def check_cross_session(self, run_id: str, store) -> SpinReport:
+        sessions = await store.list_sessions(run_id)
+        recent = [s for s in sessions if s.status == "completed"][-self.window:]
+        if len(recent) < self.min_sessions:
+            return SpinReport(detected=False, layer=self.name)
+        session_ids = {s.id for s in recent}
+        goals = await store.list_goals(run_id)
+        done_in_window = [g for g in goals
+                          if g.status == "done"
+                          and g.last_updated_by_session in session_ids]
+        if done_in_window:
+            return SpinReport(detected=False, layer=self.name)
+        return SpinReport(detected=True, layer=self.name,
+                          action="terminate_and_hitl")
+```
+
+### Housekeeping step budget refund
+
+Mandatory session cleanup steps — writing `summary.md`, `progress.md`, `goals.json`, `decisions.jsonl`, git add/commit — are classified by `is_housekeeping_step()` and credited to `session.housekeeping_steps` instead of `session.steps_count`. The agent's full step budget is reserved for real work.
 
 ---
 
@@ -1687,6 +1815,19 @@ Some moments need humans. HorizonX surfaces them and waits.
 5. Decision recorded as a `Step` of type `HITL_DECISION` in `hitl_events`
 6. Run resumes with operator's instruction injected into next session prompt
 
+### HITL actions
+
+| Action | What happens |
+|---|---|
+| `approve` | Run continues from next session |
+| `modify` | Operator instruction appended to goal notes; injected into next prompt |
+| `abort` | Goal marked FAILED; run terminates |
+| `re_decompose` | LLM (Haiku) restructures all pending/in-progress goal nodes based on operator instruction; DONE nodes preserved exactly |
+
+#### re_decompose
+
+When an operator selects `re_decompose` and provides an instruction (e.g. "split the API goal into separate auth and data layers"), a `claude-haiku` call restructures the pending goal sub-graph. The restructured graph is written to `goals.json` and synced to the DB. `goals.re_decomposed` event fires. Validated DONE nodes are re-attached to their parents in the new structure so no completed work is lost.
+
 ### HITL config
 
 ```yaml
@@ -1694,23 +1835,23 @@ hitl:
   triggers:
     - spin_detected
     - validator_paused
-    - budget_threshold: 75
+    - budget_threshold_75       # Slack alert at 75% spend
     - subgoal_max_attempts
-  notification:
-    type: slack
-    channel: "#horizonx-alerts"
-    severity_routing:
-      critical: "@oncall"
-      normal: "channel"
-  context_payload:
-    include_summary: true
-    include_recent_progress: 50    # last 50 progress.md lines
-    include_failures_for_goal: true
-    include_dashboard_link: true
-  resume_protocol:
-    inject_operator_instruction: true
-    require_acknowledgement: false
+  notification_type: slack
+  notification_target: "#horizonx-alerts"
+  timeout_minutes: 30           # auto-resolve if operator doesn't respond
+  escalation_channel: "#oncall" # secondary channel on timeout
+  escalation_action: approve    # auto-approve (or abort) on timeout
 ```
+
+### Slack HITL implementation
+
+`hitl/gate.py` uses `slack_sdk.web.async_client.AsyncWebClient` to send Block Kit cards:
+- **Header**: run ID + reason
+- **Context snippet**: relevant fields from `context` dict (capped 500 chars)
+- **Action buttons**: ✅ Approve · ✏️ Modify · 🛑 Abort (danger style)
+
+Webhook notifications retry 3 times (0 / 5 / 15 s backoff) and log failures to stderr rather than swallowing them. On timeout, the gate resolves autonomously using `escalation_action` without operator input — critical for long-running experiments where human interruption would introduce bias.
 
 ---
 
@@ -2197,39 +2338,46 @@ report = await runtime.run(task)
 
 | Component | Notes |
 |---|---|
-| `core/types.py` — Task, Run, Session, Step, GoalNode | Full Pydantic v2 schema |
-| `core/runtime.py` — orchestrator with fork/merge | Primitives: start/end session, record step, run validators |
-| `core/goal_graph.py` — versioned DAG | Cycle detection, dependency ordering, status propagation |
-| `core/event_bus.py` — in-memory pub/sub | Swap Redis/NATS for multi-process |
+| `core/types.py` — Task, Run, Session, Step, GoalNode, WorkspaceConfig | Full Pydantic v2 schema. `AgentConfig.type` is `str` to allow third-party types. |
+| `core/runtime.py` — orchestrator | `start/end_session`, `record_step`, `run_validators`, `check_spin`, `charge(result)`, `request_hitl`. Async context manager for store cleanup. |
+| `core/goal_graph.py` — versioned DAG | Cycle detection, dependency ordering, status propagation, `last_updated_by_session` tracking |
+| `core/event_bus.py` — in-memory pub/sub | Events include `goals.re_decomposed`, `budget.velocity_alert`, `hitl.resolved` |
 | `core/summarizer.py` — context compression | Structured output, Haiku model by default |
-| `core/spin_detector.py` — 6 layers | ExactLoop (dual-threshold), EditRevert, ScorePlateau, ToolThrashing, BucketedHash, Semantic |
-| `core/governor.py` — resource limits | Wall-clock, tokens, USD, per-session caps, stall watchdog |
-| `storage/sqlite.py` — durable store | aiosqlite async, all tables from §17 |
-| `agents/claude_code.py` — full driver | stream-json, thinking, MCP, session resume |
-| `agents/codex.py` — full driver | JSONL stream, reasoning-effort, stdin prompt, resume |
+| `core/spin_detector.py` — **7 layers** | ExactLoop (dual-threshold), EditRevert, ScorePlateau, ToolThrashing (IDEMPOTENT/MUTATING frozensets), BucketedHash, Semantic, **CrossSessionSpinLayer** |
+| `core/housekeeping.py` — step budget refund | Classifies mandatory cleanup steps so they don't consume agent step budget |
+| `core/knowledge.py` — per-run FTS5 decisions | `RunKnowledgeStore`: relevance-ranked decision injection replacing tail-20 recency |
+| `core/governor.py` — resource limits | `charge()` wired to real token events from `SessionRunResult`. `CostVelocityMonitor` (doubling detector). `UsageStore` for per-workspace daily accounting. HITL fires at 75% via `asyncio.create_task`. |
+| `core/usage.py` — workspace budgets | `UsageStore` + `CostVelocityMonitor`. Pre-flight budget check in `Runtime.run()`. |
+| `storage/sqlite.py` — durable store | Single-worker `ThreadPoolExecutor`, WAL mode. Tables: runs, sessions (+ `housekeeping_steps`), steps, goals, validations, hitl_events, spin_reports, `pending_runs`, `workspace_usage` |
+| `agents/claude_code.py` — full driver | stream-json, session resume, populates `tokens_in/out/cost_usd` in `SessionRunResult` |
+| `agents/codex.py` — full driver | JSONL stream, stdin prompt, resume, usage populated |
 | `agents/openhands.py` — full driver | CLI + server mode, event streaming |
 | `agents/custom.py` — subprocess wrapper | 4 prompt modes, text/jsonl output, cancel, timeout |
-| All 8 strategies | single, sequential, ralph, tree, monitor, decomposition, pair, self_critique |
-| All 6 validators | test_suite, shell, llm_judge, metric, git, goal_graph |
-| `hitl/gate.py` | Pause/resume, decision routing |
-| `runtime/watchdog.py` | Stall watchdog with soft nudge → hard abort |
+| `agents/sdk.py` — API-based driver | Wraps any Python async generator; no subprocess needed |
+| `agents/template.py` — third-party template | Documents `BaseAgent` protocol for external driver authors |
+| `strategies/_agent_builder.py` — shared dispatch | `_BUILTIN_AGENTS` fast-path + `horizonx.agents` entry-points fallback; used by all 8 strategies |
+| All 8 strategies | single, sequential, ralph, tree, monitor, decomposition, pair, self_critique — all use `_agent_builder` |
+| All 6 validators | test_suite, shell, llm_judge, metric, git, goal_graph — registry uses `horizonx.validators` entry-points |
+| `hitl/gate.py` — real Slack HITL | Block Kit cards, 3-attempt webhook retry (0/5/15s backoff), `timeout_minutes` escalation, `re_decompose` action wired to LLM goal restructuring |
+| `memory/knowledge_store.py` — cross-run FTS5 | `WorkspaceKnowledgeStore`: persists facts across runs, stored relative to workspace root, never `~/.horizonx/` |
+| `memory/handoff.py` — session sync | `KnowledgeHandoffDir.sync()` indexes `knowledge/*.md` with YAML frontmatter tag support |
+| `dashboard/` — crash-safe web UI | FastAPI + SSE. `pending_runs` table. `recovery.py` re-attaches in-flight runs on startup. |
 | `agents/repair.py` | Dangling tool-call repair |
-| `cli.py` | `run`, `watch`, `show`, `list`, `fork`, `serve` |
-| 8 example tasks | One per strategy, all runnable |
-| `examples/master_template.yaml` | Every config option annotated with defaults |
-| 238 tests, all passing | Module-aligned test files |
-
-### In progress 🔧
-
-- Web dashboard (FastAPI + SSE) — shipped (`horizonx serve`, single-process in-memory bus)
-- PostgreSQL backend — DDL ready, driver pending
+| `cli.py` | `run`, `watch`, `show`, `list`, `fork`, `serve`, `knowledge` |
+| `.github/workflows/ci.yml` | Python 3.11 + 3.12 matrix, ruff + pytest |
+| `docker-compose.yml` | Zero-config local setup |
+| **277 tests, all passing** | Module-aligned test files including new: test_hitl_gate, test_re_decompose, test_knowledge_store, test_sdk_agent, test_usage, test_dashboard_routes |
 
 ### Planned 📋
 
+- `PolicyEngine` — T1 Python callable policies (task_intake, session_start, step_emit phases)
+- Z3 SMT constraint policies (optional `horizonx[z3]`)
+- LLM classifier policies (optional `horizonx[policy-llm]`, runs every N steps)
+- `DELEGATE` step type — dynamic sub-agent delegation for specialist routing
+- A2A Protocol driver + server endpoint for cross-orchestrator interop
+- Atomic task claim semantics (`BEGIN IMMEDIATE`) for parallel multi-agent goal assignment
+- PostgreSQL backend
 - Multi-process / distributed runs (Redis event bus)
-- Cost dashboard with live model pricing
-- Playwright e2e validator
-- Plugin entry-points for third-party agents/validators (pyproject entry-points already wired for first-party)
 - `composite` strategy — pipeline multiple strategies in sequence
 
 ---

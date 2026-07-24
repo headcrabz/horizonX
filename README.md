@@ -1,7 +1,7 @@
 # HorizonX
 
 <p align="center">
-  <img src="docs/press/horizonx_banner.svg" alt="HorizonX — Meta-harness orchestrating multiple AI agents with goal graphs, spin detection, and cross-session memory" width="100%"/>
+  <img src="docs/horizonx_banner.png" alt="HorizonX — Long-horizon agent execution harness" width="100%"/>
 </p>
 
 **A production-grade execution harness for long-horizon AI agent tasks.**
