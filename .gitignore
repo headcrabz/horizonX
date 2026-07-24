@@ -72,14 +72,12 @@ CLAUDE.md.bak
 # Workspace files
 *.code-workspace
 
-# Docs — exclude large generated/working files but keep key docs
+# Docs — only LONG_HORIZON_AGENT.md is tracked; everything else is excluded
+docs/planning/
+docs/press/
 docs/*.docx
-docs/build_*.py
-docs/LinkedIn.md
-docs/medium_*.md
-docs/OPENAI_HARNESS_GAP_ANALYSIS.md
-docs/REVIEW_AND_NOVELTY.md
-docs/horizonx.code-workspace
-docs/~$*.docx
-
-# Keep: docs/LONG_HORIZON_AGENT.md, docs/planning/, docs/press/, docs/storage/migrations/
+docs/*.py
+docs/*.md
+docs/*.code-workspace
+docs/~$*
+!docs/LONG_HORIZON_AGENT.md
