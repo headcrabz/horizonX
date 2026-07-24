@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from typing import Any
 
 from horizonx.core.types import HITLConfig, HITLDecision, Run
@@ -22,13 +23,13 @@ async def await_decision(
 
     # Print structured context
     sys.stderr.write("\n" + "=" * 70 + "\n")
-    sys.stderr.write(f"⚠️  HITL pause — run {run.id}\n")
+    sys.stderr.write(f"HITL pause — run {run.id}\n")
     sys.stderr.write(f"   reason: {reason}\n")
     sys.stderr.write(f"   context: {json.dumps(context, default=str, indent=2)[:1000]}\n")
     sys.stderr.write("=" * 70 + "\n")
 
     if cfg.notification_type == "slack":
-        await _notify_slack(cfg.notification_target, run.id, reason, context)
+        await _notify_slack(cfg.notification_target, run.id, reason, context, cfg)
     elif cfg.notification_type == "webhook":
         await _notify_webhook(cfg.notification_target, run.id, reason, context)
 
@@ -36,9 +37,28 @@ async def await_decision(
     decision_path = run.workspace_path / ".hitl_decision.json"
 
     if not sys.stdin.isatty() and not os.environ.get("HORIZONX_HITL_AUTO_APPROVE"):
-        # Wait for decision file
+        # Wait for decision file, with optional timeout escalation
+        start_time = time.monotonic()
+        timeout_secs = (cfg.timeout_minutes or 0) * 60
+
         while not decision_path.exists():
             await asyncio.sleep(2.0)
+            if timeout_secs and (time.monotonic() - start_time) >= timeout_secs:
+                # Escalate to secondary channel if configured
+                if cfg.escalation_channel and cfg.notification_type == "slack":
+                    await _notify_slack(
+                        cfg.escalation_channel,
+                        run.id,
+                        f"TIMEOUT: {reason}",
+                        context,
+                        cfg,
+                    )
+                action = cfg.escalation_action or "approve"
+                return HITLDecision(
+                    action=action,
+                    instruction=f"auto-{action} after {cfg.timeout_minutes}m timeout",
+                )
+
         data = json.loads(decision_path.read_text())
         decision_path.unlink()
         return HITLDecision(**data)
@@ -59,20 +79,96 @@ async def await_decision(
     return HITLDecision(action=action, instruction=instruction)
 
 
-async def _notify_slack(channel: str | None, run_id: str, reason: str, ctx: dict) -> None:
-    if not channel:
-        return
-    # Stub. Real impl: from slack_sdk.web.async_client import AsyncWebClient
-    sys.stderr.write(f"[slack] would notify {channel} for {run_id}: {reason}\n")
-
-
-async def _notify_webhook(url: str | None, run_id: str, reason: str, ctx: dict) -> None:
-    if not url:
+async def _notify_slack(
+    channel: str | None,
+    run_id: str,
+    reason: str,
+    ctx: dict[str, Any],
+    cfg: HITLConfig,
+) -> None:
+    token = os.environ.get("HORIZONX_SLACK_TOKEN")
+    if not token or not channel:
         return
     try:
-        import httpx
+        from slack_sdk.web.async_client import AsyncWebClient  # type: ignore[import]
 
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(url, json={"run_id": run_id, "reason": reason, "context": ctx})
-    except Exception:
-        pass
+        client = AsyncWebClient(token=token)
+        await client.chat_postMessage(
+            channel=channel,
+            text=f"HorizonX HITL pause — {reason}",
+            blocks=[
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": f"Agent paused: {reason}"},
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Run:* `{run_id}`\n*Reason:* {reason}",
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"```{json.dumps(ctx, default=str)[:500]}```",
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "action_id": "hitl_approve",
+                            "value": f"{run_id}:approve",
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Modify"},
+                            "action_id": "hitl_modify",
+                            "value": f"{run_id}:modify",
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Abort"},
+                            "style": "danger",
+                            "action_id": "hitl_abort",
+                            "value": f"{run_id}:abort",
+                        },
+                    ],
+                },
+            ],
+        )
+    except ImportError:
+        sys.stderr.write("[hitl] slack_sdk not installed — pip install horizonx[slack]\n")
+    except Exception as e:
+        sys.stderr.write(f"[hitl] slack notification failed: {e}\n")
+
+
+async def _notify_webhook(
+    url: str | None,
+    run_id: str,
+    reason: str,
+    ctx: dict[str, Any],
+) -> None:
+    if not url:
+        return
+    payload = {"run_id": run_id, "reason": reason, "context": ctx}
+    for attempt, delay in enumerate([0, 5, 15], start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, json=payload)
+                if resp.status_code < 500:
+                    return
+                sys.stderr.write(
+                    f"[hitl] webhook attempt {attempt} got {resp.status_code}\n"
+                )
+        except Exception as e:
+            sys.stderr.write(f"[hitl] webhook attempt {attempt} failed: {e}\n")
+    sys.stderr.write(f"[hitl] webhook {url} failed after 3 attempts\n")

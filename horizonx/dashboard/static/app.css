@@ -1,0 +1,73 @@
+/* HorizonX Dashboard — supplemental styles on top of Tailwind CDN */
+
+:root {
+  --bg: #09090f;
+  --surface: #111118;
+  --border: #1e1e30;
+  --text: #e2e8f0;
+  --muted: #64748b;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+  font-size: 14px;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: #2a2a40; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3a55; }
+
+/* Custom badge variants */
+.badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.badge-running   { background: #1d4ed8; color: #bfdbfe; }
+.badge-completed { background: #166534; color: #bbf7d0; }
+.badge-failed    { background: #991b1b; color: #fecaca; }
+.badge-paused_hitl { background: #854d0e; color: #fef08a; }
+.badge-aborted   { background: #374151; color: #9ca3af; }
+.badge-timed_out { background: #9a3412; color: #fed7aa; }
+.badge-pending   { background: #1f2937; color: #9ca3af; }
+
+/* Event stream entries */
+.event-entry { border-left: 2px solid #1e1e30; padding: 4px 8px; margin-bottom: 2px; font-size: 12px; font-family: monospace; }
+.event-entry:hover { background: #1a1a28; }
+
+.ev-run       { border-color: #6366f1; }
+.ev-session   { border-color: #06b6d4; }
+.ev-step      { border-color: #374151; }
+.ev-goal      { border-color: #22c55e; }
+.ev-validator { border-color: #eab308; }
+.ev-spin      { border-color: #f97316; }
+.ev-hitl      { border-color: #facc15; }
+.ev-budget    { border-color: #f97316; }
+.ev-summary   { border-color: #a855f7; }
+.ev-fork      { border-color: #a855f7; }
+.ev-retry     { border-color: #f59e0b; }
+
+/* Goal tree */
+.goal-node { padding: 4px 0; }
+.goal-node details > summary { cursor: pointer; list-style: none; }
+.goal-node details > summary::-webkit-details-marker { display: none; }
+
+/* Panel */
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+
+/* Step content */
+.step-content { font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow-y: auto; color: #94a3b8; }
+
+/* Pulse animation for running status */
+@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+
+/* Sessions rail */
+.session-item { padding: 6px 10px; border-radius: 6px; cursor: pointer; transition: background 0.1s; }
+.session-item:hover { background: #1a1a28; }
+.session-item.active { background: #1e1e35; border-left: 2px solid #6366f1; }
+
+/* Tabs */
+.tab-btn { padding: 6px 14px; border-radius: 6px 6px 0 0; font-size: 13px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }
+.tab-btn.active { color: var(--text); border-bottom-color: #6366f1; }
+.tab-btn:hover { color: var(--text); }

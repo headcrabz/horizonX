@@ -1,0 +1,24 @@
+services:
+  horizonx:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+      - horizonx-workspaces:/app/horizonx-workspaces
+    command: >
+      sh -c "pip install -e '.[dev,dashboard]' -q &&
+             horizonx serve --port 8080"
+    ports:
+      - "8080:8080"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      HORIZONX_DB: /app/horizonx.db
+      HORIZONX_SLACK_TOKEN: ${HORIZONX_SLACK_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/runs"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  horizonx-workspaces:

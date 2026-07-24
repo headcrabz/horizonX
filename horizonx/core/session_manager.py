@@ -6,10 +6,10 @@ See docs/LONG_HORIZON_AGENT.md §13.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from horizonx.core.goal_graph import GoalGraph
-from horizonx.core.types import GoalNode, Run, ResourceLimits
+from horizonx.core.knowledge import RunKnowledgeStore
+from horizonx.core.types import GoalNode, Run
 
 SESSION_PROMPT_TEMPLATE = """\
 You are working on: {task_name}
@@ -78,7 +78,24 @@ class SessionManager:
         if target_goal is None:
             return self._compose_initializer_prompt()
 
-        graph = self._load_goal_graph()
+        knowledge = RunKnowledgeStore(self.workspace)
+        query = f"{target_goal.name} {target_goal.description}"
+        relevant = knowledge.search(query, limit=12)
+        recent_anchor = knowledge.recent(5)
+        # Deduplicate: recent_anchor entries that aren't already in relevant
+        seen = set(relevant)
+        extra = [r for r in recent_anchor if r not in seen]
+        combined = relevant + extra
+        # Cap at 4000 chars total
+        cap = 4000
+        total = 0
+        capped = []
+        for entry in combined:
+            if total + len(entry) > cap:
+                break
+            capped.append(entry)
+            total += len(entry)
+        decisions_tail = "\n".join(capped) if capped else "(no decisions yet)"
         return SESSION_PROMPT_TEMPLATE.format(
             task_name=self.run.task.name,
             goal_id=target_goal.id,
@@ -87,7 +104,7 @@ class SessionManager:
             verification_criteria="\n".join(f"    - {c}" for c in target_goal.verification_criteria) or "    (none)",
             summary_md=self._read_or_default("summary.md", "(no previous summary)"),
             progress_tail=self._tail("progress.md", 80),
-            decisions_tail=self._tail_jsonl("decisions.jsonl", 20),
+            decisions_tail=decisions_tail,
             failures_for_goal=self._failures_for_goal(target_goal.id),
             git_log=self._git_log(),
             max_steps=self.run.task.resources.max_steps_per_session,

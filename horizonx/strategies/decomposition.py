@@ -20,6 +20,7 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
+from horizonx.strategies._agent_builder import build_agent as _build_agent
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
@@ -48,21 +49,6 @@ Output ONLY a JSON object:
 }
 """
 
-
-def _build_agent(ac: AgentConfig) -> Any:
-    if ac.type == "claude_code":
-        from horizonx.agents.claude_code import ClaudeCodeAgent
-        return ClaudeCodeAgent(ac)
-    if ac.type == "codex":
-        from horizonx.agents.codex import CodexAgent
-        return CodexAgent(ac)
-    if ac.type == "custom":
-        from horizonx.agents.custom import CustomAgent
-        return CustomAgent(ac)
-    if ac.type == "mock":
-        from horizonx.agents.mock import MockAgent
-        return MockAgent(config=ac)
-    raise ValueError(f"unknown agent type for DecompositionFirst: {ac.type}")
 
 
 class DecompositionFirst:

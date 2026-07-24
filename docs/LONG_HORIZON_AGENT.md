@@ -2217,11 +2217,11 @@ report = await runtime.run(task)
 | `cli.py` | `run`, `watch`, `show`, `list`, `fork`, `serve` |
 | 8 example tasks | One per strategy, all runnable |
 | `examples/master_template.yaml` | Every config option annotated with defaults |
-| 222 tests, all passing | Module-aligned test files |
+| 238 tests, all passing | Module-aligned test files |
 
 ### In progress 🔧
 
-- Web dashboard (FastAPI + SSE) — server scaffolded, UI in progress
+- Web dashboard (FastAPI + SSE) — shipped (`horizonx serve`, single-process in-memory bus)
 - PostgreSQL backend — DDL ready, driver pending
 
 ### Planned 📋

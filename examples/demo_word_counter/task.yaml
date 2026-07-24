@@ -1,0 +1,82 @@
+id: demo-word-counter-001
+name: Build a word frequency CLI tool
+description: |
+  Single-session demo. The agent builds a complete word frequency counter
+  CLI tool from scratch — argument parsing, core logic, tests, and a
+  working binary — in one focused session.
+horizon_class: short
+estimated_duration_hours: [0.1, 0.3]
+tags: [demo, coding, cli, single-session]
+
+prompt: |
+  Build a complete Python CLI word frequency counter from scratch.
+
+  Create the following files:
+    src/word_counter.py   — core logic (count_words, top_n, read_file helpers)
+    src/cli.py            — click-based CLI (wc-freq <file> [--top N] [--sort asc|desc])
+    tests/test_counter.py — pytest tests for count_words and top_n
+    README.md             — one-paragraph usage example
+
+  Requirements:
+  - count_words(text) returns Counter[str] (lowercase, strip punctuation)
+  - top_n(counter, n) returns list of (word, count) sorted by frequency descending
+  - CLI wc-freq reads a file path, prints top 10 words by default
+  - --top N flag overrides the default
+  - --sort desc (default) or asc flag reverses ordering
+  - All tests must pass with pytest
+  - Type annotations on all public functions (mypy --strict)
+
+  Keep it simple and working. No external dependencies beyond click and pytest.
+
+strategy:
+  kind: single
+  config: {}
+
+agent:
+  type: claude_code
+  model: claude-opus-4-7
+  thinking_budget: 5000
+  allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
+  extra:
+    permission_mode: bypassPermissions
+
+environment:
+  type: local
+  setup_commands:
+    - "pip install click pytest mypy --quiet && mkdir -p src tests"
+
+milestone_validators:
+  - id: tests_pass
+    type: test_suite
+    runs: final
+    on_fail: pause_for_hitl
+    config:
+      command: "pytest tests/ -q"
+      test_dir: tests/
+      test_glob: "test_*.py"
+      min_test_count: 3
+      min_assertion_count: 3
+      timeout_seconds: 30
+
+handoff_files: [progress.md, summary.md]
+
+summarizer:
+  enabled: false
+
+spin_detection:
+  enabled: true
+  exact_loop_threshold: 3
+  on_spin: terminate_and_hitl
+
+hitl:
+  enabled: true
+  triggers: [spin_detected, validator_paused]
+  notification_type: console
+
+resources:
+  max_total_hours: 0.25
+  max_total_usd: 3.0
+  max_total_tokens: 500000
+  max_sessions: 3
+  max_steps_per_session: 40
+  max_minutes_per_session: 15
