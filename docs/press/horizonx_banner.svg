@@ -1,0 +1,287 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#070710"/>
+      <stop offset="50%" style="stop-color:#0d0a1f"/>
+      <stop offset="100%" style="stop-color:#070710"/>
+    </linearGradient>
+    <linearGradient id="hxGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366f1"/>
+      <stop offset="100%" style="stop-color:#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="agentGrad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1e1b4b"/>
+      <stop offset="100%" style="stop-color:#312e81"/>
+    </linearGradient>
+    <linearGradient id="agentGrad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a3e"/>
+      <stop offset="100%" style="stop-color:#2d2b6b"/>
+    </linearGradient>
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4f46e5;stop-opacity:0.3"/>
+      <stop offset="100%" style="stop-color:#7c3aed;stop-opacity:0.05"/>
+    </linearGradient>
+    <linearGradient id="goalGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#059669"/>
+      <stop offset="100%" style="stop-color:#047857"/>
+    </linearGradient>
+    <radialGradient id="glowCenter" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:#6366f1;stop-opacity:0.25"/>
+      <stop offset="100%" style="stop-color:#6366f1;stop-opacity:0"/>
+    </radialGradient>
+    <radialGradient id="glowAgent1" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:#4f46e5;stop-opacity:0.2"/>
+      <stop offset="100%" style="stop-color:#4f46e5;stop-opacity:0"/>
+    </radialGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="softglow">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#6366f1" flood-opacity="0.3"/>
+    </filter>
+    <marker id="arrowPurple" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 z" fill="#6366f1" opacity="0.8"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 z" fill="#10b981" opacity="0.8"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 z" fill="#f59e0b" opacity="0.8"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="630" fill="url(#bg)"/>
+
+  <!-- Subtle grid -->
+  <g opacity="0.03">
+    <line x1="0" y1="63" x2="1200" y2="63" stroke="#6366f1" stroke-width="1"/>
+    <line x1="0" y1="126" x2="1200" y2="126" stroke="#6366f1" stroke-width="1"/>
+    <line x1="0" y1="189" x2="1200" y2="189" stroke="#6366f1" stroke-width="1"/>
+    <line x1="0" y1="252" x2="1200" y2="252" stroke="#6366f1" stroke-width="1"/>
+    <line x1="0" y1="315" x2="1200" y2="315" stroke="#6366f1" stroke-width="1"/>
+    <line x1="0" y1="378" x2="1200" y2="378" stroke="#6366f1" stroke-width="1"/>
+    <line x1="0" y1="441" x2="1200" y2="441" stroke="#6366f1" stroke-width="1"/>
+    <line x1="0" y1="504" x2="1200" y2="504" stroke="#6366f1" stroke-width="1"/>
+    <line x1="0" y1="567" x2="1200" y2="567" stroke="#6366f1" stroke-width="1"/>
+    <line x1="120" y1="0" x2="120" y2="630" stroke="#6366f1" stroke-width="1"/>
+    <line x1="240" y1="0" x2="240" y2="630" stroke="#6366f1" stroke-width="1"/>
+    <line x1="360" y1="0" x2="360" y2="630" stroke="#6366f1" stroke-width="1"/>
+    <line x1="480" y1="0" x2="480" y2="630" stroke="#6366f1" stroke-width="1"/>
+    <line x1="600" y1="0" x2="600" y2="630" stroke="#6366f1" stroke-width="1"/>
+    <line x1="720" y1="0" x2="720" y2="630" stroke="#6366f1" stroke-width="1"/>
+    <line x1="840" y1="0" x2="840" y2="630" stroke="#6366f1" stroke-width="1"/>
+    <line x1="960" y1="0" x2="960" y2="630" stroke="#6366f1" stroke-width="1"/>
+    <line x1="1080" y1="0" x2="1080" y2="630" stroke="#6366f1" stroke-width="1"/>
+  </g>
+
+  <!-- Ambient glow behind center -->
+  <ellipse cx="600" cy="155" rx="220" ry="120" fill="url(#glowCenter)" opacity="0.8"/>
+  <ellipse cx="210" cy="420" rx="120" ry="80" fill="url(#glowAgent1)" opacity="0.6"/>
+  <ellipse cx="990" cy="420" rx="120" ry="80" fill="url(#glowAgent1)" opacity="0.6"/>
+
+  <!-- ─── OUTER RING ────────────────────────────────── -->
+  <circle cx="600" cy="155" r="108" fill="none" stroke="#4f46e5" stroke-width="1" stroke-dasharray="4,8" opacity="0.3"/>
+  <circle cx="600" cy="155" r="88" fill="none" stroke="#6366f1" stroke-width="1" opacity="0.15"/>
+
+  <!-- ─── PUPPET STRINGS ─────────────────────────────── -->
+  <!-- String to Agent 1 (far left) -->
+  <path d="M 555,195 Q 320,310 215,355" stroke="#6366f1" stroke-width="1.5" fill="none" stroke-dasharray="6,4" opacity="0.6"/>
+  <!-- String to Agent 2 (left) -->
+  <path d="M 575,200 Q 465,310 425,355" stroke="#6366f1" stroke-width="1.5" fill="none" stroke-dasharray="6,4" opacity="0.6"/>
+  <!-- String to Agent 3 (center) -->
+  <path d="M 600,210 L 600,355" stroke="#6366f1" stroke-width="1.5" fill="none" stroke-dasharray="6,4" opacity="0.6"/>
+  <!-- String to Agent 4 (right) -->
+  <path d="M 625,200 Q 735,310 775,355" stroke="#6366f1" stroke-width="1.5" fill="none" stroke-dasharray="6,4" opacity="0.6"/>
+  <!-- String to Agent 5 (far right) -->
+  <path d="M 645,195 Q 880,310 985,355" stroke="#6366f1" stroke-width="1.5" fill="none" stroke-dasharray="6,4" opacity="0.6"/>
+
+  <!-- String attachment knots -->
+  <circle cx="555" cy="195" r="3" fill="#6366f1" opacity="0.8"/>
+  <circle cx="575" cy="200" r="3" fill="#6366f1" opacity="0.8"/>
+  <circle cx="600" cy="210" r="3" fill="#6366f1" opacity="0.8"/>
+  <circle cx="625" cy="200" r="3" fill="#6366f1" opacity="0.8"/>
+  <circle cx="645" cy="195" r="3" fill="#6366f1" opacity="0.8"/>
+
+  <!-- ─── HORIZONX META-HARNESS (CENTER TOP) ──────── -->
+  <rect x="490" y="65" width="220" height="180" rx="20" fill="url(#agentGrad1)" filter="url(#shadow)"/>
+  <rect x="490" y="65" width="220" height="180" rx="20" fill="none" stroke="#6366f1" stroke-width="1.5"/>
+  <!-- Top accent bar -->
+  <rect x="490" y="65" width="220" height="4" rx="2" fill="url(#hxGrad)"/>
+
+  <!-- HX icon -->
+  <circle cx="600" cy="118" r="28" fill="url(#hxGrad)" opacity="0.15"/>
+  <circle cx="600" cy="118" r="28" fill="none" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="600" y="125" font-family="'SF Mono',monospace" font-size="20" font-weight="900" fill="white" text-anchor="middle" filter="url(#glow)">HX</text>
+
+  <text x="600" y="163" font-family="'Inter',sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle" letter-spacing="1">HorizonX</text>
+  <text x="600" y="180" font-family="'Inter',sans-serif" font-size="9.5" font-weight="500" fill="#a5b4fc" text-anchor="middle" letter-spacing="0.5">META-ORCHESTRATOR</text>
+
+  <!-- Pills inside HX box -->
+  <rect x="510" y="195" width="80" height="18" rx="9" fill="rgba(99,102,241,0.2)" stroke="#6366f1" stroke-width="0.8"/>
+  <text x="550" y="208" font-family="'SF Mono',monospace" font-size="8" fill="#a5b4fc" text-anchor="middle">goal graph</text>
+  <rect x="610" y="195" width="80" height="18" rx="9" fill="rgba(99,102,241,0.2)" stroke="#6366f1" stroke-width="0.8"/>
+  <text x="650" y="208" font-family="'SF Mono',monospace" font-size="8" fill="#a5b4fc" text-anchor="middle">validators</text>
+
+  <!-- ─── AGENT CARDS ──────────────────────────────── -->
+
+  <!-- Agent 1 — Claude Code (far left) -->
+  <rect x="120" y="355" width="180" height="155" rx="14" fill="#0f1020" stroke="#4f46e5" stroke-width="1.2"/>
+  <rect x="120" y="355" width="180" height="3" rx="2" fill="#6366f1"/>
+  <circle cx="210" cy="395" r="18" fill="rgba(99,102,241,0.15)" stroke="#6366f1" stroke-width="1"/>
+  <text x="210" y="401" font-family="'SF Mono',monospace" font-size="13" fill="#a5b4fc" text-anchor="middle" font-weight="700">CC</text>
+  <text x="210" y="428" font-family="'Inter',sans-serif" font-size="11" font-weight="700" fill="white" text-anchor="middle">Claude Code</text>
+  <text x="210" y="446" font-family="'Inter',sans-serif" font-size="9" fill="#64748b" text-anchor="middle">Implementation</text>
+  <!-- Status bar -->
+  <rect x="135" y="460" width="150" height="6" rx="3" fill="#1e2030"/>
+  <rect x="135" y="460" width="112" height="6" rx="3" fill="#6366f1" opacity="0.8"/>
+  <text x="210" y="485" font-family="'SF Mono',monospace" font-size="8" fill="#475569" text-anchor="middle">session 7 · goal g.auth</text>
+  <text x="210" y="500" font-family="'SF Mono',monospace" font-size="8" fill="#22c55e" text-anchor="middle">● running</text>
+
+  <!-- Agent 2 — Codex (left) -->
+  <rect x="335" y="355" width="180" height="155" rx="14" fill="#0f1020" stroke="#7c3aed" stroke-width="1.2"/>
+  <rect x="335" y="355" width="180" height="3" rx="2" fill="#7c3aed"/>
+  <circle cx="425" cy="395" r="18" fill="rgba(124,58,237,0.15)" stroke="#7c3aed" stroke-width="1"/>
+  <text x="425" y="401" font-family="'SF Mono',monospace" font-size="13" fill="#c4b5fd" text-anchor="middle" font-weight="700">CX</text>
+  <text x="425" y="428" font-family="'Inter',sans-serif" font-size="11" font-weight="700" fill="white" text-anchor="middle">Codex</text>
+  <text x="425" y="446" font-family="'Inter',sans-serif" font-size="9" fill="#64748b" text-anchor="middle">Architecture Search</text>
+  <rect x="350" y="460" width="150" height="6" rx="3" fill="#1e2030"/>
+  <rect x="350" y="460" width="90" height="6" rx="3" fill="#7c3aed" opacity="0.8"/>
+  <text x="425" y="485" font-family="'SF Mono',monospace" font-size="8" fill="#475569" text-anchor="middle">session 4 · goal g.arch</text>
+  <text x="425" y="500" font-family="'SF Mono',monospace" font-size="8" fill="#22c55e" text-anchor="middle">● running</text>
+
+  <!-- Agent 3 — OpenHands (center) -->
+  <rect x="510" y="355" width="180" height="155" rx="14" fill="#0f1020" stroke="#0891b2" stroke-width="1.2"/>
+  <rect x="510" y="355" width="180" height="3" rx="2" fill="#0891b2"/>
+  <circle cx="600" cy="395" r="18" fill="rgba(8,145,178,0.15)" stroke="#0891b2" stroke-width="1"/>
+  <text x="600" y="401" font-family="'SF Mono',monospace" font-size="13" fill="#67e8f9" text-anchor="middle" font-weight="700">OH</text>
+  <text x="600" y="428" font-family="'Inter',sans-serif" font-size="11" font-weight="700" fill="white" text-anchor="middle">OpenHands</text>
+  <text x="600" y="446" font-family="'Inter',sans-serif" font-size="9" fill="#64748b" text-anchor="middle">Evaluation Loop</text>
+  <rect x="525" y="460" width="150" height="6" rx="3" fill="#1e2030"/>
+  <rect x="525" y="460" width="130" height="6" rx="3" fill="#0891b2" opacity="0.8"/>
+  <text x="600" y="485" font-family="'SF Mono',monospace" font-size="8" fill="#475569" text-anchor="middle">session 9 · goal g.eval</text>
+  <text x="600" y="500" font-family="'SF Mono',monospace" font-size="8" fill="#22c55e" text-anchor="middle">● running</text>
+
+  <!-- Agent 4 — Custom (right) -->
+  <rect x="685" y="355" width="180" height="155" rx="14" fill="#0f1020" stroke="#059669" stroke-width="1.2"/>
+  <rect x="685" y="355" width="180" height="3" rx="2" fill="#059669"/>
+  <circle cx="775" cy="395" r="18" fill="rgba(5,150,105,0.15)" stroke="#059669" stroke-width="1"/>
+  <text x="775" y="401" font-family="'SF Mono',monospace" font-size="11" fill="#6ee7b7" text-anchor="middle" font-weight="700">SDK</text>
+  <text x="775" y="428" font-family="'Inter',sans-serif" font-size="11" font-weight="700" fill="white" text-anchor="middle">Custom Agent</text>
+  <text x="775" y="446" font-family="'Inter',sans-serif" font-size="9" fill="#64748b" text-anchor="middle">Data Pipeline</text>
+  <rect x="700" y="460" width="150" height="6" rx="3" fill="#1e2030"/>
+  <rect x="700" y="460" width="60" height="6" rx="3" fill="#059669" opacity="0.8"/>
+  <text x="775" y="485" font-family="'SF Mono',monospace" font-size="8" fill="#475569" text-anchor="middle">session 2 · goal g.data</text>
+  <text x="775" y="500" font-family="'SF Mono',monospace" font-size="8" fill="#f59e0b" text-anchor="middle">◎ initialising</text>
+
+  <!-- Agent 5 — Monitor (far right) -->
+  <rect x="900" y="355" width="180" height="155" rx="14" fill="#0f1020" stroke="#e11d48" stroke-width="1.2"/>
+  <rect x="900" y="355" width="180" height="3" rx="2" fill="#e11d48"/>
+  <circle cx="990" cy="395" r="18" fill="rgba(225,29,72,0.15)" stroke="#e11d48" stroke-width="1"/>
+  <text x="990" y="401" font-family="'SF Mono',monospace" font-size="11" fill="#fda4af" text-anchor="middle" font-weight="700">MON</text>
+  <text x="990" y="428" font-family="'Inter',sans-serif" font-size="11" font-weight="700" fill="white" text-anchor="middle">Monitor</text>
+  <text x="990" y="446" font-family="'Inter',sans-serif" font-size="9" fill="#64748b" text-anchor="middle">Validation &amp; Spin</text>
+  <rect x="915" y="460" width="150" height="6" rx="3" fill="#1e2030"/>
+  <rect x="915" y="460" width="150" height="6" rx="3" fill="#e11d48" opacity="0.8"/>
+  <text x="990" y="485" font-family="'SF Mono',monospace" font-size="8" fill="#475569" text-anchor="middle">7 layers · watching</text>
+  <text x="990" y="500" font-family="'SF Mono',monospace" font-size="8" fill="#22c55e" text-anchor="middle">● active</text>
+
+  <!-- ─── BOTTOM SHARED LAYER ──────────────────────── -->
+  <rect x="80" y="540" width="1040" height="60" rx="12" fill="#0a0c18" stroke="#1e2030" stroke-width="1"/>
+  <!-- Left: Goal Graph indicator -->
+  <text x="120" y="563" font-family="'SF Mono',monospace" font-size="9" fill="#6366f1" font-weight="700">SHARED CONTEXT</text>
+  <!-- Goal nodes -->
+  <circle cx="240" cy="568" r="7" fill="none" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="240" y="572" font-family="'SF Mono',monospace" font-size="6" fill="#22c55e" text-anchor="middle">✓</text>
+  <text x="240" y="584" font-family="'SF Mono',monospace" font-size="7" fill="#475569" text-anchor="middle">g.root</text>
+  <line x1="247" y1="568" x2="272" y2="568" stroke="#374151" stroke-width="1" stroke-dasharray="2,2"/>
+  <circle cx="280" cy="568" r="7" fill="none" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="280" y="572" font-family="'SF Mono',monospace" font-size="6" fill="#22c55e" text-anchor="middle">✓</text>
+  <text x="280" y="584" font-family="'SF Mono',monospace" font-size="7" fill="#475569" text-anchor="middle">g.auth</text>
+  <line x1="287" y1="568" x2="312" y2="568" stroke="#374151" stroke-width="1" stroke-dasharray="2,2"/>
+  <circle cx="320" cy="568" r="7" fill="rgba(99,102,241,0.3)" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="320" y="572" font-family="'SF Mono',monospace" font-size="6" fill="#a5b4fc" text-anchor="middle">▶</text>
+  <text x="320" y="584" font-family="'SF Mono',monospace" font-size="7" fill="#6366f1" text-anchor="middle">g.api</text>
+  <line x1="327" y1="568" x2="352" y2="568" stroke="#1e2030" stroke-width="1" stroke-dasharray="2,2"/>
+  <circle cx="360" cy="568" r="7" fill="none" stroke="#374151" stroke-width="1.5"/>
+  <text x="360" y="572" font-family="'SF Mono',monospace" font-size="6" fill="#374151" text-anchor="middle">○</text>
+  <text x="360" y="584" font-family="'SF Mono',monospace" font-size="7" fill="#374151" text-anchor="middle">g.test</text>
+  <line x1="367" y1="568" x2="392" y2="568" stroke="#1e2030" stroke-width="1" stroke-dasharray="2,2"/>
+  <circle cx="400" cy="568" r="7" fill="none" stroke="#374151" stroke-width="1.5"/>
+  <text x="400" y="572" font-family="'SF Mono',monospace" font-size="6" fill="#374151" text-anchor="middle">○</text>
+  <text x="400" y="584" font-family="'SF Mono',monospace" font-size="7" fill="#374151" text-anchor="middle">g.deploy</text>
+
+  <!-- Divider -->
+  <line x1="440" y1="548" x2="440" y2="592" stroke="#1e2030" stroke-width="1"/>
+
+  <!-- Budget indicator -->
+  <text x="460" y="563" font-family="'SF Mono',monospace" font-size="9" fill="#f59e0b" font-weight="700">BUDGET</text>
+  <rect x="460" y="568" width="120" height="8" rx="4" fill="#1e2030"/>
+  <rect x="460" y="568" width="90" height="8" rx="4" fill="#f59e0b" opacity="0.7"/>
+  <text x="590" y="575" font-family="'SF Mono',monospace" font-size="8" fill="#f59e0b">75%</text>
+  <text x="460" y="592" font-family="'SF Mono',monospace" font-size="7.5" fill="#475569">$3.75 / $5.00 · alert armed</text>
+
+  <!-- Divider -->
+  <line x1="670" y1="548" x2="670" y2="592" stroke="#1e2030" stroke-width="1"/>
+
+  <!-- Memory / FTS5 -->
+  <text x="690" y="563" font-family="'SF Mono',monospace" font-size="9" fill="#a5b4fc" font-weight="700">KNOWLEDGE</text>
+  <text x="690" y="580" font-family="'SF Mono',monospace" font-size="7.5" fill="#475569">12 facts indexed · FTS5</text>
+  <text x="690" y="592" font-family="'SF Mono',monospace" font-size="7.5" fill="#475569">cross-run memory active</text>
+
+  <!-- Divider -->
+  <line x1="870" y1="548" x2="870" y2="592" stroke="#1e2030" stroke-width="1"/>
+
+  <!-- Spin status -->
+  <text x="890" y="563" font-family="'SF Mono',monospace" font-size="9" fill="#22c55e" font-weight="700">SPIN · 7 LAYERS</text>
+  <text x="890" y="580" font-family="'SF Mono',monospace" font-size="7.5" fill="#475569">no loops detected</text>
+  <text x="890" y="592" font-family="'SF Mono',monospace" font-size="7.5" fill="#22c55e">● all clear</text>
+
+  <!-- Upward feed lines from agents to shared layer -->
+  <line x1="210" y1="510" x2="210" y2="540" stroke="#6366f1" stroke-width="1" stroke-dasharray="3,3" opacity="0.4"/>
+  <line x1="425" y1="510" x2="425" y2="540" stroke="#6366f1" stroke-width="1" stroke-dasharray="3,3" opacity="0.4"/>
+  <line x1="600" y1="510" x2="600" y2="540" stroke="#6366f1" stroke-width="1" stroke-dasharray="3,3" opacity="0.4"/>
+  <line x1="775" y1="510" x2="775" y2="540" stroke="#6366f1" stroke-width="1" stroke-dasharray="3,3" opacity="0.4"/>
+  <line x1="990" y1="510" x2="990" y2="540" stroke="#6366f1" stroke-width="1" stroke-dasharray="3,3" opacity="0.4"/>
+
+  <!-- ─── FLOATING LABELS ─────────────────────────── -->
+  <!-- Left side label -->
+  <rect x="24" y="220" width="68" height="130" rx="8" fill="rgba(99,102,241,0.06)" stroke="#1e2030" stroke-width="1"/>
+  <text x="58" y="242" font-family="'Inter',sans-serif" font-size="8" font-weight="700" fill="#6366f1" text-anchor="middle" letter-spacing="0.5">GOAL</text>
+  <text x="58" y="254" font-family="'Inter',sans-serif" font-size="8" font-weight="700" fill="#6366f1" text-anchor="middle" letter-spacing="0.5">DRIVEN</text>
+  <line x1="42" y1="263" x2="74" y2="263" stroke="#1e2030" stroke-width="1"/>
+  <text x="58" y="279" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">DAG</text>
+  <text x="58" y="292" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">validated</text>
+  <text x="58" y="305" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">milestones</text>
+  <text x="58" y="318" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">crash-safe</text>
+  <text x="58" y="331" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">resumable</text>
+
+  <!-- Right side label -->
+  <rect x="1108" y="220" width="68" height="130" rx="8" fill="rgba(99,102,241,0.06)" stroke="#1e2030" stroke-width="1"/>
+  <text x="1142" y="242" font-family="'Inter',sans-serif" font-size="8" font-weight="700" fill="#6366f1" text-anchor="middle" letter-spacing="0.5">LONG</text>
+  <text x="1142" y="254" font-family="'Inter',sans-serif" font-size="8" font-weight="700" fill="#6366f1" text-anchor="middle" letter-spacing="0.5">HORIZON</text>
+  <line x1="1122" y1="263" x2="1162" y2="263" stroke="#1e2030" stroke-width="1"/>
+  <text x="1142" y="279" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">hours or</text>
+  <text x="1142" y="292" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">days</text>
+  <text x="1142" y="305" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">spin detect</text>
+  <text x="1142" y="318" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">7 layers</text>
+  <text x="1142" y="331" font-family="'Inter',sans-serif" font-size="7.5" fill="#475569" text-anchor="middle">autonomous</text>
+
+  <!-- ─── TOP TITLE ─────────────────────────────────── -->
+  <text x="600" y="36" font-family="'Inter',sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" letter-spacing="3">THE META-HARNESS FOR LONG-HORIZON AI AGENTS</text>
+
+  <!-- ─── BOTTOM TAGLINE ────────────────────────────── -->
+  <text x="600" y="617" font-family="'SF Mono',monospace" font-size="9.5" fill="#374151" text-anchor="middle" letter-spacing="1.5">github.com/headcrabz/horizonX · MIT · pip install horizonx</text>
+
+  <!-- ─── DECORATIVE CORNER MARKS ──────────────────── -->
+  <path d="M 20,20 L 20,45 M 20,20 L 45,20" stroke="#4f46e5" stroke-width="1.5" fill="none" opacity="0.5"/>
+  <path d="M 1180,20 L 1180,45 M 1180,20 L 1155,20" stroke="#4f46e5" stroke-width="1.5" fill="none" opacity="0.5"/>
+  <path d="M 20,610 L 20,585 M 20,610 L 45,610" stroke="#4f46e5" stroke-width="1.5" fill="none" opacity="0.5"/>
+  <path d="M 1180,610 L 1180,585 M 1180,610 L 1155,610" stroke="#4f46e5" stroke-width="1.5" fill="none" opacity="0.5"/>
+
+</svg>

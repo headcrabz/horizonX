@@ -1,5 +1,9 @@
 # HorizonX
 
+<p align="center">
+  <img src="docs/press/horizonx_banner.svg" alt="HorizonX — Meta-harness orchestrating multiple AI agents with goal graphs, spin detection, and cross-session memory" width="100%"/>
+</p>
+
 **A production-grade execution harness for long-horizon AI agent tasks.**
 
 HorizonX wraps Claude Code, Codex, and OpenHands with the infrastructure they need to run reliably for hours — crash recovery, spin detection, budget governance, cross-session memory, structured goal tracking, and operator-in-the-loop gates.
