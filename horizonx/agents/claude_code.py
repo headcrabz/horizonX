@@ -167,7 +167,7 @@ class ClaudeCodeAgent:
             )
         elif last_error:
             status = SessionStatus.ERRORED
-        totals = self.usage_totals()
+        totals = self.usage_totals
         return SessionRunResult(
             agent_session_id=captured_session_id,
             status=status,

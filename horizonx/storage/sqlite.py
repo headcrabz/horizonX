@@ -594,7 +594,7 @@ class SqliteStore:
                     parent_id=row["parent_id"],
                     name=row["name"],
                     description=row["description"],
-                    verification_criteria=json.loads(row["verification_criteria"]),
+                    verification_criteria=json.loads(row["verification_criteria"] or "[]"),
                     status=GoalStatus(row["status"]),
                     attempts=row["attempts"],
                     notes=row["notes"] or "",

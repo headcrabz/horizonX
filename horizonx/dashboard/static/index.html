@@ -3,33 +3,67 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>HorizonX Dashboard</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>HorizonX — Control Plane</title>
   <link rel="stylesheet" href="/app.css">
 </head>
-<body class="bg-gray-950 text-gray-100 min-h-screen flex flex-col">
+<body>
 
-  <!-- Nav -->
-  <nav class="border-b border-slate-800 bg-slate-950 px-6 py-3 flex items-center gap-6 shrink-0">
-    <span class="font-bold text-indigo-400 text-lg tracking-tight">HorizonX</span>
-    <a id="nav-runs" href="#/"
-       class="text-slate-400 hover:text-white text-sm transition-colors">Runs</a>
-    <a id="nav-launch" href="#/launch"
-       class="text-slate-400 hover:text-white text-sm transition-colors">Launch</a>
-    <div class="ml-auto">
-      <a href="/api/health" target="_blank"
-         class="text-slate-600 hover:text-slate-400 text-xs">API</a>
+<!-- ═══════════════════════════════════════════════════════
+     SIDEBAR
+════════════════════════════════════════════════════════ -->
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-mark">HX</div>
+    <div>
+      <div class="logo-text">HorizonX</div>
+      <div class="logo-version">v0.1.0 · control plane</div>
     </div>
-  </nav>
+  </div>
 
-  <!-- ================================================================ -->
-  <!-- View: Runs list                                                   -->
-  <!-- ================================================================ -->
-  <div id="view-runs" class="flex-1 p-6">
-    <div class="flex items-center gap-4 mb-5">
-      <h1 class="text-xl font-semibold text-slate-100">Runs</h1>
-      <select id="runs-filter" onchange="loadRunsList()"
-              class="ml-auto bg-slate-900 border border-slate-700 rounded px-3 py-1.5 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+  <div class="sidebar-section">
+    <div class="sidebar-section-label">Navigation</div>
+    <a class="nav-item" id="nav-overview" href="#/">
+      <span class="nav-icon">◈</span> Overview
+    </a>
+    <a class="nav-item" id="nav-runs" href="#/runs">
+      <span class="nav-icon">⊞</span> Runs
+    </a>
+    <a class="nav-item" id="nav-launch" href="#/launch">
+      <span class="nav-icon">▶</span> Launch
+    </a>
+  </div>
+
+  <div class="sidebar-section" style="margin-top:8px;">
+    <div class="sidebar-section-label">Filters</div>
+    <a class="nav-item" href="#/runs?status=running" onclick="setFilter('running')">
+      <span class="nav-icon" style="color:#60a5fa">●</span> Active
+    </a>
+    <a class="nav-item" href="#/runs?status=paused_hitl" onclick="setFilter('paused_hitl')">
+      <span class="nav-icon" style="color:#fcd34d">⏸</span> Awaiting HITL
+    </a>
+    <a class="nav-item" href="#/runs?status=failed" onclick="setFilter('failed')">
+      <span class="nav-icon" style="color:#f87171">✕</span> Failed
+    </a>
+  </div>
+
+  <div class="sidebar-footer">
+    <div class="sidebar-health">
+      <div class="health-dot" id="health-dot"></div>
+      <span id="health-label">Connecting…</span>
+    </div>
+  </div>
+</aside>
+
+<!-- ═══════════════════════════════════════════════════════
+     MAIN CONTENT
+════════════════════════════════════════════════════════ -->
+<div class="main">
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <span class="topbar-title" id="topbar-title">Overview</span>
+    <div class="topbar-actions">
+      <select id="runs-filter" onchange="applyFilter()" style="display:none;">
         <option value="">All statuses</option>
         <option value="running">Running</option>
         <option value="completed">Completed</option>
@@ -37,135 +71,543 @@
         <option value="paused_hitl">Paused (HITL)</option>
         <option value="aborted">Aborted</option>
       </select>
-      <button onclick="loadRunsList()"
-              class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-sm text-slate-300 transition-colors">
-        Refresh
+      <button class="btn btn-ghost" id="refresh-btn" onclick="refreshCurrentView()" style="display:none;">
+        ↺ Refresh
       </button>
+      <a class="btn btn-primary" href="#/launch">▶ Launch Run</a>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────────────────────────────
+       VIEW: OVERVIEW
+  ─────────────────────────────────────────────────── -->
+  <div id="view-overview" class="view">
+
+    <!-- Stat cards -->
+    <div class="stats-grid" id="overview-stats">
+      <div class="stat-card indigo">
+        <div class="stat-label">Active Runs</div>
+        <div class="stat-value" id="stat-active">—</div>
+        <div class="stat-sub" id="stat-active-sub">loading…</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-label">Completed Today</div>
+        <div class="stat-value" id="stat-done">—</div>
+        <div class="stat-sub" id="stat-done-sub">all time</div>
+      </div>
+      <div class="stat-card yellow">
+        <div class="stat-label">Awaiting HITL</div>
+        <div class="stat-value" id="stat-hitl">—</div>
+        <div class="stat-sub">requires operator input</div>
+      </div>
+      <div class="stat-card red">
+        <div class="stat-label">Failed</div>
+        <div class="stat-value" id="stat-failed">—</div>
+        <div class="stat-sub">may need attention</div>
+      </div>
     </div>
 
-    <div class="panel overflow-hidden">
-      <table class="w-full">
-        <thead class="border-b border-slate-800">
-          <tr class="text-slate-500 text-xs uppercase tracking-wider">
-            <th class="text-left px-4 py-3 font-medium">Run ID</th>
-            <th class="text-left px-4 py-3 font-medium">Task</th>
-            <th class="text-left px-4 py-3 font-medium">Status</th>
-            <th class="text-left px-4 py-3 font-medium">Started</th>
-            <th class="text-left px-4 py-3 font-medium">Duration</th>
-            <th class="text-right px-4 py-3 font-medium">Sessions</th>
-            <th class="text-right px-4 py-3 font-medium">Steps</th>
-            <th class="text-right px-4 py-3 font-medium">Cost</th>
+    <!-- Recent runs -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">Recent Runs</span>
+        <a href="#/runs" style="margin-left:auto;font-size:12px;color:var(--accent-lt);text-decoration:none;">View all →</a>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Task</th>
+            <th>Status</th>
+            <th>Started</th>
+            <th>Sessions</th>
+            <th class="right">Cost</th>
+          </tr>
+        </thead>
+        <tbody id="overview-tbody">
+          <tr><td colspan="5" class="empty-state"><p>Loading…</p></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <!-- ──────────────────────────────────────────────────
+       VIEW: RUNS LIST
+  ─────────────────────────────────────────────────── -->
+  <div id="view-runs" class="view">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">All Runs</span>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Run ID</th>
+            <th>Task</th>
+            <th>Strategy</th>
+            <th>Status</th>
+            <th>Started</th>
+            <th>Duration</th>
+            <th class="right">Sessions</th>
+            <th class="right">Steps</th>
+            <th class="right">Cost</th>
           </tr>
         </thead>
         <tbody id="runs-tbody">
-          <tr>
-            <td colspan="8" class="text-center text-slate-500 px-4 py-10 text-sm">Loading…</td>
-          </tr>
+          <tr><td colspan="9"><div class="empty-state"><div class="spinner"></div></div></td></tr>
         </tbody>
       </table>
     </div>
   </div>
 
-  <!-- ================================================================ -->
-  <!-- View: Run detail                                                  -->
-  <!-- ================================================================ -->
-  <div id="view-run-detail" class="flex-1 flex flex-col p-6 gap-4" style="display:none">
+  <!-- ──────────────────────────────────────────────────
+       VIEW: RUN DETAIL
+  ─────────────────────────────────────────────────── -->
+  <div id="view-run-detail" class="view" style="padding:16px 20px;gap:12px;">
 
-    <!-- Header -->
+    <!-- Breadcrumb + header row -->
     <div>
-      <div class="text-slate-500 text-sm mb-1">
-        <a href="#/" class="hover:text-slate-300">← Runs</a>
-        <span class="mx-2">/</span>
-        <span id="run-breadcrumb" class="text-slate-300"></span>
+      <div style="font-size:12px;color:var(--faint);margin-bottom:6px;">
+        <a href="#/runs" style="color:var(--faint);text-decoration:none;" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--faint)'">← Runs</a>
+        <span style="margin:0 6px;">/</span>
+        <span id="run-breadcrumb" style="color:var(--muted);"></span>
       </div>
-      <div class="flex items-center gap-4 flex-wrap">
+      <div class="run-header" id="run-header-row">
         <div id="run-status-badge"></div>
-        <div id="run-metrics" class="text-sm flex items-center gap-1 flex-wrap"></div>
-        <div class="ml-auto flex gap-2">
-          <button onclick="if(state.currentRunId) api('/api/runs/'+state.currentRunId+'/cancel',{method:'POST'}).then(()=>alert('Cancel signal sent')).catch(e=>alert(e.message))"
-                  class="px-3 py-1 bg-slate-800 hover:bg-slate-700 rounded text-xs text-slate-400">
-            Cancel
-          </button>
+        <div id="run-metrics-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"></div>
+        <div style="margin-left:auto;display:flex;gap:6px;">
+          <button class="btn btn-ghost" style="font-size:12px;" id="btn-cancel-run"
+            onclick="cancelRun()">Cancel</button>
         </div>
       </div>
     </div>
 
     <!-- HITL banner -->
-    <div id="hitl-banner" style="display:none"
-         class="panel bg-yellow-950 border-yellow-800 px-4 py-3 text-sm">
+    <div class="hitl-banner" id="hitl-banner">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span style="color:var(--yellow);font-weight:700;font-size:13px;">⏸  Run paused — operator input required</span>
+        <button class="btn btn-green" onclick="resolveHitl(state.currentRunId,'approve')">✓ Approve</button>
+        <button class="btn btn-yellow" onclick="toggleModifyForm()">✎ Modify</button>
+        <button class="btn btn-yellow" onclick="resolveHitl(state.currentRunId,'re_decompose')" title="LLM restructures the goal graph">⟳ Re-decompose</button>
+        <button class="btn btn-red" onclick="resolveHitl(state.currentRunId,'abort')">✕ Abort</button>
+      </div>
+      <div id="hitl-modify-form" style="display:none;margin-top:10px;display:none;gap:8px;">
+        <input id="hitl-instruction" type="text" placeholder="Instruction for the agent…"
+          style="flex:1;padding:7px 12px;font-size:13px;width:100%;margin-bottom:8px;"/>
+        <button class="btn btn-yellow" onclick="resolveHitlModify()">Send instruction</button>
+      </div>
     </div>
 
-    <!-- 3-column layout -->
-    <div class="flex-1 grid gap-4 overflow-hidden" style="grid-template-columns: 220px 1fr 300px; grid-template-rows: 1fr 1fr;">
+    <!-- 3-column grid -->
+    <div class="run-detail-grid" style="flex:1;min-height:0;">
 
-      <!-- Left: sessions + steps -->
-      <div class="panel flex flex-col overflow-hidden row-span-2">
-        <div class="px-3 py-2 border-b border-slate-800 text-xs text-slate-500 uppercase tracking-wider font-medium shrink-0">
-          Sessions
+      <!-- COL 1: Sessions + Steps -->
+      <div class="panel-col">
+        <div class="card" style="flex:0 0 auto;">
+          <div class="card-header">
+            <span class="card-header-title">Sessions</span>
+            <span id="session-count" style="margin-left:auto;font-size:11px;font-family:monospace;color:var(--faint);"></span>
+          </div>
+          <div id="sessions-list" style="max-height:220px;overflow-y:auto;"></div>
         </div>
-        <div id="sessions-list" class="overflow-y-auto flex-1">
-          <div class="text-slate-500 text-xs p-3">Loading…</div>
-        </div>
-        <div class="border-t border-slate-800 px-3 py-2 text-xs text-slate-500 uppercase tracking-wider font-medium shrink-0">
-          Steps
-        </div>
-        <div id="steps-panel" class="overflow-y-auto" style="max-height: 50%;">
-          <div class="text-slate-500 text-xs p-3">Select a session</div>
+
+        <div class="card" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
+          <div class="card-header">
+            <span class="card-header-title">Steps</span>
+            <span id="steps-count" style="margin-left:auto;font-size:11px;font-family:monospace;color:var(--faint);"></span>
+          </div>
+          <div id="steps-panel" style="flex:1;overflow-y:auto;">
+            <div class="empty-state"><p>Select a session</p></div>
+          </div>
         </div>
       </div>
 
-      <!-- Center top: live event stream -->
-      <div class="panel flex flex-col overflow-hidden">
-        <div class="px-3 py-2 border-b border-slate-800 flex items-center gap-2 shrink-0">
-          <span class="text-xs text-slate-500 uppercase tracking-wider font-medium">Live Events</span>
-          <label class="ml-auto flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer">
-            <input type="checkbox" checked onchange="state.pinScroll = this.checked"
-                   class="accent-indigo-500"> Newest first
-          </label>
+      <!-- COL 2: Live stream + Goals + Validators tabs -->
+      <div class="panel-col">
+        <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;">
+          <!-- Tab bar -->
+          <div class="tab-bar" style="flex-shrink:0;">
+            <button class="tab-btn active" id="tab-stream" onclick="setCenterTab('stream')">Live Stream</button>
+            <button class="tab-btn" id="tab-goals" onclick="setCenterTab('goals')">Goal Graph</button>
+            <button class="tab-btn" id="tab-validations" onclick="setCenterTab('validations')">Validators</button>
+            <label id="pin-label" style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--faint);padding:0 12px;cursor:pointer;">
+              <input type="checkbox" checked id="pin-scroll" style="accent-color:var(--accent);"> Newest first
+            </label>
+          </div>
+
+          <!-- Live Stream panel -->
+          <div id="panel-stream"
+               style="flex:1;min-height:0;overflow-y:auto;padding:4px 0;">
+            <div class="empty-state" style="padding:32px 16px;">
+              <div style="font-size:24px;opacity:0.3;margin-bottom:8px;">⟳</div>
+              <p style="color:var(--faint);font-size:12px;">Events will appear here when a run is active</p>
+            </div>
+          </div>
+
+          <!-- Goal Graph panel -->
+          <div id="panel-goals"
+               style="flex:1;min-height:0;overflow-y:auto;padding:8px;display:none;">
+            <div class="empty-state">
+              <div style="font-size:24px;opacity:0.3;margin-bottom:8px;">◈</div>
+              <p>No goals recorded yet</p>
+            </div>
+          </div>
+
+          <!-- Validators panel -->
+          <div id="panel-validations"
+               style="flex:1;min-height:0;overflow-y:auto;display:none;">
+            <div class="empty-state">
+              <div style="font-size:24px;opacity:0.3;margin-bottom:8px;">✓</div>
+              <p>No validations yet</p>
+            </div>
+          </div>
         </div>
-        <div id="event-stream" class="overflow-y-auto flex-1 p-1"></div>
       </div>
 
-      <!-- Center bottom: (placeholder or second panel) -->
-      <div class="panel flex flex-col overflow-hidden" style="display:none"></div>
+      <!-- COL 3: Metrics / Spin / HITL -->
+      <div class="panel-col">
 
-      <!-- Right: tabs -->
-      <div class="panel flex flex-col overflow-hidden row-span-2">
-        <div class="flex border-b border-slate-800 px-1 shrink-0">
-          <button id="tab-goals" class="tab-btn active" onclick="setRightTab('goals')">Goals</button>
-          <button id="tab-validations" class="tab-btn" onclick="setRightTab('validations')">Validators</button>
-          <button id="tab-hitl" class="tab-btn" onclick="setRightTab('hitl')">HITL</button>
+        <!-- Budget gauge -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-header-title">Budget</span>
+            <span id="budget-pct" style="margin-left:auto;font-size:11.5px;font-family:monospace;color:var(--faint);">—</span>
+          </div>
+          <div class="cost-bar-wrap">
+            <div class="cost-bar-label">
+              <span id="cost-spent">$0.000</span>
+              <span id="cost-limit" style="color:var(--faint);">— limit</span>
+            </div>
+            <div class="cost-bar-track">
+              <div class="cost-bar-fill" id="cost-bar-fill" style="width:0%"></div>
+              <div class="cost-bar-marker" style="left:75%">
+                <div class="cost-bar-marker-label">75%</div>
+              </div>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0;border-top:1px solid var(--border);">
+            <div style="padding:9px 14px;border-right:1px solid var(--border);">
+              <div style="font-size:10px;color:var(--faint);letter-spacing:0.5px;margin-bottom:3px;">TOKENS IN</div>
+              <div style="font-family:monospace;font-size:13px;font-weight:600;" id="tok-in">—</div>
+            </div>
+            <div style="padding:9px 14px;">
+              <div style="font-size:10px;color:var(--faint);letter-spacing:0.5px;margin-bottom:3px;">TOKENS OUT</div>
+              <div style="font-family:monospace;font-size:13px;font-weight:600;" id="tok-out">—</div>
+            </div>
+          </div>
         </div>
-        <div id="panel-goals" class="overflow-y-auto flex-1"></div>
-        <div id="panel-validations" class="overflow-y-auto flex-1" style="display:none"></div>
-        <div id="panel-hitl" class="overflow-y-auto flex-1" style="display:none"></div>
-      </div>
 
+        <!-- Spin detection -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-header-title">Spin Detection</span>
+            <span style="margin-left:auto;font-size:11px;color:var(--green);" id="spin-summary">7 layers · clear</span>
+          </div>
+          <div class="spin-layers">
+            <div class="spin-layer">
+              <div class="spin-dot ok" id="spin-1-dot"></div>
+              <div class="spin-name">1 · ExactLoop</div>
+              <div class="spin-status ok" id="spin-1-status">clear</div>
+            </div>
+            <div class="spin-layer">
+              <div class="spin-dot ok" id="spin-2-dot"></div>
+              <div class="spin-name">2 · EditRevert</div>
+              <div class="spin-status ok" id="spin-2-status">clear</div>
+            </div>
+            <div class="spin-layer">
+              <div class="spin-dot ok" id="spin-3-dot"></div>
+              <div class="spin-name">3 · ScorePlateau</div>
+              <div class="spin-status ok" id="spin-3-status">clear</div>
+            </div>
+            <div class="spin-layer">
+              <div class="spin-dot ok" id="spin-4-dot"></div>
+              <div class="spin-name">4 · ToolThrash</div>
+              <div class="spin-status ok" id="spin-4-status">clear</div>
+            </div>
+            <div class="spin-layer">
+              <div class="spin-dot ok" id="spin-5-dot"></div>
+              <div class="spin-name">5 · BucketedHash</div>
+              <div class="spin-status ok" id="spin-5-status">clear</div>
+            </div>
+            <div class="spin-layer">
+              <div class="spin-dot ok" id="spin-6-dot"></div>
+              <div class="spin-name">6 · Semantic</div>
+              <div class="spin-status ok" id="spin-6-status">clear</div>
+            </div>
+            <div class="spin-layer" style="border-top:1px solid var(--border);padding-top:8px;margin-top:4px;">
+              <div class="spin-dot ok" id="spin-7-dot"></div>
+              <div class="spin-name">7 · CrossSession</div>
+              <div class="spin-status ok" id="spin-7-status">clear</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- HITL history -->
+        <div class="card" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
+          <div class="card-header">
+            <span class="card-header-title">HITL Gates</span>
+            <span id="hitl-count" style="margin-left:auto;font-size:11px;color:var(--faint);font-family:monospace;"></span>
+          </div>
+          <div id="panel-hitl" style="flex:1;overflow-y:auto;">
+            <div class="empty-state"><p>No HITL events yet</p></div>
+          </div>
+        </div>
+
+      </div>
     </div>
   </div>
 
-  <!-- ================================================================ -->
-  <!-- View: Launch                                                      -->
-  <!-- ================================================================ -->
-  <div id="view-launch" class="flex-1 p-6 max-w-3xl" style="display:none">
-    <h1 class="text-xl font-semibold text-slate-100 mb-6">Launch a Run</h1>
-    <div class="panel p-5">
-      <label class="block text-slate-400 text-sm mb-2">Task definition (YAML or JSON)</label>
-      <textarea id="launch-yaml" rows="24"
-        class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 font-mono text-xs text-slate-200 focus:outline-none focus:border-indigo-500 resize-none"
-        placeholder="id: my-task&#10;name: My Task&#10;prompt: |&#10;  Do something useful&#10;strategy:&#10;  kind: single&#10;agent:&#10;  type: claude_code&#10;  model: claude-opus-4-7"></textarea>
-      <div class="flex items-center gap-4 mt-4">
-        <button id="launch-btn" onclick="submitLaunch()"
-                class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-medium transition-colors">
-          Launch
+  <!-- ──────────────────────────────────────────────────
+       VIEW: LAUNCH
+  ─────────────────────────────────────────────────── -->
+  <div id="view-launch" class="view">
+
+    <!-- Mode toggle bar -->
+    <div style="display:flex;align-items:center;gap:10px;flex-shrink:0;">
+      <div style="display:flex;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:3px;gap:2px;">
+        <button class="launch-mode-btn active" id="mode-form" onclick="setLaunchMode('form')">
+          ⊞ Form
         </button>
-        <span id="launch-status" class="text-sm text-slate-400"></span>
+        <button class="launch-mode-btn" id="mode-yaml" onclick="setLaunchMode('yaml')">
+          ⟨/⟩ YAML
+        </button>
+      </div>
+      <span style="font-size:12px;color:var(--faint);" id="launch-mode-hint">Configure your job using the form below</span>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:10px;">
+        <button id="launch-btn" class="btn btn-primary" onclick="submitLaunch()">▶ Launch Run</button>
+        <span id="launch-status" style="font-size:12.5px;color:var(--faint);"></span>
       </div>
     </div>
-  </div>
 
-  <!-- js-yaml for YAML parsing in the launch form -->
-  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4/dist/js.yaml.min.js"></script>
-  <script src="/app.js"></script>
+    <!-- ═══ FORM MODE ═══ -->
+    <div id="launch-form-mode" style="display:flex;flex-direction:column;gap:14px;flex:1;overflow-y:auto;">
+
+      <!-- Row 1: Task info + Execution -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+
+        <!-- Task basics -->
+        <div class="card">
+          <div class="card-header"><span class="card-header-title">Task</span></div>
+          <div style="padding:14px;display:flex;flex-direction:column;gap:10px;">
+            <div class="form-group">
+              <label class="form-label">Job Name <span class="form-required">*</span></label>
+              <input type="text" id="f-name" class="form-input" placeholder="Implement OAuth 2.0"/>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Task ID <span class="form-hint">optional — auto-generated if blank</span></label>
+              <input type="text" id="f-id" class="form-input" placeholder="build-oauth-001" style="font-family:monospace;"/>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Prompt <span class="form-required">*</span></label>
+              <textarea id="f-prompt" class="form-input" rows="8"
+                placeholder="Describe the task in detail. Include success criteria, constraints, and any important context the agent needs."></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- Execution config -->
+        <div style="display:flex;flex-direction:column;gap:14px;">
+          <div class="card">
+            <div class="card-header"><span class="card-header-title">Strategy &amp; Agent</span></div>
+            <div style="padding:14px;display:flex;flex-direction:column;gap:10px;">
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div class="form-group">
+                  <label class="form-label">Strategy</label>
+                  <select id="f-strategy" class="form-input" onchange="updateStrategyHint()">
+                    <option value="single">single</option>
+                    <option value="sequential" selected>sequential</option>
+                    <option value="pair">pair</option>
+                    <option value="self_critique">self_critique</option>
+                    <option value="decomposition">decomposition</option>
+                    <option value="tree">tree</option>
+                    <option value="monitor">monitor</option>
+                    <option value="ralph">ralph</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Max attempts / goal</label>
+                  <input type="number" id="f-max-attempts" class="form-input" value="3" min="1" max="10"/>
+                </div>
+              </div>
+              <div id="strategy-hint" class="form-hint-box">Sub-goals with session handoffs and crash recovery.</div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div class="form-group">
+                  <label class="form-label">Agent</label>
+                  <select id="f-agent" class="form-input">
+                    <option value="claude_code" selected>claude_code</option>
+                    <option value="codex">codex</option>
+                    <option value="openhands">openhands</option>
+                    <option value="custom">custom</option>
+                    <option value="mock">mock</option>
+                    <option value="sdk">sdk</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Model</label>
+                  <select id="f-model" class="form-input">
+                    <option value="claude-opus-4-8" selected>claude-opus-4-8</option>
+                    <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+                    <option value="claude-haiku-4-5">claude-haiku-4-5</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Budget & Limits -->
+          <div class="card">
+            <div class="card-header"><span class="card-header-title">Budget &amp; Limits</span></div>
+            <div style="padding:14px;display:flex;flex-direction:column;gap:10px;">
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+                <div class="form-group">
+                  <label class="form-label">Max cost (USD)</label>
+                  <input type="number" id="f-max-usd" class="form-input" placeholder="5.00" step="0.50" min="0"/>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Max tokens</label>
+                  <input type="number" id="f-max-tokens" class="form-input" placeholder="500000" step="50000" min="0"/>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Max hours</label>
+                  <input type="number" id="f-max-hours" class="form-input" placeholder="8" step="1" min="0"/>
+                </div>
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div class="form-group">
+                  <label class="form-label">Workspace ID <span class="form-hint">for daily budget tracking</span></label>
+                  <input type="text" id="f-workspace-id" class="form-input" placeholder="ws-my-project" style="font-family:monospace;"/>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Daily budget (USD / workspace)</label>
+                  <input type="number" id="f-daily-budget" class="form-input" placeholder="20.00" step="1" min="0"/>
+                </div>
+              </div>
+              <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer;">
+                <input type="checkbox" id="f-git-commit" checked style="accent-color:var(--accent);"/>
+                Git commit after each session
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Row 2: Validators + HITL -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+
+        <!-- Validators -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-header-title">Milestone Validators</span>
+            <button class="btn btn-ghost" style="margin-left:auto;font-size:11.5px;padding:3px 10px;" onclick="addValidator()">+ Add</button>
+          </div>
+          <div id="validators-list" style="padding:8px;">
+            <!-- default validator row -->
+          </div>
+          <div style="padding:8px 12px;border-top:1px solid var(--border);">
+            <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);cursor:pointer;">
+              <input type="checkbox" id="f-no-validators" onchange="toggleValidators()" style="accent-color:var(--accent);"/>
+              Run without validators (not recommended for long-horizon tasks)
+            </label>
+          </div>
+        </div>
+
+        <!-- HITL -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-header-title">Human-in-the-Loop (HITL)</span>
+            <label style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;">
+              <input type="checkbox" id="f-hitl-enabled" checked onchange="toggleHitl()" style="accent-color:var(--accent);"/>
+              Enable
+            </label>
+          </div>
+          <div id="hitl-config" style="padding:14px;display:flex;flex-direction:column;gap:10px;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+              <div class="form-group">
+                <label class="form-label">Notification</label>
+                <select id="f-hitl-type" class="form-input">
+                  <option value="slack" selected>Slack</option>
+                  <option value="email">Email</option>
+                  <option value="webhook">Webhook</option>
+                  <option value="none">None (block)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Channel / target</label>
+                <input type="text" id="f-hitl-target" class="form-input" placeholder="#eng-alerts"/>
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+              <div class="form-group">
+                <label class="form-label">Timeout (minutes)</label>
+                <input type="number" id="f-hitl-timeout" class="form-input" value="30" min="5"/>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Escalation action</label>
+                <select id="f-hitl-escalation" class="form-input">
+                  <option value="approve" selected>approve (auto-continue)</option>
+                  <option value="abort">abort</option>
+                  <option value="re_decompose">re_decompose</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Trigger on</label>
+              <div style="display:flex;gap:12px;margin-top:4px;flex-wrap:wrap;">
+                <label class="form-check"><input type="checkbox" id="hitl-on-75" checked style="accent-color:var(--accent);"/> Budget 75%</label>
+                <label class="form-check"><input type="checkbox" id="hitl-on-spin" checked style="accent-color:var(--accent);"/> Spin detected</label>
+                <label class="form-check"><input type="checkbox" id="hitl-on-val" checked style="accent-color:var(--accent);"/> Validator fail</label>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /#launch-form-mode -->
+
+    <!-- ═══ YAML MODE ═══ -->
+    <div id="launch-yaml-mode" style="display:none;flex:1;display:none;gap:14px;" class="launch-split">
+      <div class="card" style="display:flex;flex-direction:column;">
+        <div class="card-header">
+          <span class="card-header-title">Task Definition — YAML</span>
+          <button class="btn btn-ghost" style="font-size:11px;padding:3px 10px;margin-left:auto;" onclick="syncFormToYaml()">↻ Sync from form</button>
+        </div>
+        <div style="padding:14px;flex:1;display:flex;flex-direction:column;">
+          <textarea id="launch-yaml" style="width:100%;flex:1;min-height:420px;"></textarea>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px;width:300px;flex-shrink:0;">
+        <div class="card">
+          <div class="card-header"><span class="card-header-title">Quick Load</span></div>
+          <div style="padding:12px;">
+            <button class="launch-example-btn" onclick="loadExample('single')">▸ Single session</button>
+            <button class="launch-example-btn" onclick="loadExample('sequential')">▸ Sequential — OAuth</button>
+            <button class="launch-example-btn" onclick="loadExample('pair')">▸ Pair programming</button>
+            <button class="launch-example-btn" onclick="loadExample('self_critique')">▸ Self-critique</button>
+            <button class="launch-example-btn" onclick="loadExample('monitor')">▸ SRE monitor</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-header-title">Strategies</span></div>
+          <div style="padding:10px 12px;display:flex;flex-direction:column;gap:3px;">
+            <div class="strategy-ref"><code>single</code><span>one session</span></div>
+            <div class="strategy-ref"><code>sequential</code><span>sub-goals</span></div>
+            <div class="strategy-ref"><code>pair</code><span>driver + navigator</span></div>
+            <div class="strategy-ref"><code>self_critique</code><span>self-review loop</span></div>
+            <div class="strategy-ref"><code>decomposition</code><span>LLM decomposes first</span></div>
+            <div class="strategy-ref"><code>tree</code><span>parallel branches</span></div>
+            <div class="strategy-ref"><code>monitor</code><span>watch &amp; react</span></div>
+            <div class="strategy-ref"><code>ralph</code><span>reflect + iterate</span></div>
+          </div>
+        </div>
+      </div>
+    </div><!-- /#launch-yaml-mode -->
+
+  </div><!-- /#view-launch -->
+
+
+</div><!-- /.main -->
+
+<script src="https://cdn.jsdelivr.net/npm/js-yaml@4/dist/js.yaml.min.js"></script>
+<script src="/app.js"></script>
 </body>
 </html>

@@ -1,107 +1,165 @@
-/* HorizonX Dashboard — vanilla JS SPA */
 'use strict';
 
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // State
-// ---------------------------------------------------------------------------
-
+// ─────────────────────────────────────────────────────────────────────────────
 const state = {
   currentRunId: null,
   currentSessionId: null,
   eventSource: null,
   pollTimer: null,
-  rightTab: 'goals',
-  pinScroll: true,
+  centerTab: 'stream',
+  runsFilter: '',
 };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilities
+// ─────────────────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
 function badge(status) {
-  return `<span class="badge badge-${status}">${esc(status)}</span>`;
+  return `<span class="badge badge-${esc(status)}">${esc(status)}</span>`;
 }
 
 function reltime(iso) {
   if (!iso) return '—';
-  const d = new Date(iso);
-  const sec = Math.floor((Date.now() - d) / 1000);
-  if (sec < 60) return `${sec}s ago`;
-  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
-  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
-  return d.toLocaleDateString();
+  const sec = Math.floor((Date.now() - new Date(iso)) / 1000);
+  if (sec < 60)    return `${sec}s ago`;
+  if (sec < 3600)  return `${Math.floor(sec/60)}m ago`;
+  if (sec < 86400) return `${Math.floor(sec/3600)}h ago`;
+  return new Date(iso).toLocaleDateString();
 }
 
-function duration(startIso, endIso) {
-  if (!startIso) return '—';
-  const end = endIso ? new Date(endIso) : new Date();
-  const sec = Math.floor((end - new Date(startIso)) / 1000);
-  if (sec < 60) return `${sec}s`;
-  if (sec < 3600) return `${Math.floor(sec / 60)}m ${sec % 60}s`;
-  return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+function duration(start, end) {
+  if (!start) return '—';
+  const sec = Math.floor(((end ? new Date(end) : new Date()) - new Date(start)) / 1000);
+  if (sec < 60)   return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec/60)}m ${sec%60}s`;
+  return `${Math.floor(sec/3600)}h ${Math.floor((sec%3600)/60)}m`;
 }
 
-function fmtUSD(n) { return n != null ? `$${Number(n).toFixed(3)}` : '—'; }
-function fmtTokens(n) { return n ? (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : n) : '0'; }
-
-function evClass(type) {
-  const prefix = type.split('.')[0];
-  const map = { run: 'ev-run', session: 'ev-session', step: 'ev-step', goal: 'ev-goal',
-    validator: 'ev-validator', spin: 'ev-spin', hitl: 'ev-hitl', budget: 'ev-budget',
-    summary: 'ev-summary', fork: 'ev-fork', retry: 'ev-retry' };
-  return map[prefix] || 'ev-step';
-}
-
-function stepTypeColor(type) {
-  const m = { thought: 'text-slate-300', reasoning: 'text-purple-300', tool_call: 'text-blue-300',
-    observation: 'text-green-300', file_change: 'text-yellow-300', error: 'text-red-300',
-    hitl_pause: 'text-yellow-400', hitl_decision: 'text-yellow-300', spin: 'text-orange-300',
-    usage: 'text-slate-500', system: 'text-slate-600' };
-  return m[type] || 'text-slate-400';
-}
+const fmtUSD = n => n != null ? `$${Number(n).toFixed(3)}` : '$0.000';
+const fmtTok = n => n ? (n>=1e6 ? `${(n/1e6).toFixed(2)}M` : n>=1000 ? `${(n/1000).toFixed(1)}K` : String(n)) : '0';
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const r = await fetch(path, { headers: {'Content-Type':'application/json'}, ...opts });
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
 }
 
-// ---------------------------------------------------------------------------
-// Router
-// ---------------------------------------------------------------------------
-
-function navigate(hash) {
-  window.location.hash = hash;
+function setNav(id) {
+  ['nav-overview','nav-runs','nav-launch'].forEach(n => {
+    const el = $(n);
+    if (el) el.classList.toggle('active', n === id);
+  });
 }
 
-window.addEventListener('hashchange', route);
-window.addEventListener('DOMContentLoaded', () => { route(); });
+function showView(id) {
+  ['view-overview','view-runs','view-run-detail','view-launch'].forEach(v => {
+    const el = $(v);
+    if (el) el.classList.toggle('active', v === id);
+  });
+}
 
-function route() {
-  const hash = window.location.hash || '#/';
-  if (hash.startsWith('#/run/')) {
-    showRunDetail(hash.slice(6));
-  } else if (hash === '#/launch') {
-    showLaunch();
-  } else {
-    showRunsList();
+// ─────────────────────────────────────────────────────────────────────────────
+// Health
+// ─────────────────────────────────────────────────────────────────────────────
+async function checkHealth() {
+  try {
+    await api('/api/health');
+    const d = $('health-dot'); if (d) d.style.background = 'var(--green)';
+    const l = $('health-label'); if (l) l.textContent = 'API connected';
+  } catch {
+    const d = $('health-dot'); if (d) d.style.background = 'var(--red)';
+    const l = $('health-label'); if (l) l.textContent = 'API unavailable';
   }
 }
 
-// ---------------------------------------------------------------------------
-// View: Runs list
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Router
+// ─────────────────────────────────────────────────────────────────────────────
+window.addEventListener('hashchange', route);
+window.addEventListener('DOMContentLoaded', () => { checkHealth(); route(); });
 
-function showRunsList() {
+function route() {
+  const hash = window.location.hash || '#/';
   clearRunDetail();
-  $('view-runs').style.display = '';
-  $('view-run-detail').style.display = 'none';
-  $('view-launch').style.display = 'none';
-  $('nav-runs').classList.add('text-white');
-  $('nav-launch').classList.remove('text-white');
+  const filterEl = $('runs-filter'); if (filterEl) filterEl.style.display = 'none';
+  const refBtn   = $('refresh-btn'); if (refBtn)   refBtn.style.display   = 'none';
+
+  if      (hash.startsWith('#/run/'))  showRunDetail(hash.slice(6));
+  else if (hash.startsWith('#/runs'))  showRunsList();
+  else if (hash === '#/launch')        showLaunch();
+  else                                 showOverview();
+}
+
+window.navigate          = hash => { window.location.hash = hash; };
+window.refreshCurrentView = () => {
+  const h = window.location.hash;
+  if (h.startsWith('#/run/'))   loadRunDetailData(state.currentRunId);
+  else if (h.startsWith('#/runs')) loadRunsList();
+  else                             loadOverviewData();
+};
+window.setFilter = status => { state.runsFilter = status; };
+window.applyFilter = () => loadRunsList();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Overview
+// ─────────────────────────────────────────────────────────────────────────────
+function showOverview() {
+  setNav('nav-overview');
+  showView('view-overview');
+  $('topbar-title').textContent = 'Overview';
+  $('refresh-btn').style.display = '';
+  loadOverviewData();
+}
+
+async function loadOverviewData() {
+  try {
+    const runs = await api('/api/runs?limit=200');
+    const active = runs.filter(r => r.status === 'running').length;
+    const done   = runs.filter(r => r.status === 'completed').length;
+    const hitl   = runs.filter(r => r.status === 'paused_hitl').length;
+    const failed = runs.filter(r => r.status === 'failed').length;
+
+    $('stat-active').textContent  = active;
+    $('stat-active-sub').textContent = active ? `${active} agent${active>1?'s':''} running now` : 'none running';
+    $('stat-done').textContent    = done;
+    $('stat-done-sub').textContent = `${runs.length} total runs`;
+    $('stat-hitl').textContent    = hitl;
+    $('stat-failed').textContent  = failed;
+
+    const recent = runs.slice(0, 10);
+    if (!recent.length) {
+      $('overview-tbody').innerHTML = `<tr><td colspan="5"><div class="empty-state">
+        <div class="empty-icon">◈</div><p>No runs yet. <a href="#/launch">Launch your first run →</a></p>
+      </div></td></tr>`;
+      return;
+    }
+    $('overview-tbody').innerHTML = recent.map(r => `
+      <tr onclick="navigate('#/run/${esc(r.id)}')">
+        <td style="font-weight:600;">${esc(r.task_name || r.task_id || '—')}</td>
+        <td>${badge(r.status)}</td>
+        <td style="color:var(--faint);font-size:12px;">${reltime(r.started_at)}</td>
+        <td style="color:var(--muted);">${r.sessions_count ?? 0}</td>
+        <td class="right" style="color:var(--green);font-family:monospace;">${fmtUSD(r.usd)}</td>
+      </tr>`).join('');
+  } catch (e) {
+    $('overview-tbody').innerHTML = `<tr><td colspan="5" style="color:var(--red);padding:12px;">${esc(e.message)}</td></tr>`;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Runs list
+// ─────────────────────────────────────────────────────────────────────────────
+function showRunsList() {
+  setNav('nav-runs');
+  showView('view-runs');
+  $('topbar-title').textContent = 'Runs';
+  $('runs-filter').style.display = '';
+  $('refresh-btn').style.display = '';
+  if (state.runsFilter) $('runs-filter').value = state.runsFilter;
   loadRunsList();
 }
 
@@ -110,442 +168,712 @@ async function loadRunsList() {
   const qs = status ? `?status=${status}&limit=100` : '?limit=100';
   try {
     const runs = await api('/api/runs' + qs);
-    renderRunsTable(runs);
+    if (!runs.length) {
+      $('runs-tbody').innerHTML = `<tr><td colspan="9"><div class="empty-state">
+        <div class="empty-icon">⊞</div><p>No runs found. <a href="#/launch">Launch one →</a></p>
+      </div></td></tr>`;
+      return;
+    }
+    $('runs-tbody').innerHTML = runs.map(r => `
+      <tr onclick="navigate('#/run/${esc(r.id)}')">
+        <td class="mono">${esc(r.id.slice(0,12))}…</td>
+        <td style="font-weight:600;">${esc(r.task_name || r.task_id || '—')}</td>
+        <td><span style="font-family:monospace;font-size:11.5px;color:var(--accent-lt);">${esc(r.strategy||'—')}</span></td>
+        <td>${badge(r.status)}</td>
+        <td style="color:var(--faint);font-size:12px;">${reltime(r.started_at)}</td>
+        <td style="color:var(--faint);font-size:12px;">${duration(r.started_at,r.completed_at)}</td>
+        <td class="right" style="color:var(--muted);">${r.sessions_count??0}</td>
+        <td class="right" style="color:var(--muted);">${r.steps_count??0}</td>
+        <td class="right" style="color:var(--green);font-family:monospace;">${fmtUSD(r.usd)}</td>
+      </tr>`).join('');
   } catch (e) {
-    $('runs-tbody').innerHTML = `<tr><td colspan="8" class="text-red-400 px-4 py-3">Error: ${esc(e.message)}</td></tr>`;
+    $('runs-tbody').innerHTML = `<tr><td colspan="9" style="color:var(--red);padding:12px;">${esc(e.message)}</td></tr>`;
   }
 }
 
-function renderRunsTable(runs) {
-  if (!runs.length) {
-    $('runs-tbody').innerHTML = `<tr><td colspan="8" class="text-center text-slate-500 px-4 py-8">No runs yet. <a href="#/launch" class="text-indigo-400 hover:underline">Launch one →</a></td></tr>`;
-    return;
-  }
-  $('runs-tbody').innerHTML = runs.map(r => `
-    <tr class="border-b border-slate-800 hover:bg-slate-900 cursor-pointer" onclick="navigate('#/run/${esc(r.id)}')">
-      <td class="px-4 py-3 font-mono text-xs text-slate-400">${esc(r.id.slice(0, 14))}…</td>
-      <td class="px-4 py-3 font-medium">${esc(r.task_name || r.task_id || '—')}</td>
-      <td class="px-4 py-3">${badge(r.status)}</td>
-      <td class="px-4 py-3 text-slate-400 text-xs">${reltime(r.started_at)}</td>
-      <td class="px-4 py-3 text-slate-400 text-xs">${duration(r.started_at, r.completed_at)}</td>
-      <td class="px-4 py-3 text-right text-slate-400">${r.sessions_count}</td>
-      <td class="px-4 py-3 text-right text-slate-400">${r.steps_count}</td>
-      <td class="px-4 py-3 text-right text-emerald-400">${fmtUSD(r.usd)}</td>
-    </tr>
-  `).join('');
-}
-
-// ---------------------------------------------------------------------------
-// View: Run detail
-// ---------------------------------------------------------------------------
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Run detail
+// ─────────────────────────────────────────────────────────────────────────────
 async function showRunDetail(runId) {
-  clearRunDetail();
-  $('view-runs').style.display = 'none';
-  $('view-run-detail').style.display = '';
-  $('view-launch').style.display = 'none';
-  $('nav-runs').classList.remove('text-white');
-  $('nav-launch').classList.remove('text-white');
-
+  setNav(null);
+  showView('view-run-detail');
+  $('topbar-title').textContent = 'Run Detail';
+  $('refresh-btn').style.display = '';
   state.currentRunId = runId;
+  await loadRunDetailData(runId);
+}
 
+async function loadRunDetailData(runId) {
   try {
     const run = await api(`/api/runs/${runId}`);
     renderRunHeader(run);
     renderHitlBanner(run);
   } catch (e) {
-    $('run-header').innerHTML = `<span class="text-red-400">Error loading run: ${esc(e.message)}</span>`;
+    $('run-breadcrumb').textContent = `Error: ${e.message}`;
     return;
   }
-
   loadSessions(runId);
   connectEventSource(runId);
-  // Poll run status while it's active
+  loadSpinReports(runId);
+  loadHitlHistory(runId);
+
   state.pollTimer = setInterval(async () => {
     try {
       const run = await api(`/api/runs/${runId}`);
       renderRunHeader(run);
       renderHitlBanner(run);
-      if (['completed', 'failed', 'aborted', 'timed_out'].includes(run.status)) {
+      if (['completed','failed','aborted','timed_out'].includes(run.status))
         clearInterval(state.pollTimer);
-      }
     } catch { /* ignore */ }
   }, 5000);
 
-  // Load right-panel data
-  setRightTab(state.rightTab);
+  setCenterTab(state.centerTab);
 }
 
 function renderRunHeader(run) {
   const cm = run.cumulative || {};
   $('run-breadcrumb').textContent = run.task?.name || run.id;
   $('run-status-badge').innerHTML = badge(run.status) +
-    (run.status === 'running' ? ' <span class="pulse-dot inline-block w-2 h-2 rounded-full bg-blue-400 ml-1"></span>' : '');
-  $('run-metrics').innerHTML = `
-    <span class="text-slate-400">tokens in</span> <span class="text-slate-200">${fmtTokens(cm.tokens_in)}</span>
-    <span class="mx-2 text-slate-700">·</span>
-    <span class="text-slate-400">out</span> <span class="text-slate-200">${fmtTokens(cm.tokens_out)}</span>
-    <span class="mx-2 text-slate-700">·</span>
-    <span class="text-slate-400">cost</span> <span class="text-emerald-400">${fmtUSD(cm.usd)}</span>
-    <span class="mx-2 text-slate-700">·</span>
-    <span class="text-slate-400">sessions</span> <span class="text-slate-200">${cm.sessions_count ?? 0}</span>
-    <span class="mx-2 text-slate-700">·</span>
-    <span class="text-slate-400">steps</span> <span class="text-slate-200">${cm.steps_count ?? 0}</span>
-    <span class="mx-2 text-slate-700">·</span>
-    <span class="text-slate-400">wall</span> <span class="text-slate-200">${duration(run.started_at, run.completed_at)}</span>
-  `;
+    (run.status === 'running' ? ' <span class="pulse" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--blue);margin-left:4px;"></span>' : '');
+
+  $('run-metrics-row').innerHTML = [
+    `<div class="metric-chip"><span>Sessions</span><span class="val">${cm.sessions_count??0}</span></div>`,
+    `<div class="metric-chip"><span>Steps</span><span class="val">${cm.steps_count??0}</span></div>`,
+    `<div class="metric-chip green"><span>Cost</span><span class="val">${fmtUSD(cm.usd)}</span></div>`,
+    `<div class="metric-chip"><span>Wall</span><span class="val">${duration(run.started_at,run.completed_at)}</span></div>`,
+    `<div class="metric-chip"><span>Tok in</span><span class="val">${fmtTok(cm.tokens_in)}</span></div>`,
+    `<div class="metric-chip"><span>Tok out</span><span class="val">${fmtTok(cm.tokens_out)}</span></div>`,
+  ].join('');
+
+  // Budget gauge
+  const spent = cm.usd || 0;
+  const limit = run.task?.resources?.max_total_usd;
+  $('cost-spent').textContent = fmtUSD(spent);
+  $('cost-limit').textContent = limit ? `$${limit} limit` : 'no limit set';
+  $('tok-in').textContent  = fmtTok(cm.tokens_in);
+  $('tok-out').textContent = fmtTok(cm.tokens_out);
+  const pct = limit ? Math.min((spent/limit)*100, 100) : 0;
+  const fill = $('cost-bar-fill');
+  if (fill) {
+    fill.style.width = `${pct}%`;
+    fill.className = 'cost-bar-fill' + (pct>=90?' danger': pct>=75?' warn':'');
+  }
+  const bp = $('budget-pct');
+  if (bp) bp.textContent = limit ? `${pct.toFixed(1)}%` : '—';
 }
 
 function renderHitlBanner(run) {
   const banner = $('hitl-banner');
-  if (run.status === 'paused_hitl') {
-    banner.style.display = '';
-    banner.innerHTML = `
-      <div class="flex items-center gap-4">
-        <span class="text-yellow-300 font-semibold">⏸ Run paused — waiting for human input</span>
-        <button onclick="resolveHitl('${esc(run.id)}','approve')" class="px-3 py-1 bg-green-700 hover:bg-green-600 text-white rounded text-sm">Approve</button>
-        <button onclick="showModifyHitl('${esc(run.id)}')" class="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 text-white rounded text-sm">Modify</button>
-        <button onclick="resolveHitl('${esc(run.id)}','abort')" class="px-3 py-1 bg-red-800 hover:bg-red-700 text-white rounded text-sm">Abort</button>
-      </div>
-      <div id="hitl-modify-form" style="display:none" class="mt-3 flex gap-2">
-        <input id="hitl-instruction" type="text" placeholder="Instruction for the agent…"
-          class="flex-1 bg-slate-900 border border-slate-700 rounded px-3 py-1 text-sm text-white" />
-        <button onclick="resolveHitlModify('${esc(run.id)}')" class="px-3 py-1 bg-yellow-600 hover:bg-yellow-500 text-white rounded text-sm">Send</button>
-      </div>
-    `;
-  } else {
-    banner.style.display = 'none';
-  }
+  if (!banner) return;
+  banner.style.display = run.status === 'paused_hitl' ? '' : 'none';
 }
 
-window.showModifyHitl = () => { $('hitl-modify-form').style.display = ''; };
+// ─────────────────────────────────────────────────────────────────────────────
+// HITL actions
+// ─────────────────────────────────────────────────────────────────────────────
+window.toggleModifyForm = () => {
+  const f = $('hitl-modify-form');
+  f.style.display = f.style.display === 'none' || f.style.display === '' ? 'flex' : 'none';
+};
 
-window.resolveHitl = async (runId, action, instruction = '') => {
+window.resolveHitl = async (runId, action, instruction='') => {
   try {
     await api(`/api/runs/${runId}/hitl`, {
       method: 'POST',
       body: JSON.stringify({ action, instruction, operator: 'dashboard' }),
     });
-    $('hitl-banner').innerHTML = '<span class="text-green-400">Decision sent. Waiting for agent to resume…</span>';
-  } catch (e) {
-    alert('Error: ' + e.message);
-  }
+    const banner = $('hitl-banner');
+    if (banner) {
+      banner.innerHTML = '<span style="color:var(--green);">✓ Decision sent — agent will resume shortly</span>';
+      setTimeout(() => { banner.style.display = 'none'; }, 4000);
+    }
+  } catch (e) { alert('Error: ' + e.message); }
 };
 
-window.resolveHitlModify = (runId) => {
-  const instr = $('hitl-instruction').value.trim();
-  resolveHitl(runId, 'modify', instr);
+window.resolveHitlModify = () => {
+  const instr = $('hitl-instruction')?.value.trim();
+  if (!instr) { alert('Enter an instruction first'); return; }
+  resolveHitl(state.currentRunId, 'modify', instr);
 };
 
-// ---------------------------------------------------------------------------
-// Sessions panel
-// ---------------------------------------------------------------------------
+window.cancelRun = async () => {
+  if (!state.currentRunId || !confirm('Cancel this run?')) return;
+  try {
+    await api(`/api/runs/${state.currentRunId}/cancel`, { method: 'POST' });
+    alert('Cancel signal sent');
+  } catch (e) { alert('Error: ' + e.message); }
+};
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Sessions
+// ─────────────────────────────────────────────────────────────────────────────
 async function loadSessions(runId) {
   try {
     const sessions = await api(`/api/runs/${runId}/sessions`);
     renderSessions(sessions, runId);
-    if (sessions.length > 0 && !state.currentSessionId) {
-      // Auto-select most recent session
-      const latest = sessions[sessions.length - 1];
-      selectSession(latest.id, runId);
-    }
+    if (sessions.length && !state.currentSessionId)
+      selectSession(sessions[sessions.length-1].id, runId);
   } catch (e) {
-    $('sessions-list').innerHTML = `<div class="text-red-400 text-xs px-3">${esc(e.message)}</div>`;
+    $('sessions-list').innerHTML = `<div style="color:var(--red);font-size:11px;padding:10px;">${esc(e.message)}</div>`;
   }
 }
 
 function renderSessions(sessions, runId) {
+  const sc = $('session-count');
+  if (sc) sc.textContent = `${sessions.length} total`;
   if (!sessions.length) {
-    $('sessions-list').innerHTML = '<div class="text-slate-500 text-xs px-3 py-2">No sessions yet</div>';
+    $('sessions-list').innerHTML = '<div class="empty-state"><p>No sessions yet</p></div>';
     return;
   }
-  $('sessions-list').innerHTML = sessions.map((s, i) => `
-    <div class="session-item${s.id === state.currentSessionId ? ' active' : ''}"
-         id="sess-${esc(s.id)}"
+  $('sessions-list').innerHTML = [...sessions].reverse().map(s => `
+    <div class="session-item${s.id===state.currentSessionId?' active':''}" id="sess-${esc(s.id)}"
          onclick="selectSession('${esc(s.id)}','${esc(runId)}')">
-      <div class="flex items-center justify-between">
-        <span class="text-slate-300 font-medium text-xs">#${s.sequence_index + 1}</span>
-        <span class="badge badge-${s.status} text-xs">${esc(s.status)}</span>
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <span class="s-num">Session #${(s.sequence_index??0)+1}</span>
+        ${badge(s.status)}
       </div>
-      <div class="text-slate-500 text-xs mt-0.5">${s.steps_count} steps · ${fmtTokens(s.tokens_used)} tok</div>
-    </div>
-  `).reverse().join('');
+      <div class="s-meta">${s.steps_count??0} steps · ${fmtTok(s.tokens_used)} tok · ${duration(s.started_at,s.completed_at)}</div>
+    </div>`).join('');
 }
 
 window.selectSession = async (sessionId, runId) => {
   state.currentSessionId = sessionId;
-  // Update active styling
   document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
   const el = $(`sess-${sessionId}`);
   if (el) el.classList.add('active');
-
-  $('steps-panel').innerHTML = '<div class="text-slate-500 text-xs p-3">Loading steps…</div>';
+  $('steps-panel').innerHTML = '<div class="empty-state"><div class="spinner"></div></div>';
   try {
     const steps = await api(`/api/runs/${runId}/sessions/${sessionId}/steps?limit=500`);
     renderSteps(steps);
   } catch (e) {
-    $('steps-panel').innerHTML = `<div class="text-red-400 text-xs p-3">${esc(e.message)}</div>`;
+    $('steps-panel').innerHTML = `<div style="color:var(--red);font-size:11px;padding:10px;">${esc(e.message)}</div>`;
   }
 };
 
 function renderSteps(steps) {
+  const sc = $('steps-count');
+  if (sc) sc.textContent = `${steps.length} steps`;
   if (!steps.length) {
-    $('steps-panel').innerHTML = '<div class="text-slate-500 text-xs p-3">No steps recorded</div>';
+    $('steps-panel').innerHTML = '<div class="empty-state"><p>No steps recorded</p></div>';
     return;
   }
+  const typeColor = {
+    thought:'type-thought', tool_call:'type-tool_call', observation:'type-observation',
+    file_change:'type-file_change', error:'type-error', reasoning:'type-reasoning',
+  };
   $('steps-panel').innerHTML = steps.map(s => {
-    const snippet = extractSnippet(s);
-    return `
-      <div class="border-b border-slate-800 px-3 py-2">
-        <div class="flex items-center gap-2 mb-1">
-          <span class="${stepTypeColor(s.type)} text-xs font-mono font-semibold">${esc(s.type)}</span>
-          ${s.tool_name ? `<span class="text-blue-400 text-xs font-mono">${esc(s.tool_name)}</span>` : ''}
-          <span class="text-slate-600 text-xs ml-auto">#${s.sequence}</span>
-        </div>
-        ${snippet ? `<div class="step-content">${esc(snippet)}</div>` : ''}
+    const c = s.content || {};
+    const snippet = (c.text||c.command||c.output||c.patch||JSON.stringify(c)).slice(0,260);
+    return `<div class="step-row">
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span class="step-type ${typeColor[s.type]||'type-thought'}">${esc(s.type)}</span>
+        ${s.tool_name?`<span style="font-family:monospace;font-size:10.5px;color:var(--blue);">${esc(s.tool_name)}</span>`:''}
+        <span style="margin-left:auto;font-family:monospace;font-size:10px;color:var(--faint);">#${s.sequence}</span>
       </div>
-    `;
+      ${snippet?`<div class="step-content">${esc(snippet)}</div>`:''}
+    </div>`;
   }).join('');
 }
 
-function extractSnippet(step) {
-  const c = step.content || {};
-  if (c.text) return c.text.slice(0, 300);
-  if (c.command) return c.command;
-  if (c.output) return String(c.output).slice(0, 300);
-  if (c.patch) return c.patch.slice(0, 300);
-  return JSON.stringify(c).slice(0, 200);
-}
-
-// ---------------------------------------------------------------------------
-// Live event stream
-// ---------------------------------------------------------------------------
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Live event stream (SSE)
+// ─────────────────────────────────────────────────────────────────────────────
 function connectEventSource(runId) {
   if (state.eventSource) state.eventSource.close();
   state.eventSource = new EventSource(`/api/runs/${runId}/events`);
-  state.eventSource.onmessage = (e) => appendEvent(JSON.parse(e.data));
-  // Named events come as event: <type>
-  for (const evType of [
+  state.eventSource.onmessage = e => appendEvent(JSON.parse(e.data));
+  [
     'run.started','run.completed','run.failed','run.paused_hitl',
     'session.started','session.completed','session.timeout',
     'step.recorded','goal.in_progress','goal.done','goal.failed',
     'validator.passed','validator.failed','validator.paused',
     'spin.detected','hitl.requested','hitl.resolved',
-    'budget.threshold','summary.created','fork.created','fork.merged','retry.attempted',
-  ]) {
-    state.eventSource.addEventListener(evType, (e) => appendEvent(JSON.parse(e.data)));
-  }
-  state.eventSource.onerror = () => {
-    // SSE will auto-reconnect; suppress noise
-  };
+    'budget.threshold','budget.velocity_alert',
+    'goals.re_decomposed','summary.created','retry.attempted',
+  ].forEach(t => state.eventSource.addEventListener(t, e => appendEvent(JSON.parse(e.data))));
+  state.eventSource.onerror = () => {};
+}
+
+function evCls(type) {
+  const map = { run:'ev-run', session:'ev-session', step:'ev-step', goal:'ev-goal',
+    goals:'ev-goal', validator:'ev-validator', spin:'ev-spin', hitl:'ev-hitl',
+    budget:'ev-budget', summary:'ev-summary', fork:'ev-fork', retry:'ev-retry' };
+  return map[type.split('.')[0]] || 'ev-step';
 }
 
 function appendEvent(event) {
-  const container = $('event-stream');
+  const container = $('panel-stream');
+  if (!container) return;
   const el = document.createElement('div');
-  el.className = `event-entry ${evClass(event.type)}`;
-  const payload = event.payload && Object.keys(event.payload).length
-    ? ' — ' + JSON.stringify(event.payload).slice(0, 120)
-    : '';
-  el.innerHTML = `<span class="text-slate-500 text-xs">${new Date(event.timestamp).toLocaleTimeString()}</span>
-    <span class="text-slate-300 ml-2 font-medium">${esc(event.type)}</span>
-    <span class="text-slate-500 text-xs">${esc(payload)}</span>`;
-  if (state.pinScroll) {
-    container.prepend(el);
-  } else {
-    container.appendChild(el);
-    container.scrollTop = container.scrollHeight;
-  }
+  el.className = `event-row ${evCls(event.type)}`;
+  const pay = event.payload && Object.keys(event.payload).length
+    ? ' · ' + JSON.stringify(event.payload).slice(0,100) : '';
+  el.innerHTML = `<span class="event-time">${new Date(event.timestamp).toLocaleTimeString()}</span>
+    <span class="event-type">${esc(event.type)}</span>
+    <span class="event-payload">${esc(pay)}</span>`;
+  const pinned = $('pin-scroll')?.checked;
+  pinned ? container.prepend(el) : (container.appendChild(el), container.scrollTop=container.scrollHeight);
 
-  // Refresh sessions list on session events
-  if (event.type.startsWith('session.') || event.type === 'step.recorded') {
-    if (state.currentRunId) {
-      loadSessions(state.currentRunId);
-    }
+  if (event.type.startsWith('session.') || event.type==='step.recorded')
+    if (state.currentRunId) loadSessions(state.currentRunId);
+  if (event.type.startsWith('goal.') || event.type==='goals.re_decomposed')
+    if (state.centerTab==='goals' && state.currentRunId) loadGoals(state.currentRunId);
+  if (event.type.startsWith('validator.'))
+    if (state.centerTab==='validations' && state.currentRunId) loadValidations(state.currentRunId);
+  if (event.type==='spin.detected' && state.currentRunId)
+    loadSpinReports(state.currentRunId);
+  if (event.type==='hitl.requested') {
+    api(`/api/runs/${state.currentRunId}`).then(renderHitlBanner).catch(()=>{});
+    loadHitlHistory(state.currentRunId);
   }
-  // Reload right panel on goal/validator events
-  if (event.type.startsWith('goal.') || event.type.startsWith('validator.')) {
-    if (state.currentRunId) loadRightTab(state.currentRunId);
-  }
-  // Show HITL banner
-  if (event.type === 'hitl.requested') {
-    api(`/api/runs/${state.currentRunId}`).then(run => renderHitlBanner(run)).catch(() => {});
-  }
-  if (event.type === 'hitl.resolved') {
-    $('hitl-banner').style.display = 'none';
+  if (event.type==='hitl.resolved') {
+    const b = $('hitl-banner'); if (b) b.style.display='none';
+    loadHitlHistory(state.currentRunId);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Right panel (Goals / Validations / HITL)
-// ---------------------------------------------------------------------------
-
-window.setRightTab = (tab) => {
-  state.rightTab = tab;
-  ['goals', 'validations', 'hitl'].forEach(t => {
-    $(`tab-${t}`).classList.toggle('active', t === tab);
-    $(`panel-${t}`).style.display = t === tab ? '' : 'none';
+// ─────────────────────────────────────────────────────────────────────────────
+// Center tab
+// ─────────────────────────────────────────────────────────────────────────────
+window.setCenterTab = tab => {
+  state.centerTab = tab;
+  ['stream','goals','validations'].forEach(t => {
+    const btn = $(`tab-${t}`); if (btn) btn.classList.toggle('active', t===tab);
+    const pan = $(`panel-${t}`); if (pan) pan.style.display = t===tab ? '' : 'none';
   });
-  if (state.currentRunId) loadRightTab(state.currentRunId);
+  if (!state.currentRunId) return;
+  if (tab==='goals')       loadGoals(state.currentRunId);
+  if (tab==='validations') loadValidations(state.currentRunId);
 };
 
-async function loadRightTab(runId) {
-  if (state.rightTab === 'goals') await loadGoals(runId);
-  else if (state.rightTab === 'validations') await loadValidations(runId);
-  else await loadHitlHistory(runId);
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Goals
+// ─────────────────────────────────────────────────────────────────────────────
 async function loadGoals(runId) {
   try {
     const goals = await api(`/api/runs/${runId}/goals`);
     renderGoals(goals);
   } catch (e) {
-    $('panel-goals').innerHTML = `<div class="text-red-400 text-xs p-3">${esc(e.message)}</div>`;
+    $('panel-goals').innerHTML = `<div style="color:var(--red);padding:10px;font-size:11px;">${esc(e.message)}</div>`;
   }
 }
 
 function renderGoals(goals) {
   if (!goals.length) {
-    $('panel-goals').innerHTML = '<div class="text-slate-500 text-xs p-3">No goals recorded yet</div>';
+    $('panel-goals').innerHTML = '<div class="empty-state"><p>No goals yet</p></div>';
     return;
   }
-  const byId = Object.fromEntries(goals.map(g => [g.id, g]));
+  const byId  = Object.fromEntries(goals.map(g => [g.id, g]));
   const roots = goals.filter(g => !g.parent_id || !byId[g.parent_id]);
+  const icons = { done:'✓', failed:'✗', in_progress:'▶', pending:'○', blocked:'⊘', skipped:'⊝' };
+  const cls   = { done:'done', failed:'failed', in_progress:'active', pending:'pending', blocked:'failed', skipped:'pending' };
 
-  function renderNode(goal, depth = 0) {
-    const statusIcon = { done: '✓', failed: '✗', in_progress: '⟳', pending: '○', blocked: '⊘', skipped: '⊝' }[goal.status] || '?';
-    const statusColor = { done: 'text-green-400', failed: 'text-red-400', in_progress: 'text-blue-400', pending: 'text-slate-500', blocked: 'text-orange-400', skipped: 'text-slate-600' }[goal.status] || 'text-slate-400';
-    const children = goals.filter(g => g.parent_id === goal.id);
-    const indent = depth * 16;
-    const hasChildren = children.length > 0;
-    return `
-      <div class="goal-node" style="padding-left:${indent}px">
-        ${hasChildren ? `<details${goal.status === 'in_progress' ? ' open' : ''}>
-          <summary class="flex items-center gap-2 py-1 select-none">
-            <span class="${statusColor} font-bold w-4 text-center">${statusIcon}</span>
-            <span class="text-slate-200 text-xs">${esc(goal.name)}</span>
-            ${goal.progress_pct ? `<span class="text-slate-500 text-xs ml-auto">${Math.round(goal.progress_pct)}%</span>` : ''}
-          </summary>
-          <div>${children.map(c => renderNode(c, depth + 1)).join('')}</div>
-        </details>` : `
-          <div class="flex items-center gap-2 py-1">
-            <span class="${statusColor} font-bold w-4 text-center">${statusIcon}</span>
-            <span class="text-slate-300 text-xs">${esc(goal.name)}</span>
-            ${goal.progress_pct ? `<span class="text-slate-500 text-xs ml-auto">${Math.round(goal.progress_pct)}%</span>` : ''}
-          </div>`}
-      </div>
-    `;
+  function node(g, depth=0) {
+    const children = goals.filter(c => c.parent_id===g.id);
+    return `<div class="goal-row" style="padding-left:${depth*14+8}px;">
+      <span class="goal-icon ${cls[g.status]||'pending'}">${icons[g.status]||'?'}</span>
+      <span class="goal-name">${esc(g.name)}</span>
+      ${g.progress_pct!=null?`<span class="goal-pct">${Math.round(g.progress_pct)}%</span>`:''}
+    </div>` + children.map(c=>node(c,depth+1)).join('');
   }
-
-  $('panel-goals').innerHTML = `<div class="p-2">${roots.map(r => renderNode(r)).join('')}</div>`;
+  $('panel-goals').innerHTML = roots.map(r=>node(r)).join('');
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Validators
+// ─────────────────────────────────────────────────────────────────────────────
 async function loadValidations(runId) {
   try {
-    const validations = await api(`/api/runs/${runId}/validations`);
-    renderValidations(validations);
+    const vals = await api(`/api/runs/${runId}/validations`);
+    if (!vals.length) {
+      $('panel-validations').innerHTML = '<div class="empty-state"><p>No validations yet</p></div>';
+      return;
+    }
+    $('panel-validations').innerHTML = vals.map(v => `
+      <div class="val-row">
+        <span class="val-decision ${v.decision}">${esc(v.decision)}</span>
+        <span class="val-name">${esc(v.validator)}</span>
+        ${v.score!=null?`<span class="val-score">${Number(v.score).toFixed(2)}</span>`:''}
+      </div>`).join('');
   } catch (e) {
-    $('panel-validations').innerHTML = `<div class="text-red-400 text-xs p-3">${esc(e.message)}</div>`;
+    $('panel-validations').innerHTML = `<div style="color:var(--red);padding:10px;font-size:11px;">${esc(e.message)}</div>`;
   }
 }
 
-function renderValidations(vals) {
-  if (!vals.length) {
-    $('panel-validations').innerHTML = '<div class="text-slate-500 text-xs p-3">No validations yet</div>';
-    return;
-  }
-  $('panel-validations').innerHTML = vals.map(v => {
-    const decColor = v.decision === 'continue' ? 'text-green-400' : v.decision === 'abort' ? 'text-red-400' : 'text-yellow-400';
-    return `
-      <div class="border-b border-slate-800 px-3 py-2">
-        <div class="flex items-center gap-2">
-          <span class="${decColor} text-xs font-semibold">${esc(v.decision)}</span>
-          <span class="text-slate-300 text-xs">${esc(v.validator)}</span>
-          ${v.score != null ? `<span class="text-slate-400 text-xs ml-auto">${Number(v.score).toFixed(2)}</span>` : ''}
-        </div>
-        <div class="text-slate-500 text-xs mt-0.5 truncate">${esc(v.reason)}</div>
-      </div>
-    `;
-  }).join('');
+// ─────────────────────────────────────────────────────────────────────────────
+// Spin detection panel
+// ─────────────────────────────────────────────────────────────────────────────
+async function loadSpinReports(runId) {
+  try {
+    const reports = await api(`/api/runs/${runId}/spin-reports`);
+    updateSpinPanel(reports);
+  } catch { /* endpoint may not exist on all backends */ }
 }
 
+function updateSpinPanel(reports) {
+  const layerMap = {
+    exact_loop:1, edit_revert:2, score_plateau:3,
+    tool_thrashing:4, bucketed_hash:5, semantic_progress:6, cross_session:7,
+  };
+  const fired = new Set(reports.map(r => r.layer));
+  const summary = $('spin-summary');
+  if (summary) {
+    const n = reports.length;
+    summary.textContent = n ? `${n} detection${n>1?'s':''}` : '7 layers · clear';
+    summary.style.color = n ? 'var(--yellow)' : 'var(--green)';
+  }
+  Object.entries(layerMap).forEach(([name, num]) => {
+    const dot    = $(`spin-${num}-dot`);
+    const status = $(`spin-${num}-status`);
+    if (!dot || !status) return;
+    const active = fired.has(name);
+    dot.className    = `spin-dot ${active?'fire':'ok'}`;
+    status.className = `spin-status ${active?'fire':'ok'}`;
+    status.textContent = active ? 'DETECTED' : 'clear';
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HITL history
+// ─────────────────────────────────────────────────────────────────────────────
 async function loadHitlHistory(runId) {
   try {
     const events = await api(`/api/runs/${runId}/hitl`);
-    renderHitlHistory(events);
-  } catch (e) {
-    $('panel-hitl').innerHTML = `<div class="text-red-400 text-xs p-3">${esc(e.message)}</div>`;
-  }
+    const hc = $('hitl-count');
+    if (hc) hc.textContent = events.length ? `${events.length} event${events.length>1?'s':''}` : '';
+    if (!events.length) {
+      $('panel-hitl').innerHTML = '<div class="empty-state"><p>No HITL events yet</p></div>';
+      return;
+    }
+    $('panel-hitl').innerHTML = events.map(e => `
+      <div class="hitl-row">
+        <div class="hitl-trigger">⏸ ${esc(e.trigger||'operator pause')}</div>
+        ${e.decision
+          ? `<div class="hitl-decision">✓ ${esc(e.decision)}${e.instruction?` — "${esc(e.instruction)}"`:''}  </div>`
+          : '<div class="hitl-pending">Awaiting decision…</div>'}
+        ${e.resolved_at?`<div style="font-size:10.5px;color:var(--faint);margin-top:2px;">${reltime(e.resolved_at)}</div>`:''}
+      </div>`).join('');
+  } catch { /* ignore */ }
 }
 
-function renderHitlHistory(events) {
-  if (!events.length) {
-    $('panel-hitl').innerHTML = '<div class="text-slate-500 text-xs p-3">No HITL events</div>';
-    return;
-  }
-  $('panel-hitl').innerHTML = events.map(e => `
-    <div class="border-b border-slate-800 px-3 py-2">
-      <div class="flex items-center gap-2">
-        <span class="text-yellow-400 text-xs font-semibold">HITL</span>
-        <span class="text-slate-300 text-xs truncate">${esc(e.trigger)}</span>
-        ${e.decision ? `<span class="text-green-400 text-xs ml-auto">${esc(e.decision)}</span>` : '<span class="text-yellow-500 text-xs ml-auto">pending</span>'}
-      </div>
-      ${e.instruction ? `<div class="text-slate-500 text-xs mt-0.5">${esc(e.instruction)}</div>` : ''}
-    </div>
-  `).join('');
-}
-
-// ---------------------------------------------------------------------------
-// View: Launch
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Launch — mode toggle (Form / YAML)
+// ─────────────────────────────────────────────────────────────────────────────
+let launchMode = 'form';
+let validatorCount = 0;
 
 function showLaunch() {
-  clearRunDetail();
-  $('view-runs').style.display = 'none';
-  $('view-run-detail').style.display = 'none';
-  $('view-launch').style.display = '';
-  $('nav-runs').classList.remove('text-white');
-  $('nav-launch').classList.add('text-white');
+  setNav('nav-launch');
+  showView('view-launch');
+  $('topbar-title').textContent = 'Launch a Run';
+  if (validatorCount === 0) addValidator(); // add default validator row
 }
 
-window.submitLaunch = async () => {
-  const yaml = window.jsyaml;
-  const raw = $('launch-yaml').value.trim();
-  if (!raw) { alert('Paste a task definition (YAML or JSON)'); return; }
+window.setLaunchMode = (mode) => {
+  launchMode = mode;
+  ['form','yaml'].forEach(m => {
+    const btn = $(`mode-${m}`);
+    if (btn) btn.classList.toggle('active', m === mode);
+  });
+  $('launch-form-mode').style.display = mode === 'form' ? 'flex' : 'none';
+  $('launch-yaml-mode').style.display = mode === 'yaml' ? 'flex' : 'none';
+  $('launch-mode-hint').textContent = mode === 'form'
+    ? 'Configure your job using the form below'
+    : 'Edit raw YAML — all fields supported';
+  if (mode === 'yaml') syncFormToYaml();
+};
 
-  let task;
-  try {
-    task = yaml ? yaml.load(raw) : JSON.parse(raw);
-  } catch (e) {
-    try { task = JSON.parse(raw); } catch { alert('Invalid YAML/JSON: ' + e.message); return; }
+// Strategy descriptions
+const STRATEGY_HINTS = {
+  single:       'One session runs to completion. Best for quick, well-defined tasks.',
+  sequential:   'Breaks the goal into sub-goals with session handoffs and crash recovery.',
+  pair:         'Driver agent builds; navigator agent reviews each session before proceeding.',
+  self_critique:'Agent produces output, then critiques its own work in a second pass.',
+  decomposition:'LLM first decomposes the goal into a goal graph, then executes sub-goals.',
+  tree:         'Runs multiple parallel branches and keeps the best result.',
+  monitor:      'Long-lived agent that watches for signals and reacts autonomously.',
+  ralph:        'Reflection + iteration loop for tasks requiring progressive refinement.',
+};
+
+window.updateStrategyHint = () => {
+  const v = $('f-strategy').value;
+  const hint = $('strategy-hint');
+  if (hint) hint.textContent = STRATEGY_HINTS[v] || '';
+};
+
+window.toggleHitl = () => {
+  const enabled = $('f-hitl-enabled').checked;
+  $('hitl-config').style.opacity = enabled ? '1' : '0.4';
+  $('hitl-config').style.pointerEvents = enabled ? '' : 'none';
+};
+
+window.toggleValidators = () => {
+  const disabled = $('f-no-validators').checked;
+  $('validators-list').style.opacity = disabled ? '0.4' : '1';
+  $('validators-list').style.pointerEvents = disabled ? 'none' : '';
+};
+
+window.addValidator = () => {
+  const idx = validatorCount++;
+  const row = document.createElement('div');
+  row.className = 'validator-row';
+  row.id = `val-row-${idx}`;
+  row.innerHTML = `
+    <div class="form-group">
+      <label class="form-label">Type</label>
+      <select class="form-input val-type" id="val-type-${idx}">
+        <option value="test_suite">test_suite</option>
+        <option value="shell">shell</option>
+        <option value="llm_judge">llm_judge</option>
+        <option value="metric">metric</option>
+        <option value="goal_graph">goal_graph</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Runs</label>
+      <select class="form-input" id="val-runs-${idx}">
+        <option value="after_every_session">after every session</option>
+        <option value="after_last_session">after last session</option>
+        <option value="before_session">before session</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">On fail</label>
+      <select class="form-input" id="val-fail-${idx}">
+        <option value="pause_for_hitl">pause for HITL</option>
+        <option value="retry">retry session</option>
+        <option value="abort">abort run</option>
+        <option value="continue">continue</option>
+      </select>
+    </div>
+    <button class="remove-btn" onclick="removeValidator(${idx})" title="Remove">✕</button>
+    <div class="form-group" style="grid-column:1/-2;">
+      <label class="form-label">Command / config</label>
+      <input type="text" class="form-input" id="val-cmd-${idx}" placeholder="pytest tests/ -q" style="font-family:monospace;font-size:12px;"/>
+    </div>
+  `;
+  $('validators-list').appendChild(row);
+};
+
+window.removeValidator = (idx) => {
+  const row = $(`val-row-${idx}`);
+  if (row) row.remove();
+};
+
+// Build task object from form values
+function buildTaskFromForm() {
+  const name    = $('f-name').value.trim();
+  const prompt  = $('f-prompt').value.trim();
+  if (!name)   { alert('Job Name is required'); return null; }
+  if (!prompt) { alert('Prompt is required'); return null; }
+
+  const taskId  = $('f-id').value.trim() || `job-${Date.now()}`;
+  const strategy = $('f-strategy').value;
+  const maxAttempts = parseInt($('f-max-attempts').value) || 3;
+  const agent   = $('f-agent').value;
+  const model   = $('f-model').value;
+  const maxUsd   = parseFloat($('f-max-usd').value) || null;
+  const maxTok   = parseInt($('f-max-tokens').value) || null;
+  const maxHrs   = parseFloat($('f-max-hours').value) || null;
+  const wsId     = $('f-workspace-id').value.trim() || null;
+  const daily    = parseFloat($('f-daily-budget').value) || null;
+  const gitCommit= $('f-git-commit').checked;
+
+  const task = {
+    id: taskId, name, prompt,
+    strategy: {
+      kind: strategy,
+      config: { max_attempts_per_goal: maxAttempts, git_commit_each_session: gitCommit },
+    },
+    agent: { type: agent, model },
+  };
+
+  // Resources
+  const res = {};
+  if (maxUsd)  res.max_total_usd    = maxUsd;
+  if (maxTok)  res.max_total_tokens = maxTok;
+  if (maxHrs)  res.max_total_hours  = maxHrs;
+  if (Object.keys(res).length) task.resources = res;
+
+  // Workspace budget
+  if (wsId) task.workspace = { workspace_id: wsId, daily_budget_usd: daily || 0 };
+
+  // Validators
+  if (!$('f-no-validators').checked) {
+    const rows = document.querySelectorAll('.validator-row');
+    const validators = [];
+    rows.forEach((row, i) => {
+      const idxEl = row.id.replace('val-row-','');
+      const type = $(`val-type-${idxEl}`)?.value;
+      const runs = $(`val-runs-${idxEl}`)?.value;
+      const fail = $(`val-fail-${idxEl}`)?.value;
+      const cmd  = $(`val-cmd-${idxEl}`)?.value.trim();
+      if (!type) return;
+      const v = { id: `${type}_${i}`, type, runs, on_fail: fail };
+      if (cmd) v.config = { command: cmd };
+      validators.push(v);
+    });
+    if (validators.length) task.milestone_validators = validators;
   }
 
-  $('launch-status').textContent = 'Launching…';
-  $('launch-btn').disabled = true;
+  // HITL
+  if ($('f-hitl-enabled').checked) {
+    task.hitl = {
+      notification_type:   $('f-hitl-type').value,
+      notification_target: $('f-hitl-target').value.trim() || undefined,
+      timeout_minutes:     parseInt($('f-hitl-timeout').value) || 30,
+      escalation_action:   $('f-hitl-escalation').value,
+    };
+  }
 
+  return task;
+}
+
+// Sync form → YAML textarea
+window.syncFormToYaml = () => {
+  const task = buildTaskFromForm();
+  if (!task) return;
+  if (window.jsyaml) {
+    $('launch-yaml').value = window.jsyaml.dump(task, { indent: 2, lineWidth: 100 });
+  } else {
+    $('launch-yaml').value = JSON.stringify(task, null, 2);
+  }
+};
+
+const EXAMPLES = {
+  single: `id: quick-task-001
+name: Quick debugging task
+prompt: |
+  Debug the failing test in tests/test_auth.py.
+  Fix the root cause — do not delete the test.
+strategy:
+  kind: single
+agent:
+  type: claude_code
+  model: claude-opus-4-8
+resources:
+  max_total_usd: 1.0
+  max_total_tokens: 100000`,
+
+  sequential: `id: build-oauth-001
+name: Implement OAuth 2.0 Authorization Code + PKCE
+prompt: |
+  Implement OAuth 2.0 (auth code + PKCE + refresh + revoke) in the FastAPI app.
+  All existing tests must pass. No secrets in logs.
+strategy:
+  kind: sequential
+  config:
+    max_attempts_per_goal: 3
+    git_commit_each_session: true
+agent:
+  type: claude_code
+  model: claude-opus-4-8
+milestone_validators:
+  - id: tests_pass
+    type: test_suite
+    runs: after_every_session
+    on_fail: pause_for_hitl
+    config:
+      command: pytest tests/ -q
+hitl:
+  notification_type: slack
+  notification_target: "#eng-alerts"
+  timeout_minutes: 30
+  escalation_action: approve
+resources:
+  max_total_usd: 5.0
+  max_total_tokens: 500000`,
+
+  pair: `id: refactor-auth-001
+name: Refactor auth module — pair programming
+prompt: |
+  Refactor the auth module to use JWT tokens.
+  Replace session cookies. Keep all tests passing.
+strategy:
+  kind: pair
+agent:
+  type: claude_code
+  model: claude-opus-4-8
+resources:
+  max_total_usd: 3.0`,
+
+  self_critique: `id: quality-uplift-001
+name: Code quality uplift — self-critique
+prompt: |
+  Improve type coverage and add missing docstrings
+  to horizonx/core/. Ruff and mypy must pass.
+strategy:
+  kind: self_critique
+agent:
+  type: claude_code
+  model: claude-sonnet-4-6
+milestone_validators:
+  - id: ruff
+    type: shell
+    runs: after_every_session
+    on_fail: pause_for_hitl
+    config:
+      command: ruff check horizonx/ --quiet
+resources:
+  max_total_usd: 2.0`,
+
+  monitor: `id: sre-monitor-001
+name: SRE monitor — watch error rate
+prompt: |
+  Watch the application logs. If error rate exceeds 5%
+  for 3 consecutive minutes, open a GitHub issue.
+strategy:
+  kind: monitor
+  config:
+    poll_interval_seconds: 60
+    max_watch_hours: 8
+agent:
+  type: claude_code
+  model: claude-haiku-4-5
+resources:
+  max_total_usd: 2.0
+  max_total_hours: 8.0`,
+};
+
+window.loadExample = key => {
+  if (EXAMPLES[key]) {
+    setLaunchMode('yaml');
+    $('launch-yaml').value = EXAMPLES[key];
+  }
+};
+
+window.submitLaunch = async () => {
+  let task;
+  if (launchMode === 'form') {
+    task = buildTaskFromForm();
+    if (!task) return;
+  } else {
+    const raw = $('launch-yaml').value.trim();
+    if (!raw) { alert('Paste a task definition (YAML or JSON)'); return; }
+    try { task = window.jsyaml ? window.jsyaml.load(raw) : JSON.parse(raw); }
+    catch (e) { try { task = JSON.parse(raw); } catch { alert('Invalid YAML/JSON:\n' + e.message); return; } }
+  }
+
+  $('launch-status').innerHTML = '<span class="spinner"></span> Launching…';
+  $('launch-btn').disabled = true;
   try {
-    const result = await api('/api/runs', { method: 'POST', body: JSON.stringify({ task }) });
-    $('launch-status').textContent = `Started run: ${result.run_id}`;
-    setTimeout(() => navigate(`#/run/${result.run_id}`), 500);
+    const result = await api('/api/runs', { method:'POST', body: JSON.stringify({ task }) });
+    $('launch-status').innerHTML = `<span style="color:var(--green);">✓ Started: ${result.run_id}</span>`;
+    setTimeout(() => navigate(`#/run/${result.run_id}`), 600);
   } catch (e) {
-    $('launch-status').innerHTML = `<span class="text-red-400">Error: ${esc(e.message)}</span>`;
+    $('launch-status').innerHTML = `<span style="color:var(--red);">Error: ${esc(e.message)}</span>`;
     $('launch-btn').disabled = false;
   }
 };
 
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // Cleanup
-// ---------------------------------------------------------------------------
-
+// ─────────────────────────────────────────────────────────────────────────────
 function clearRunDetail() {
   if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
-  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  if (state.pollTimer)   { clearInterval(state.pollTimer); state.pollTimer = null; }
   state.currentRunId = null;
   state.currentSessionId = null;
-  const stream = $('event-stream');
-  if (stream) stream.innerHTML = '';
-  const steps = $('steps-panel');
-  if (steps) steps.innerHTML = '<div class="text-slate-500 text-xs p-3">Select a session</div>';
+  const ps = $('panel-stream');
+  if (ps) ps.innerHTML = '';
 }
