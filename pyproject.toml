@@ -83,7 +83,19 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "ASYNC"]
-ignore = ["E501"]
+ignore = [
+  "E501",    # line too long — handled by formatter
+  "B008",    # FastAPI Depends() in default args — idiomatic FastAPI pattern
+  "N818",    # Exception naming — BudgetExceeded is intentional public API name
+  "UP042",   # StrEnum rewrite — str+Enum is intentional for Pydantic compat
+  "ASYNC109", # timeout param in async — intentional wrapper pattern
+  "ASYNC230", # open() in async — intentional in test helpers
+  "ASYNC240", # pathlib in async — intentional in test helpers
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_git_validator.py" = ["ASYNC221"]  # subprocess.run in tests is intentional
+"tests/test_dashboard_routes.py" = ["E402"]   # sys.path patch must precede imports
 
 [tool.mypy]
 python_version = "3.11"

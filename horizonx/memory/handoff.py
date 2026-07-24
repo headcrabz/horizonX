@@ -42,7 +42,7 @@ class KnowledgeHandoffDir:
 
     def sync(
         self,
-        store: "WorkspaceKnowledgeStore",
+        store: WorkspaceKnowledgeStore,
         run_id: str | None = None,
         goal_id: str | None = None,
     ) -> int:

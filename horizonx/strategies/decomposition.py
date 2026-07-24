@@ -15,16 +15,14 @@ See docs/LONG_HORIZON_AGENT.md §21.4.
 
 from __future__ import annotations
 
-import json
-import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
-from horizonx.core.types import AgentConfig, GoalStatus, Run, SessionStatus, Step
+from horizonx.core.types import GoalStatus, Run, Step
+from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 DECOMPOSER_SYSTEM = """\
 You are a task planner for a long-horizon agent framework. Given a high-level goal,

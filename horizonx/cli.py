@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 from pathlib import Path
 
 import click
@@ -149,12 +148,13 @@ def export(ctx: click.Context, run_id: str, fmt: str) -> None:
 def serve(ctx: click.Context, host: str, port: int, workspace_root: Path) -> None:
     """Start the web dashboard (requires horizonx[dashboard])."""
     try:
-        from horizonx.dashboard.app import create_app
         import uvicorn
-    except ImportError:
+
+        from horizonx.dashboard.app import create_app
+    except ImportError as exc:
         raise click.ClickException(
             "Dashboard extras not installed. Run: pip install horizonx[dashboard]"
-        )
+        ) from exc
     app = create_app(db_path=ctx.obj["db"], workspace_root=workspace_root)
     console.print(f"[bold cyan]HorizonX[/] dashboard → http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="info")

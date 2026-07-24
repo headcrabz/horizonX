@@ -8,11 +8,10 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 from horizonx.agents.base import Workspace
 from horizonx.core.event_bus import Event
 from horizonx.core.types import Run, SessionStatus
-
+from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 
 class SingleSession:

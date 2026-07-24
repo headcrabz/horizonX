@@ -115,7 +115,7 @@ class OpenHandsAgent:
                 proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     proc.kill()
                 return SessionRunResult(status=SessionStatus.TIMEOUT)
 

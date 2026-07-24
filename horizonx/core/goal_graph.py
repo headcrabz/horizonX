@@ -8,9 +8,8 @@ See docs/LONG_HORIZON_AGENT.md §12.
 from __future__ import annotations
 
 import json
-from collections import deque
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from horizonx.core.types import GoalNode, GoalStatus, utcnow
 
@@ -40,7 +39,7 @@ class GoalGraph:
     # ------------------------------------------------------------------
 
     @classmethod
-    def empty(cls, root_name: str, root_description: str) -> "GoalGraph":
+    def empty(cls, root_name: str, root_description: str) -> GoalGraph:
         root = GoalNode(
             id=cls.ROOT_ID,
             name=root_name,
@@ -50,7 +49,7 @@ class GoalGraph:
         return cls({cls.ROOT_ID: root})
 
     @classmethod
-    def load(cls, path: Path) -> "GoalGraph":
+    def load(cls, path: Path) -> GoalGraph:
         data = json.loads(path.read_text())
         nodes = {nid: GoalNode(**n) for nid, n in data["nodes"].items()}
         return cls(nodes)
@@ -222,25 +221,24 @@ class GoalGraph:
     def _validate_structure(self) -> None:
         if self.ROOT_ID not in self._nodes:
             raise GoalGraphError(f"missing root node: {self.ROOT_ID}")
-        # DFS cycle check with path-tracking
-        WHITE, GRAY, BLACK = 0, 1, 2
-        color: dict[str, int] = {nid: WHITE for nid in self._nodes}
+        # DFS cycle check with path-tracking (0=unvisited, 1=in-stack, 2=done)
+        color: dict[str, int] = {nid: 0 for nid in self._nodes}
 
         def dfs(nid: str, path: list[str]) -> None:
-            if color[nid] == GRAY:
+            if color[nid] == 1:
                 raise GoalGraphError(f"cycle detected: {' -> '.join(path + [nid])}")
-            if color[nid] == BLACK:
+            if color[nid] == 2:
                 return
-            color[nid] = GRAY
+            color[nid] = 1
             for child in self._nodes[nid].children:
                 if child not in self._nodes:
                     raise GoalGraphError(f"dangling child reference: {child}")
                 dfs(child, path + [nid])
-            color[nid] = BLACK
+            color[nid] = 2
 
         dfs(self.ROOT_ID, [])
         # Orphan check — every non-root node must be reachable from root
-        reachable = {nid for nid, c in color.items() if c == BLACK}
+        reachable = {nid for nid, c in color.items() if c == 2}
         orphans = set(self._nodes) - reachable
         if orphans:
             raise GoalGraphError(f"orphan goal(s): {orphans}")

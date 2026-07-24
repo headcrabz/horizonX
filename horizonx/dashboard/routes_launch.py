@@ -30,7 +30,7 @@ async def launch_run(
     try:
         task = Task.model_validate(body.task)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
     # Pre-create the run record so we can return the run_id immediately
     workspace = runtime.workspace_root / f"{task.id}-{new_session_id()[:8]}"
@@ -66,7 +66,7 @@ async def cancel_run(
     try:
         run = await store.load_run(run_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found")
+        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
     run.status = RunStatus.ABORTED
     await store.save_run(run)
     return {"status": "aborted", "run_id": run_id}

@@ -7,7 +7,6 @@ keeps if metric improves, discards otherwise. See §21.3.
 from __future__ import annotations
 
 import asyncio
-import shlex
 import subprocess
 import time
 from collections.abc import AsyncIterator
@@ -15,11 +14,32 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
 from horizonx.core.types import Run, SessionStatus
+from horizonx.strategies._agent_builder import build_agent as _build_agent
 
+RALPH_PROMPT_TEMPLATE = """\
+Iteration {iter_index} — {iters_left} iterations and {minutes_left} minutes remaining.
+
+Current best {direction} metric: {current_metric}
+
+Mutable paths you may edit:
+{mutable_paths}
+
+Task:
+{user_prompt}
+
+Make ONE targeted improvement. Do not touch files outside the mutable paths list.
+"""
+
+
+@dataclass
+class IterationResult:
+    index: int
+    metric: float | None
+    kept: bool
+    elapsed_s: float
 
 
 class RalphLoop:
@@ -75,9 +95,11 @@ class RalphLoop:
             agent = _build_agent(run.task.agent)
             cancel_token = CancelToken()
 
-            async def on_step(step):
-                step.session_id = session.id
-                await rt.record_step(session, step)
+            _session = session
+
+            async def on_step(step, _s=_session):
+                step.session_id = _s.id
+                await rt.record_step(_s, step)
 
             ws = Workspace(path=workspace, env={})
 
@@ -94,7 +116,7 @@ class RalphLoop:
                 )
                 if result.agent_session_id:
                     session.agent_session_id = result.agent_session_id
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 cancel_token.cancel("iteration timeout")
                 result = None
 

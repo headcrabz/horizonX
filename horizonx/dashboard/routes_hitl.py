@@ -40,7 +40,7 @@ async def resolve_hitl(
     try:
         run = await store.load_run(run_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found")
+        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
 
     decision = HITLDecision(
         action=body.action,

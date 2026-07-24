@@ -43,9 +43,7 @@ import json
 import logging
 import os
 import shlex
-import tempfile
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.types import AgentConfig, SessionRunResult, SessionStatus, Step, StepType
@@ -105,7 +103,6 @@ class CustomAgent:
 
         cmd = list(self._cmd)
         stdin_data: bytes | None = None
-        tmp_prompt_file: str | None = None
 
         if self._prompt_mode == "stdin":
             stdin_data = session_prompt.encode()
@@ -172,7 +169,7 @@ class CustomAgent:
 
         try:
             await asyncio.wait_for(asyncio.shield(drain_task), timeout=self._timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             drain_task.cancel()
             watcher.cancel()
             proc.kill()
@@ -191,7 +188,7 @@ class CustomAgent:
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
             return SessionRunResult(status=SessionStatus.TIMEOUT, error=cancel_token.reason)
 

@@ -20,7 +20,6 @@ from typing import Any
 
 from horizonx.core.types import GateAction, GateDecision, Run, Session
 
-
 _ASSERT_PATTERNS = [
     # Python pytest: assert X, assert_* calls
     re.compile(r"^\s*assert\b", re.MULTILINE),
@@ -117,7 +116,7 @@ class TestSuiteGate:
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             return GateDecision(
                 decision=GateAction(self.on_fail),

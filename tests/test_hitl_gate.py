@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from pathlib import Path
@@ -21,7 +20,6 @@ from horizonx.core.types import (
     Task,
 )
 from horizonx.hitl.gate import _notify_slack, _notify_webhook, await_decision
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -108,7 +106,7 @@ async def test_notify_slack_import_error_writes_stderr(
         with patch.dict("sys.modules", {"slack_sdk.web.async_client": None}):
             import sys
             # Simulate ImportError by patching the import path used in gate.py
-            original = sys.modules.get("slack_sdk")
+            original = sys.modules.get("slack_sdk")  # noqa: F841
             sys.modules.pop("slack_sdk", None)
             sys.modules.pop("slack_sdk.web", None)
             sys.modules.pop("slack_sdk.web.async_client", None)
@@ -309,7 +307,7 @@ async def test_await_decision_timeout_escalation(tmp_path: Path) -> None:
             fake_start = time.monotonic() - 120  # 2 minutes past
 
     # We patch time.monotonic to simulate elapsed time
-    original_monotonic = time.monotonic
+    _original_monotonic = time.monotonic  # noqa: F841
     call_to_monotonic = [0]
 
     def patched_monotonic() -> float:

@@ -41,7 +41,7 @@ class TestMockAgent:
             status=SessionStatus.COMPLETED,
         )
         steps: list[Step] = []
-        result = await agent.run_session(
+        result = await agent.run_session(  # noqa: F841
             "test", workspace, on_step=lambda s: _collect(steps, s)
         )
         assert len(steps) == 2
@@ -83,7 +83,7 @@ class TestMockAgent:
         )
         agent = MockAgent(config=config)
         steps: list[Step] = []
-        result = await agent.run_session(
+        result = await agent.run_session(  # noqa: F841
             "test", workspace, on_step=lambda s: _collect(steps, s)
         )
         assert len(steps) == 1

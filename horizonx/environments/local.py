@@ -34,7 +34,7 @@ class LocalWorkspace:
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             return CommandResult(returncode=-1, stdout="", stderr="timeout", elapsed=timeout)
         return CommandResult(

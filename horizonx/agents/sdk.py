@@ -5,7 +5,7 @@ functions) to plug into HorizonX without building a subprocess shim.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Awaitable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from horizonx.agents.base import CancelToken, Workspace

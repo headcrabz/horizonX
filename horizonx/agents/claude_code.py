@@ -56,7 +56,7 @@ class ClaudeCodeConfig:
     no_session_persistence: bool = False  # if True, sessions can't be resumed
 
     @classmethod
-    def from_agent_config(cls, ac: AgentConfig) -> "ClaudeCodeConfig":
+    def from_agent_config(cls, ac: AgentConfig) -> ClaudeCodeConfig:
         return cls(
             model=ac.model,
             allowed_tools=ac.allowed_tools,

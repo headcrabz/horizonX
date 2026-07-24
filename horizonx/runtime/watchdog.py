@@ -63,7 +63,7 @@ class StallWatchdog:
 
     async def run(
         self,
-        session_task: "asyncio.Task[object]",
+        session_task: asyncio.Task[object],
         *,
         on_nudge: Callable[[str], Awaitable[None]] | None = None,
     ) -> StallOutcome:

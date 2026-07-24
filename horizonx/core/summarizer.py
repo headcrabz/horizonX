@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from horizonx.core.types import Run, Session, SessionSummary, SummarizerConfig, Step, StepType
+from horizonx.core.types import Run, Session, SessionSummary, Step, StepType, SummarizerConfig
 
 logger = logging.getLogger(__name__)
 

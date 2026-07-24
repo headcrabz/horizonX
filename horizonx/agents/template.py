@@ -11,11 +11,11 @@ Then use in task YAML:
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Awaitable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from horizonx.agents.base import CancelToken, SessionRunResult, Workspace
-from horizonx.core.types import SessionStatus, Step
+from horizonx.core.types import Step
 
 
 class TemplateAgent:

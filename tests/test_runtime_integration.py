@@ -11,13 +11,11 @@ from horizonx.core.event_bus import Event
 from horizonx.core.runtime import Runtime
 from horizonx.core.types import (
     AgentConfig,
-    GateAction,
     RunStatus,
-    SessionStatus,
     StrategyConfig,
+    SummarizerConfig,
     Task,
     ValidatorConfig,
-    SummarizerConfig,
 )
 from horizonx.storage.sqlite import SqliteStore
 
@@ -158,7 +156,7 @@ class TestWithSummarizer:
             }
             run = await rt.run(task)
             # Summary file should exist in workspace
-            summary_path = run.workspace_path / "summary.md"
+            _summary_path = run.workspace_path / "summary.md"  # noqa: F841
             # Summarizer is called by strategies, not runtime.run directly.
             # SingleSession doesn't call summarize, so this is fine.
 
@@ -321,7 +319,7 @@ class TestEventBus:
                 while True:
                     event = await asyncio.wait_for(it.__anext__(), timeout=2.0)
                     events.append(event)
-            except (asyncio.TimeoutError, StopAsyncIteration, asyncio.CancelledError):
+            except (TimeoutError, StopAsyncIteration, asyncio.CancelledError):
                 pass
 
         collector = asyncio.create_task(collect_events())

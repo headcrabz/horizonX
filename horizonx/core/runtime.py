@@ -63,8 +63,8 @@ class Runtime:
     async def run(self, task: Task, *, resume_from: str | None = None) -> Run:
         # Pre-flight workspace daily budget check
         if task.workspace and task.workspace.daily_budget_usd is not None:
-            from horizonx.core.usage import UsageStore
             from horizonx.core.governor import BudgetExceeded
+            from horizonx.core.usage import UsageStore
             spent = await UsageStore(self.store).daily_usd(task.workspace.workspace_id)
             if spent >= task.workspace.daily_budget_usd:
                 raise BudgetExceeded(

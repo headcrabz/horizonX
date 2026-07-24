@@ -23,11 +23,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
-from horizonx.core.types import AgentConfig, Run, SessionStatus, Step
-
+from horizonx.core.types import Run, SessionStatus, Step
+from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 
 class TreeOfTrials:
@@ -66,7 +65,7 @@ class TreeOfTrials:
 
             # Score all branches
             scores: list[float] = []
-            for i, (branch_dir, result) in enumerate(zip(branch_dirs, results)):
+            for i, (branch_dir, result) in enumerate(zip(branch_dirs, results, strict=False)):
                 if isinstance(result, Exception):
                     scores.append(0.0)
                     continue
@@ -77,7 +76,7 @@ class TreeOfTrials:
                 })
 
             # Select winner (prune below threshold)
-            viable = [(s, d) for s, d in zip(scores, branch_dirs) if s >= self.prune_below]
+            viable = [(s, d) for s, d in zip(scores, branch_dirs, strict=False) if s >= self.prune_below]
             if not viable:
                 viable = [(scores[0], branch_dirs[0])]  # fallback: keep first
             best_score, winner_dir = max(viable, key=lambda x: x[0])

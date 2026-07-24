@@ -13,8 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from horizonx.agents.base import CancelToken, Workspace
-from horizonx.agents.claude_code import ClaudeCodeAgent
-from horizonx.agents.codex import CodexAgent
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
 from horizonx.core.knowledge import RunKnowledgeStore
@@ -27,7 +25,6 @@ from horizonx.core.types import (
     Run,
     SessionStatus,
 )
-
 
 _BUILTIN_AGENTS: dict[str, str] = {
     "claude_code": "horizonx.agents.claude_code:ClaudeCodeAgent",

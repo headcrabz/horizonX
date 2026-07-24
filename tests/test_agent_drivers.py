@@ -369,8 +369,8 @@ class TestOpenHandsAgent:
 
     @pytest.mark.asyncio
     async def test_cli_binary_not_found(self, tmp_path: Path):
-        from horizonx.agents.openhands import OpenHandsAgent
         from horizonx.agents.base import Workspace
+        from horizonx.agents.openhands import OpenHandsAgent
         from horizonx.core.types import SessionStatus
         config = AgentConfig(type="openhands", model="any", extra={"cli_bin": "nonexistent-binary-xyz"})
         agent = OpenHandsAgent(config)

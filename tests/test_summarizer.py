@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -121,7 +120,7 @@ class TestSummarizer:
                 "tests_status": {},
                 "confidence": 0.6,
             }
-            path = await summarizer.summarize(session, run)
+            path = await summarizer.summarize(session, run)  # noqa: F841
             # Verify the prompt included the goal info
             call_args = mock.call_args
             assert "Auth system" in call_args.kwargs["user_prompt"]
@@ -130,7 +129,7 @@ class TestSummarizer:
 
 class TestStepCompression:
     def test_compress_types(self, tmp_path: Path):
-        run = _make_run(tmp_path)
+        run = _make_run(tmp_path)  # noqa: F841
         summarizer = Summarizer(SummarizerConfig(), MagicMock())
         steps = [
             Step(session_id="s1", sequence=0, type=StepType.THOUGHT,

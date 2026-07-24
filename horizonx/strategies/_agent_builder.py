@@ -19,14 +19,15 @@ _BUILTIN_AGENTS: dict[str, str] = {
 }
 
 
+_KEYWORD_CONFIG_AGENTS: frozenset[str] = frozenset({"mock"})
+
+
 def build_agent(ac: Any) -> Any:
     """Build an agent driver from AgentConfig.
 
     Checks built-ins first (no entry-point overhead), then falls back to
     installed horizonx.agents entry-points for third-party drivers.
     """
-    # Agents that take 'config' as a keyword argument (not positional)
-    _KEYWORD_CONFIG_AGENTS = frozenset({"mock"})
 
     if ac.type in _BUILTIN_AGENTS:
         module_path, cls_name = _BUILTIN_AGENTS[ac.type].rsplit(":", 1)

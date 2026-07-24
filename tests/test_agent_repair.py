@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from horizonx.agents.repair import repair_dangling_tool_calls
 
 

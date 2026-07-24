@@ -28,7 +28,7 @@ async def get_run(
     try:
         run = await store.load_run(run_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found")
+        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
     return run.model_dump(mode="json")
 
 

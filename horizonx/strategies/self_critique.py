@@ -26,22 +26,18 @@ See docs/LONG_HORIZON_AGENT.md §21.7.
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
 from horizonx.core.types import (
-    AgentConfig,
-    GateAction,
     Run,
     SessionStatus,
     Step,
-    StepType,
 )
+from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 CRITIQUE_SYSTEM = """\
 You are a code critic for a self-improving agent loop. Your role is to:
@@ -305,7 +301,7 @@ class SelfCritique:
                 f"({i.get('location','')})"
                 for i in issues
             ) + "\n\n"
-            f"## Suggestions\n" + "\n".join(f"- {s}" for s in suggestions) + "\n"
+            "## Suggestions\n" + "\n".join(f"- {s}" for s in suggestions) + "\n"
         )
 
     def _append_progress(self, ws: Path, round_n: int, score: float, verdict: str) -> None:

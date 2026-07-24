@@ -1,8 +1,6 @@
 """Tests for HX-13: WorkspaceKnowledgeStore and KnowledgeHandoffDir."""
-import pytest
-from pathlib import Path
-from horizonx.memory.knowledge_store import WorkspaceKnowledgeStore
 from horizonx.memory.handoff import KnowledgeHandoffDir, _parse_fact_file
+from horizonx.memory.knowledge_store import WorkspaceKnowledgeStore
 
 
 def test_upsert_and_search(tmp_path):

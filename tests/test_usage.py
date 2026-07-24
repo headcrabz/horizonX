@@ -1,8 +1,9 @@
 """Tests for HX-07: workspace budgets + cost velocity."""
 import pytest
-from horizonx.core.usage import CostVelocityMonitor, UsageStore
+
 from horizonx.core.governor import BudgetExceeded
-from horizonx.core.types import Task, WorkspaceConfig, AgentConfig, StrategyConfig
+from horizonx.core.types import WorkspaceConfig
+from horizonx.core.usage import CostVelocityMonitor, UsageStore
 
 
 @pytest.mark.asyncio
@@ -43,7 +44,6 @@ def test_velocity_monitor_no_fire_initially():
 
 
 def test_velocity_monitor_fires_after_doublings():
-    import time
     mon = CostVelocityMonitor(threshold_usd_per_min=0.0001)
     # Feed samples quickly to build up rate
     for _ in range(5):
@@ -56,7 +56,6 @@ def test_velocity_monitor_fires_after_doublings():
 
 @pytest.mark.asyncio
 async def test_budget_exceeded_raises(rt, mock_task):
-    from horizonx.core.types import WorkspaceConfig
     task = mock_task.model_copy(deep=True)
     task = task.model_copy(update={
         "workspace": WorkspaceConfig(workspace_id="ws-over", daily_budget_usd=1.0)

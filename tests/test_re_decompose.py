@@ -8,12 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from horizonx.core.goal_graph import GoalGraph
 from horizonx.core.types import (
     AgentConfig,
     GoalNode,
-    GoalStatus,
-    HITLDecision,
     Run,
     RunStatus,
     StrategyConfig,
@@ -105,8 +102,8 @@ def _minimal_goals_with_done_and_pending() -> dict:
 
 
 def _make_rt_mock(tmp_path: Path) -> MagicMock:
-    from horizonx.storage.sqlite import SqliteStore
     from horizonx.core.event_bus import InMemoryBus
+    from horizonx.storage.sqlite import SqliteStore
 
     store = SqliteStore(tmp_path / "test.db")
     bus = InMemoryBus()

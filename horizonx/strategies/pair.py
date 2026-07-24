@@ -19,14 +19,13 @@ See docs/LONG_HORIZON_AGENT.md §21.8.
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
-from horizonx.core.types import AgentConfig, Run, SessionStatus, Step
+from horizonx.core.types import Run, SessionStatus, Step
+from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 NAVIGATOR_SYSTEM_TEMPLATE = """\
 You are the Navigator in a pair-programming loop. Review the current state of the

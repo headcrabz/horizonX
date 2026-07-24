@@ -745,8 +745,8 @@ class SqliteStore:
         self, workspace_id: str, run_id: str,
         tokens_in: int, tokens_out: int, usd: float,
     ) -> None:
-        from datetime import date
         import uuid
+        from datetime import date
         with self._conn() as c:
             c.execute(
                 "INSERT INTO workspace_usage "

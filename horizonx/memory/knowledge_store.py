@@ -16,7 +16,6 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS facts_meta (
     id                  TEXT PRIMARY KEY,
@@ -53,7 +52,7 @@ class WorkspaceKnowledgeStore:
         self._init()
 
     @classmethod
-    def for_run(cls, workspace_path: Path, workspace_id: str | None = None) -> "WorkspaceKnowledgeStore":
+    def for_run(cls, workspace_path: Path, workspace_id: str | None = None) -> WorkspaceKnowledgeStore:
         """Resolve the knowledge DB path relative to the run workspace.
 
         Stores in <workspace_parent>/.horizonx/<workspace_id>/knowledge.db.

@@ -27,11 +27,9 @@ from horizonx.core.types import (
     StepType,
     StrategyConfig,
     Task,
-    new_session_id,
 )
 from horizonx.dashboard.app import create_app
 from horizonx.storage.sqlite import SqliteStore
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

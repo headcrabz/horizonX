@@ -6,7 +6,7 @@ See docs/LONG_HORIZON_AGENT.md §21–§23.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 from horizonx.core.event_bus import Event
 
@@ -22,6 +22,6 @@ class Strategy(Protocol):
 
     def __init__(self, config: dict[str, Any]): ...
 
-    async def execute(self, run: "Run", rt: "Runtime") -> AsyncIterator[Event]:
+    async def execute(self, run: Run, rt: Runtime) -> AsyncIterator[Event]:
         """Drive the run to completion or failure. Yields events for the bus."""
         ...

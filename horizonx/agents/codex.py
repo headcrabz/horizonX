@@ -55,7 +55,7 @@ class CodexConfig:
     config_overrides: dict[str, str] = field(default_factory=dict)
 
     @classmethod
-    def from_agent_config(cls, ac: AgentConfig) -> "CodexConfig":
+    def from_agent_config(cls, ac: AgentConfig) -> CodexConfig:
         overrides: dict[str, str] = {}
         if ac.reasoning_effort:
             # codex CLI exposes reasoning effort via TOML config override

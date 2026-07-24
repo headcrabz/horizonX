@@ -31,7 +31,7 @@ class ShellGate:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout_seconds
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             return GateDecision(
                 decision=GateAction.PAUSE_FOR_HITL,

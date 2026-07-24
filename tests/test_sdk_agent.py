@@ -1,9 +1,10 @@
 """Tests for HX-12: SDKAgent."""
-import pytest
-from unittest.mock import AsyncMock
 from pathlib import Path
+
+import pytest
+
 from horizonx.agents.sdk import SDKAgent
-from horizonx.core.types import SessionStatus, StepType, Step
+from horizonx.core.types import SessionStatus, Step, StepType
 
 
 def _make_config(callable_fn=None):

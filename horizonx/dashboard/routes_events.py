@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 from sse_starlette.sse import EventSourceResponse
 
-from horizonx.core.event_bus import Event, InMemoryBus
+from horizonx.core.event_bus import InMemoryBus
 
 from .deps import get_bus
 
