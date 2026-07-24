@@ -16,27 +16,27 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-  "pydantic>=2.6",
+  "pydantic>=2.13",
   "sqlalchemy[asyncio]>=2.0",
-  "aiosqlite>=0.19",
-  "click>=8.1",
-  "rich>=13.7",
-  "anyio>=4.2",
-  "pyyaml>=6.0",
-  "httpx>=0.27",
-  "anthropic>=0.39",
+  "aiosqlite>=0.22",
+  "click>=8.4",
+  "rich>=15.0",
+  "anyio>=4.14",
+  "pyyaml>=6.0.3",
+  "httpx>=0.28",
+  "anthropic>=0.119",
 ]
 
 [project.optional-dependencies]
-postgres = ["asyncpg>=0.29"]
-dashboard = ["fastapi>=0.115", "uvicorn[standard]>=0.27", "sse-starlette>=2.0"]
-slack = ["slack-sdk>=3.27"]
+postgres = ["asyncpg>=0.31"]
+dashboard = ["fastapi>=0.139", "uvicorn[standard]>=0.51", "sse-starlette>=3.4"]
+slack = ["slack-sdk>=3.43"]
 all = ["horizonx[postgres,dashboard,slack]"]
 dev = [
-  "pytest>=8.0",
-  "pytest-asyncio>=0.23",
-  "ruff>=0.4",
-  "mypy>=1.10",
+  "pytest>=9.1",
+  "pytest-asyncio>=1.4",
+  "ruff>=0.16",
+  "mypy>=2.3",
 ]
 
 [project.scripts]
