@@ -21,7 +21,7 @@ class BudgetExceeded(Exception):
     pass
 
 
-class ResourceGovernor(AbstractAsyncContextManager):
+class ResourceGovernor(AbstractAsyncContextManager["ResourceGovernor"]):
     """Tracks consumed resources; raises BudgetExceeded when limits hit."""
 
     def __init__(

@@ -44,6 +44,7 @@ import logging
 import os
 import shlex
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.types import AgentConfig, SessionRunResult, SessionStatus, Step, StepType
@@ -157,7 +158,7 @@ class CustomAgent:
                         await on_step(step)
                     seq += 1
 
-        async def _watch_cancel(drain_task: asyncio.Task) -> None:
+        async def _watch_cancel(drain_task: asyncio.Task[Any]) -> None:
             while not drain_task.done():
                 if cancel_token and cancel_token.cancelled:
                     drain_task.cancel()

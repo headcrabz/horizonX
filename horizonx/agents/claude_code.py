@@ -172,8 +172,8 @@ class ClaudeCodeAgent:
             agent_session_id=captured_session_id,
             status=status,
             error=last_error,
-            tokens_in=totals.get("input_tokens", 0) + totals.get("cache_creation_input_tokens", 0),
-            tokens_out=totals.get("output_tokens", 0),
+            tokens_in=int(totals.get("input_tokens", 0) + totals.get("cache_creation_input_tokens", 0)),
+            tokens_out=int(totals.get("output_tokens", 0)),
             cost_usd=totals.get("total_cost_usd", 0.0),
         )
 

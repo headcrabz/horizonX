@@ -320,7 +320,7 @@ class CodexAgent:
                 tool_name="todo_list",
                 content={
                     "items": item.get("items", []),
-                    "phase": outer_event_type.split(".")[-1],
+                    "phase": (outer_event_type or "").split(".")[-1],
                     "item_id": item.get("id"),
                 },
             ))
@@ -345,7 +345,7 @@ class CodexAgent:
         else:
             out.append(Step(
                 session_id=session_id, sequence=seq, type=StepType.OBSERVATION,
-                content={"raw_item": item, "phase": outer_event_type.split(".")[-1]},
+                content={"raw_item": item, "phase": (outer_event_type or "").split(".")[-1]},
             ))
 
         # Re-sequence

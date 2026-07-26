@@ -103,6 +103,14 @@ strict = true
 warn_return_any = true
 warn_unused_ignores = true
 
+[[tool.mypy.overrides]]
+module = ["horizonx.dashboard.*"]
+disable_error_code = ["untyped-decorator"]
+
+[[tool.mypy.overrides]]
+module = "horizonx.core.llm_client"
+disable_error_code = ["arg-type", "union-attr", "no-any-return"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

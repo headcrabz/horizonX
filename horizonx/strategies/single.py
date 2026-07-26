@@ -24,7 +24,7 @@ class SingleSession:
         session = await rt.start_session(run, target_goal=None)
         agent = _build_agent(run.task.agent)
 
-        async def on_step(step):
+        async def on_step(step: Any) -> None:
             step.session_id = session.id
             await rt.record_step(session, step)
 

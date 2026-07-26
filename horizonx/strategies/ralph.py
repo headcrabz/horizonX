@@ -97,7 +97,7 @@ class RalphLoop:
 
             _session = session
 
-            async def on_step(step, _s=_session):
+            async def on_step(step: Any, _s: Any = _session) -> None:
                 step.session_id = _s.id
                 await rt.record_step(_s, step)
 

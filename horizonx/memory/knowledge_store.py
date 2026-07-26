@@ -15,6 +15,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS facts_meta (
@@ -143,7 +144,7 @@ class WorkspaceKnowledgeStore:
             conn.execute("UPDATE facts_meta SET status='archived' WHERE id=?", (fact_id,))
             conn.commit()
 
-    def all_active(self) -> list[dict]:
+    def all_active(self) -> list[dict[str, Any]]:
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT id, content, tags, source_run_id, created_at, reference_count "

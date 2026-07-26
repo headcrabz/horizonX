@@ -60,7 +60,7 @@ class MonitorRespond:
         while True:
             # Check resource budget
             elapsed_hours = (time.monotonic() - start) / 3600
-            if elapsed_hours >= run.task.resources.max_total_hours:
+            if run.task.resources.max_total_hours is not None and elapsed_hours >= run.task.resources.max_total_hours:
                 break
             if self.max_triggers is not None and triggers_fired >= self.max_triggers:
                 break
@@ -130,7 +130,7 @@ class MonitorRespond:
             trigger_count=trigger_count,
         )
 
-        async def on_step(step: Step, s=session) -> None:
+        async def on_step(step: Step, s: Any = session) -> None:
             step.session_id = s.id
             await rt.record_step(s, step)
 

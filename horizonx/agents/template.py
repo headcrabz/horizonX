@@ -14,8 +14,8 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from horizonx.agents.base import CancelToken, SessionRunResult, Workspace
-from horizonx.core.types import Step
+from horizonx.agents.base import CancelToken, Workspace
+from horizonx.core.types import SessionRunResult, Step
 
 
 class TemplateAgent:

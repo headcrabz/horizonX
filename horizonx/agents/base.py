@@ -6,10 +6,10 @@ See docs/LONG_HORIZON_AGENT.md §24.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from horizonx.core.types import SessionRunResult, Step
 
@@ -67,7 +67,7 @@ async def stream_subprocess_jsonl(
     stdin_data: str | None = None,
     env: dict[str, str] | None = None,
     cancel_token: CancelToken | None = None,
-):
+) -> AsyncIterator[dict[str, Any]]:
     """Spawn a subprocess and yield parsed JSON events from its stdout."""
     import json
     import os

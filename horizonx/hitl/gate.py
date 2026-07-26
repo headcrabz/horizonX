@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, Literal, cast
 
 from horizonx.core.types import HITLConfig, HITLDecision, Run
 
@@ -70,9 +70,12 @@ async def await_decision(
     sys.stderr.write("Choose action: [a]pprove / [m]odify / [r]e-decompose / [x]abort: ")
     sys.stderr.flush()
     choice = (await asyncio.get_running_loop().run_in_executor(None, input)).strip().lower() or "a"
-    action = {"a": "approve", "m": "modify", "r": "re_decompose", "x": "abort"}.get(choice, "approve")
+    action = cast(
+        Literal["approve", "abort"],
+        {"a": "approve", "m": "modify", "r": "re_decompose", "x": "abort"}.get(choice, "approve"),
+    )
     instruction = ""
-    if action == "modify":
+    if action == "modify":  # type: ignore[comparison-overlap]
         sys.stderr.write("Enter instruction: ")
         sys.stderr.flush()
         instruction = await asyncio.get_running_loop().run_in_executor(None, input)
@@ -90,7 +93,7 @@ async def _notify_slack(
     if not token or not channel:
         return
     try:
-        from slack_sdk.web.async_client import AsyncWebClient  # type: ignore[import]
+        from slack_sdk.web.async_client import AsyncWebClient
 
         client = AsyncWebClient(token=token)
         await client.chat_postMessage(

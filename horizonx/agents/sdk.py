@@ -29,7 +29,7 @@ class SDKAgent:
 
     def __init__(self, config: Any) -> None:
         self.config = config
-        self._callable: Callable | None = config.extra.get("callable") if hasattr(config, "extra") else None
+        self._callable: Callable[..., Any] | None = config.extra.get("callable") if hasattr(config, "extra") else None
 
     async def run_session(
         self,

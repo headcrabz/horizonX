@@ -66,7 +66,7 @@ class DecompositionFirst:
             graph.save(graph_path)
             yield Event(type="goal.in_progress", run_id=run.id, payload={
                 "phase": "decomposed",
-                "subgoal_count": len(graph.all_nodes()),
+                "subgoal_count": len(list(graph.all_nodes())),
             })
         else:
             graph = GoalGraph.load(graph_path)
@@ -97,7 +97,7 @@ class DecompositionFirst:
                 + f"\n\nOriginal task context:\n{run.task.prompt[:1000]}"
             )
 
-            async def on_step(step: Step, s=session) -> None:
+            async def on_step(step: Step, s: Any = session) -> None:
                 step.session_id = s.id
                 await rt.record_step(s, step)
 
@@ -124,7 +124,8 @@ class DecompositionFirst:
             graph.save(graph_path)
 
             event_type = "goal.done" if goal.status == GoalStatus.DONE else "goal.in_progress"
-            yield Event(type=event_type, run_id=run.id, payload={
+            yield Event(type=event_type,  # type: ignore[arg-type]
+            run_id=run.id, payload={
                 "goal_id": goal.id, "status": goal.status.value,
             })
 

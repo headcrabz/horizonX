@@ -9,7 +9,7 @@ import importlib.metadata
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from horizonx.core.event_bus import Event, EventBus, InMemoryBus
 from horizonx.core.governor import ResourceGovernor
@@ -173,7 +173,7 @@ class Runtime:
             )
             await self.bus.publish(
                 Event(
-                    type=ev_type,
+                    type=ev_type,  # type: ignore[arg-type]
                     run_id=run.id,
                     session_id=session.id if session else None,
                     payload={"validator": vc.id, "reason": decision.reason},
@@ -301,7 +301,7 @@ class Runtime:
         if resume_from:
             run = await self.store.load_run(resume_from)
             run.status = RunStatus.RUNNING
-            return run
+            return cast(Run, run)
         workspace = self.workspace_root / f"{task.id}-{new_session_id()[:8]}"
         workspace.mkdir(parents=True, exist_ok=True)
         return Run(task=task, workspace_path=workspace, status=RunStatus.RUNNING)

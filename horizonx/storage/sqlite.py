@@ -718,7 +718,7 @@ class SqliteStore:
         with self._conn() as c:
             c.execute("DELETE FROM pending_runs WHERE run_id=?", (run_id,))
 
-    def _sync_list_pending_runs(self) -> list[dict]:
+    def _sync_list_pending_runs(self) -> list[dict[str, Any]]:
         with self._conn() as c:
             rows = c.execute(
                 "SELECT run_id, task_json FROM pending_runs WHERE status='pending'"
@@ -734,7 +734,7 @@ class SqliteStore:
     async def delete_pending_run(self, run_id: str) -> None:
         return await self._run_sync(self._sync_delete_pending_run, run_id)
 
-    async def list_pending_runs(self) -> list[dict]:
+    async def list_pending_runs(self) -> list[dict[str, Any]]:
         return await self._run_sync(self._sync_list_pending_runs)
 
     # ------------------------------------------------------------------

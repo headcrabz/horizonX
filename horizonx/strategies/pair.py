@@ -126,7 +126,7 @@ class PairProgramming:
                     goal=run.task.prompt,
                 )
 
-            async def on_driver_step(step: Step, s=driver_session) -> None:
+            async def on_driver_step(step: Step, s: Any = driver_session) -> None:
                 step.session_id = s.id
                 await rt.record_step(s, step)
 
@@ -153,7 +153,7 @@ class PairProgramming:
                 goal=run.task.prompt[:800],
             )
 
-            async def on_nav_step(step: Step, s=nav_session) -> None:
+            async def on_nav_step(step: Step, s: Any = nav_session) -> None:
                 step.session_id = s.id
                 await rt.record_step(s, step)
 

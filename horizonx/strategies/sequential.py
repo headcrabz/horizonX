@@ -107,7 +107,7 @@ class SequentialSubgoals:
         agent = _build_agent(run.task.agent)
         workspace = Workspace(path=run.workspace_path, env={})
 
-        async def on_step(step):
+        async def on_step(step: Any) -> None:
             step.session_id = session.id
             await rt.record_step(session, step)
 
@@ -170,7 +170,7 @@ class SequentialSubgoals:
 
         cancel_token = CancelToken()
 
-        async def on_step(step):
+        async def on_step(step: Any) -> None:
             step.session_id = session.id
             await rt.record_step(session, step)
             # Mid-session spin check every N steps

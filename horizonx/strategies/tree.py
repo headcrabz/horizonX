@@ -116,7 +116,7 @@ class TreeOfTrials:
             f"{run.task.prompt}"
         )
 
-        async def on_step(step: Step, s=session) -> None:
+        async def on_step(step: Step, s: Any = session) -> None:
             step.session_id = s.id
             await rt.record_step(s, step)
 
@@ -138,7 +138,7 @@ class TreeOfTrials:
     async def _shell_score(self, branch_dir: Path) -> float:
         import re
         proc = await asyncio.create_subprocess_shell(
-            self.scorer_command,
+            self.scorer_command or "true",
             cwd=str(branch_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

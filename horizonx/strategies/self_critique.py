@@ -113,7 +113,7 @@ class SelfCritique:
                     original_prompt=run.task.prompt,
                 )
 
-            async def on_impl_step(step: Step, s=impl_session) -> None:
+            async def on_impl_step(step: Step, s: Any = impl_session) -> None:
                 step.session_id = s.id
                 await rt.record_step(s, step)
 
@@ -249,7 +249,7 @@ class SelfCritique:
         )
         critic_session = await rt.start_session(run, target_goal=None)
 
-        async def on_critic_step(step: Step, s=critic_session) -> None:
+        async def on_critic_step(step: Step, s: Any = critic_session) -> None:
             step.session_id = s.id
             await rt.record_step(s, step)
 
@@ -262,7 +262,7 @@ class SelfCritique:
 
         if critique_out.exists():
             try:
-                return json.loads(critique_out.read_text())
+                return dict(json.loads(critique_out.read_text()))
             except json.JSONDecodeError:
                 pass
         return {"score": 0.5, "verdict": "revise", "issues": [], "suggestions": [],

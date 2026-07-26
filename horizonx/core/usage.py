@@ -22,7 +22,7 @@ class UsageStore:
         await self._store.record_workspace_usage(workspace_id, run_id, tokens_in, tokens_out, usd)
 
     async def daily_usd(self, workspace_id: str) -> float:
-        return await self._store.workspace_daily_usd(workspace_id)
+        return float(await self._store.workspace_daily_usd(workspace_id))
 
     async def over_budget(self, workspace_id: str, daily_budget_usd: float) -> bool:
         spent = await self.daily_usd(workspace_id)
@@ -38,7 +38,7 @@ class CostVelocityMonitor:
     """
     window: int = 5
     threshold_usd_per_min: float = 1.0
-    _samples: deque = field(default_factory=lambda: deque(maxlen=5))
+    _samples: deque[tuple[float, float]] = field(default_factory=lambda: deque(maxlen=5))
     _prev_slope: float = 0.0
     _doublings: int = 0
 

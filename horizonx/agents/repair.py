@@ -11,8 +11,10 @@ Usage:
 """
 from __future__ import annotations
 
+from typing import Any
 
-def repair_dangling_tool_calls(messages: list[dict]) -> list[dict]:
+
+def repair_dangling_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return a copy of *messages* with synthetic tool_results injected for any
     tool_use blocks that have no matching tool_result downstream.
 
@@ -37,7 +39,7 @@ def repair_dangling_tool_calls(messages: list[dict]) -> list[dict]:
 
     # Pass 2: find assistant messages whose tool_use blocks are not satisfied.
     # Record (message_index, list_of_dangling_blocks).
-    repairs: list[tuple[int, list[dict]]] = []
+    repairs: list[tuple[int, list[dict[str, Any]]]] = []
     for i, msg in enumerate(messages):
         if msg.get("role") != "assistant":
             continue
