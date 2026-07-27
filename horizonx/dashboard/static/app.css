@@ -1,23 +1,52 @@
-/* HorizonX Dashboard — Professional Control Plane */
+/* HorizonX Dashboard — Neutral Professional */
 
+/* ── Dark theme (default) ────────────────────────── */
 :root {
-  --bg:        #0b0e16;
-  --surface:   #111827;
-  --surface2:  #1a2235;
-  --border:    #1e2d45;
-  --border2:   #253450;
-  --text:      #f1f5f9;
-  --muted:     #94a3b8;
-  --faint:     #475569;
-  --accent:    #4f46e5;
+  --bg:        #09090b;
+  --surface:   #18181b;
+  --surface2:  #27272a;
+  --border:    #3f3f46;
+  --border2:   #52525b;
+  --text:      #f4f4f5;
+  --muted:     #a1a1aa;
+  --faint:     #71717a;
+  --accent:    #6366f1;
   --accent-lt: #818cf8;
   --green:     #22c55e;
   --green-dk:  #166534;
   --yellow:    #f59e0b;
   --red:       #ef4444;
-  --blue:      #3b82f6;
-  --purple:    #8b5cf6;
+  --blue:      #38bdf8;
+  --purple:    #a78bfa;
   --sidebar-w: 224px;
+  --sidebar-bg: #0c0c0e;
+  --topbar-bg:  #0c0c0e;
+  --scrollthumb: #2a2a2e;
+  --scrollthumb-h: #3f3f46;
+}
+
+/* ── Light theme ─────────────────────────────────── */
+html[data-theme="light"] {
+  --bg:        #f9fafb;
+  --surface:   #ffffff;
+  --surface2:  #f3f4f6;
+  --border:    #e5e7eb;
+  --border2:   #d1d5db;
+  --text:      #111827;
+  --muted:     #6b7280;
+  --faint:     #9ca3af;
+  --accent:    #4f46e5;
+  --accent-lt: #6366f1;
+  --green:     #16a34a;
+  --green-dk:  #14532d;
+  --yellow:    #d97706;
+  --red:       #dc2626;
+  --blue:      #2563eb;
+  --purple:    #7c3aed;
+  --sidebar-bg: #f3f4f6;
+  --topbar-bg:  #ffffff;
+  --scrollthumb: #d1d5db;
+  --scrollthumb-h: #9ca3af;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -36,14 +65,14 @@ body {
 /* ── Scrollbars ─────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #2a3550; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #374467; }
+::-webkit-scrollbar-thumb { background: var(--scrollthumb); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollthumb-h); }
 
 /* ── Sidebar ─────────────────────────────────────── */
 .sidebar {
   width: var(--sidebar-w);
   min-height: 100vh;
-  background: #080b12;
+  background: var(--sidebar-bg);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -92,7 +121,7 @@ body {
   margin-bottom: 1px;
 }
 .nav-item:hover { background: var(--surface2); color: var(--text); }
-.nav-item.active { background: rgba(79,70,229,0.15); color: var(--accent-lt); }
+.nav-item.active { background: rgba(99,102,241,0.15); color: var(--accent-lt); }
 .nav-item .nav-icon { width: 18px; font-size: 14px; text-align: center; flex-shrink: 0; }
 
 .sidebar-footer {
@@ -121,7 +150,7 @@ body {
 .topbar {
   height: 48px;
   border-bottom: 1px solid var(--border);
-  background: #090c14;
+  background: var(--topbar-bg);
   display: flex; align-items: center;
   padding: 0 24px;
   flex-shrink: 0;
@@ -220,13 +249,14 @@ button:focus { outline: none; }
   font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
   text-transform: uppercase;
 }
-.badge-running    { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); }
-.badge-completed  { background: rgba(34,197,94,0.12);  color: #4ade80; border: 1px solid rgba(34,197,94,0.25); }
-.badge-failed     { background: rgba(239,68,68,0.12);  color: #f87171; border: 1px solid rgba(239,68,68,0.25); }
-.badge-paused_hitl{ background: rgba(245,158,11,0.12); color: #fcd34d; border: 1px solid rgba(245,158,11,0.25); }
-.badge-aborted    { background: rgba(100,116,139,0.15);color: #94a3b8; border: 1px solid rgba(100,116,139,0.2);}
-.badge-timed_out  { background: rgba(249,115,22,0.12); color: #fb923c; border: 1px solid rgba(249,115,22,0.25);}
-.badge-pending    { background: rgba(100,116,139,0.1); color: #64748b; border: 1px solid rgba(100,116,139,0.15);}
+.badge-running    { background: rgba(59,130,246,0.12); color: var(--blue);   border: 1px solid rgba(59,130,246,0.3); }
+.badge-completed  { background: rgba(34,197,94,0.12);  color: var(--green);  border: 1px solid rgba(34,197,94,0.3); }
+.badge-failed     { background: rgba(239,68,68,0.12);  color: var(--red);    border: 1px solid rgba(239,68,68,0.3); }
+.badge-paused_hitl{ background: rgba(245,158,11,0.12); color: var(--yellow); border: 1px solid rgba(245,158,11,0.3); }
+.badge-aborted    { background: rgba(100,116,139,0.1); color: var(--muted);  border: 1px solid rgba(100,116,139,0.2);}
+.badge-timed_out  { background: rgba(249,115,22,0.12); color: #f97316;       border: 1px solid rgba(249,115,22,0.3);}
+.badge-pending    { background: rgba(100,116,139,0.08);color: var(--faint);  border: 1px solid rgba(100,116,139,0.15);}
+.badge-errored    { background: rgba(239,68,68,0.1);   color: var(--red);    border: 1px solid rgba(239,68,68,0.25);}
 
 /* ── Table ───────────────────────────────────────── */
 .data-table { width: 100%; border-collapse: collapse; }
@@ -328,7 +358,7 @@ button:focus { outline: none; }
 }
 .session-item:hover { background: var(--surface2); }
 .session-item.active {
-  background: rgba(79,70,229,0.1);
+  background: rgba(99,102,241,0.1);
   border-left-color: var(--accent);
 }
 .session-item .s-num { font-size: 12px; font-weight: 700; color: var(--text); }
@@ -358,7 +388,7 @@ button:focus { outline: none; }
 .event-type { font-weight: 700; }
 .event-payload { color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.ev-run .event-type     { color: #818cf8; }
+.ev-run .event-type     { color: var(--accent-lt); }
 .ev-session .event-type { color: #22d3ee; }
 .ev-step .event-type    { color: #64748b; }
 .ev-goal .event-type    { color: #4ade80; }
@@ -368,7 +398,7 @@ button:focus { outline: none; }
 .ev-budget .event-type  { color: #fb923c; }
 .ev-summary .event-type { color: #c084fc; }
 
-.ev-run      { border-left-color: #4f46e5; }
+.ev-run      { border-left-color: var(--accent); }
 .ev-session  { border-left-color: #0891b2; }
 .ev-goal     { border-left-color: #16a34a; }
 .ev-validator{ border-left-color: #d97706; }
@@ -432,7 +462,7 @@ button:focus { outline: none; }
 /* ── Buttons ─────────────────────────────────────── */
 .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 7px; font-size: 12.5px; font-weight: 600; cursor: pointer; border: none; transition: all 0.12s; }
 .btn-primary   { background: var(--accent); color: white; }
-.btn-primary:hover { background: #4338ca; }
+.btn-primary:hover { background: #7c3aed; }
 .btn-ghost     { background: var(--surface2); color: var(--muted); border: 1px solid var(--border2); }
 .btn-ghost:hover { color: var(--text); background: var(--surface); }
 .btn-green     { background: rgba(34,197,94,0.15); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
@@ -522,6 +552,39 @@ select.form-input { cursor: pointer; }
 .strategy-ref:last-child { border-bottom: none; }
 .strategy-ref code { font-family: monospace; color: var(--accent-lt); font-size: 11.5px; }
 .strategy-ref span { color: var(--faint); }
+
+/* ── Goal Graph DAG ─────────────────────────────── */
+#panel-goals.active { display: flex !important; }
+
+.dag-legend {
+  font-size: 11px; font-weight: 600; padding: 2px 8px;
+  border-radius: 4px; letter-spacing: 0.2px;
+}
+.dag-legend.done    { color: var(--green);  background: rgba(34,197,94,0.12); }
+.dag-legend.active  { color: var(--blue);   background: rgba(59,130,246,0.12); }
+.dag-legend.pending { color: var(--faint);  background: rgba(71,85,105,0.25); }
+.dag-legend.failed  { color: var(--red);    background: rgba(239,68,68,0.12); }
+
+.dag-btn {
+  width: 26px; height: 26px; border-radius: 5px; font-size: 14px; font-weight: 600;
+  color: var(--muted); background: var(--surface2); border: 1px solid var(--border2);
+  display: flex; align-items: center; justify-content: center; line-height: 1;
+}
+.dag-btn:hover { color: var(--text); border-color: var(--accent); }
+
+#dag-canvas { cursor: default; }
+#dag-canvas svg { display: block; }
+
+.dag-node { cursor: pointer; }
+.dag-node .dag-node-bg { transition: filter 0.12s; }
+.dag-node:hover .dag-node-bg { filter: brightness(1.25); }
+.dag-node.selected .dag-node-bg { filter: brightness(1.4); }
+
+@keyframes dag-pulse {
+  0%,100% { stroke-opacity: 1; filter: drop-shadow(0 0 5px rgba(99,102,241,0.4)); }
+  50%      { stroke-opacity: 0.45; filter: drop-shadow(0 0 1px rgba(99,102,241,0.1)); }
+}
+.dag-node-active .dag-node-bg { animation: dag-pulse 2.2s ease-in-out infinite; }
 
 /* ── Pulse ───────────────────────────────────────── */
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }

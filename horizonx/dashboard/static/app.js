@@ -63,6 +63,27 @@ function showView(id) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Theme toggle (light / dark)
+// ─────────────────────────────────────────────────────────────────────────────
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const btn = $('theme-toggle');
+  if (btn) btn.textContent = theme === 'light' ? '🌙' : '☀';
+  localStorage.setItem('hx-theme', theme);
+}
+
+window.toggleTheme = () => {
+  const current = document.documentElement.getAttribute('data-theme') || 'dark';
+  applyTheme(current === 'light' ? 'dark' : 'light');
+};
+
+// Apply saved theme on load
+(function () {
+  const saved = localStorage.getItem('hx-theme') || 'dark';
+  applyTheme(saved);
+})();
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Health
 // ─────────────────────────────────────────────────────────────────────────────
 async function checkHealth() {
@@ -439,7 +460,7 @@ window.setCenterTab = tab => {
   state.centerTab = tab;
   ['stream','goals','validations'].forEach(t => {
     const btn = $(`tab-${t}`); if (btn) btn.classList.toggle('active', t===tab);
-    const pan = $(`panel-${t}`); if (pan) pan.style.display = t===tab ? '' : 'none';
+    const pan = $(`panel-${t}`); if (pan) pan.style.display = t===tab ? (t==='goals' ? 'flex' : '') : 'none';
   });
   if (!state.currentRunId) return;
   if (tab==='goals')       loadGoals(state.currentRunId);
@@ -452,32 +473,166 @@ window.setCenterTab = tab => {
 async function loadGoals(runId) {
   try {
     const goals = await api(`/api/runs/${runId}/goals`);
-    renderGoals(goals);
+    renderGoalDAG(goals);
   } catch (e) {
-    $('panel-goals').innerHTML = `<div style="color:var(--red);padding:10px;font-size:11px;">${esc(e.message)}</div>`;
+    const c = $('dag-canvas');
+    if (c) c.innerHTML = `<div style="color:var(--red);padding:16px;font-size:11px;">${esc(e.message)}</div>`;
   }
 }
 
-function renderGoals(goals) {
+// ─── DAG layout constants ─────────────────────────────────────────────────────
+const DAG = { W: 192, H: 58, HG: 52, VG: 12, PAD: 20 };
+let _dagScale = 1;
+
+// Status palette — neutral dark theme
+const DAG_STATUS = {
+  done:        { stroke:'#22c55e', fill:'rgba(34,197,94,0.08)',   icon:'✓', tc:'#22c55e' },
+  in_progress: { stroke:'#6366f1', fill:'rgba(99,102,241,0.12)',  icon:'▶', tc:'#818cf8', pulse:true },
+  pending:     { stroke:'#3f3f46', fill:'rgba(39,39,42,0.8)',      icon:'○', tc:'#71717a' },
+  failed:      { stroke:'#ef4444', fill:'rgba(239,68,68,0.09)',   icon:'✕', tc:'#ef4444' },
+  blocked:     { stroke:'#f59e0b', fill:'rgba(245,158,11,0.09)',  icon:'⊘', tc:'#f59e0b' },
+  skipped:     { stroke:'#3f3f46', fill:'rgba(39,39,42,0.5)',      icon:'⊝', tc:'#52525b' },
+};
+
+// Build adjacency tree from flat list
+function dagBuildTree(goals) {
+  const byId = {};
+  goals.forEach(g => byId[g.id] = { ...g, children: [] });
+  const roots = [];
+  goals.forEach(g => {
+    const p = g.parent_id && byId[g.parent_id];
+    if (p) p.children.push(byId[g.id]);
+    else roots.push(byId[g.id]);
+  });
+  return roots;
+}
+
+// Measure subtree height (accounts for children fan-out)
+function dagMeasure(node) {
+  if (!node.children.length) { node._h = DAG.H; return; }
+  node.children.forEach(dagMeasure);
+  const childH = node.children.reduce((s, c) => s + c._h, 0)
+               + DAG.VG * (node.children.length - 1);
+  node._h = Math.max(DAG.H, childH);
+}
+
+// Assign x/y positions (horizontal left-to-right tree)
+function dagPlace(node, x, y) {
+  node._x = x;
+  node._y = y + (node._h - DAG.H) / 2;  // vertically center node in subtree
+  let cy = y;
+  node.children.forEach(child => {
+    dagPlace(child, x + DAG.W + DAG.HG, cy);
+    cy += child._h + DAG.VG;
+  });
+}
+
+// Flatten tree to array
+function dagFlatten(roots) {
+  const all = [];
+  (function walk(n) { all.push(n); n.children.forEach(walk); })(
+    { children: roots }  // virtual root to walk all
+  );
+  return all.filter(n => n.id);  // skip virtual
+}
+
+function renderGoalDAG(goals) {
+  const canvas = $('dag-canvas');
+  if (!canvas) return;
+
   if (!goals.length) {
-    $('panel-goals').innerHTML = '<div class="empty-state"><p>No goals yet</p></div>';
+    canvas.innerHTML = '<div class="empty-state" style="padding:40px 16px;"><div style="font-size:28px;opacity:0.2;margin-bottom:10px;">◈</div><p>No goals yet</p></div>';
     return;
   }
-  const byId  = Object.fromEntries(goals.map(g => [g.id, g]));
-  const roots = goals.filter(g => !g.parent_id || !byId[g.parent_id]);
-  const icons = { done:'✓', failed:'✗', in_progress:'▶', pending:'○', blocked:'⊘', skipped:'⊝' };
-  const cls   = { done:'done', failed:'failed', in_progress:'active', pending:'pending', blocked:'failed', skipped:'pending' };
 
-  function node(g, depth=0) {
-    const children = goals.filter(c => c.parent_id===g.id);
-    return `<div class="goal-row" style="padding-left:${depth*14+8}px;">
-      <span class="goal-icon ${cls[g.status]||'pending'}">${icons[g.status]||'?'}</span>
-      <span class="goal-name">${esc(g.name)}</span>
-      ${g.progress_pct!=null?`<span class="goal-pct">${Math.round(g.progress_pct)}%</span>`:''}
-    </div>` + children.map(c=>node(c,depth+1)).join('');
-  }
-  $('panel-goals').innerHTML = roots.map(r=>node(r)).join('');
+  const roots = dagBuildTree(goals);
+  roots.forEach(dagMeasure);
+
+  // Place roots stacked vertically
+  let y = DAG.PAD;
+  roots.forEach(r => { dagPlace(r, DAG.PAD, y); y += r._h + DAG.VG * 2; });
+
+  const all = dagFlatten(roots);
+  const svgW = Math.max(...all.map(n => n._x + DAG.W)) + DAG.PAD;
+  const svgH = Math.max(...all.map(n => n._y + DAG.H)) + DAG.PAD;
+
+  // Build SVG markup
+  let edges = '', nodes = '';
+
+  all.forEach(node => {
+    // Draw edge from this node to each child
+    node.children.forEach(child => {
+      const x1 = node._x + DAG.W, y1 = node._y + DAG.H / 2;
+      const x2 = child._x,        y2 = child._y + DAG.H / 2;
+      const mx = (x1 + x2) / 2;
+      edges += `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"
+        fill="none" stroke="#3f3f46" stroke-width="1.5" stroke-linecap="round"/>`;
+    });
+
+    const sc  = DAG_STATUS[node.status] || DAG_STATUS.pending;
+    const raw = node.name || node.id;
+    const label = raw.length > 26 ? raw.slice(0, 25) + '…' : raw;
+    const subId = node.id.length > 30 ? node.id.slice(0, 29) + '…' : node.id;
+    const pct  = node.progress_pct != null ? Math.round(node.progress_pct) : null;
+    const barMaxW = DAG.W - 24;
+    const barFillW = pct != null ? barMaxW * pct / 100 : 0;
+    const pulseClass = sc.pulse ? ' dag-node-active' : '';
+
+    nodes += `<g class="dag-node${pulseClass}" data-id="${esc(node.id)}"
+        onclick="dagSelectNode('${esc(node.id)}')" role="button" aria-label="${esc(raw)}">
+      <rect class="dag-node-bg" x="${node._x}" y="${node._y}"
+        width="${DAG.W}" height="${DAG.H}" rx="8"
+        fill="${sc.fill}" stroke="${sc.stroke}" stroke-width="1.5"/>
+      ${pct != null ? `
+        <rect x="${node._x + 12}" y="${node._y + DAG.H - 9}"
+          width="${barMaxW}" height="3" rx="1.5" fill="#27272a"/>
+        <rect x="${node._x + 12}" y="${node._y + DAG.H - 9}"
+          width="${barFillW}" height="3" rx="1.5" fill="${sc.stroke}"/>` : ''}
+      <text x="${node._x + 13}" y="${node._y + 21}"
+        font-size="12.5" fill="${sc.tc}" font-weight="800"
+        font-family="system-ui,sans-serif">${sc.icon}</text>
+      <text x="${node._x + 28}" y="${node._y + 21}"
+        font-size="12" fill="#f1f5f9" font-weight="600"
+        font-family="system-ui,sans-serif">${esc(label)}</text>
+      <text x="${node._x + 13}" y="${node._y + 38}"
+        font-size="10" fill="#475569"
+        font-family="system-ui,sans-serif">${esc(subId)}</text>
+      ${pct != null ? `
+        <text x="${node._x + DAG.W - 8}" y="${node._y + 38}"
+          text-anchor="end" font-size="10" fill="${sc.tc}"
+          font-family="system-ui,sans-serif">${pct}%</text>` : ''}
+    </g>`;
+  });
+
+  canvas.innerHTML = `
+    <svg id="dag-svg" width="${svgW}" height="${svgH}"
+         style="display:block;min-width:100%;transform-origin:top left;transition:transform 0.15s;">
+      <g class="dag-edges">${edges}</g>
+      <g class="dag-nodes">${nodes}</g>
+    </svg>`;
+
+  _dagScale = 1;
 }
+
+window.dagSelectNode = (id) => {
+  document.querySelectorAll('.dag-node').forEach(g => g.classList.remove('selected'));
+  // Use querySelectorAll + filter to avoid CSS.escape issues with dots in IDs
+  document.querySelectorAll('.dag-node').forEach(g => {
+    if (g.getAttribute('data-id') === id) g.classList.add('selected');
+  });
+};
+
+window.dagZoom = (delta) => {
+  _dagScale = Math.min(2, Math.max(0.3, _dagScale + delta));
+  const svg = $('dag-svg');
+  if (svg) svg.style.transform = `scale(${_dagScale})`;
+};
+
+window.dagFit = () => {
+  _dagScale = 1;
+  const svg = $('dag-svg');
+  if (svg) { svg.style.transform = 'scale(1)'; $('dag-canvas').scrollTo(0, 0); }
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Validators

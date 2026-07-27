@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>HorizonX — Control Plane</title>
-  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/app.css?v=1785162997">
 </head>
 <body>
 
@@ -74,6 +74,8 @@
       <button class="btn btn-ghost" id="refresh-btn" onclick="refreshCurrentView()" style="display:none;">
         ↺ Refresh
       </button>
+      <button class="btn btn-ghost" id="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark theme"
+              style="font-size:15px;padding:4px 10px;letter-spacing:0;">☀</button>
       <a class="btn btn-primary" href="#/launch">▶ Launch Run</a>
     </div>
   </div>
@@ -246,10 +248,26 @@
 
           <!-- Goal Graph panel -->
           <div id="panel-goals"
-               style="flex:1;min-height:0;overflow-y:auto;padding:8px;display:none;">
-            <div class="empty-state">
-              <div style="font-size:24px;opacity:0.3;margin-bottom:8px;">◈</div>
-              <p>No goals recorded yet</p>
+               style="flex:1;min-height:0;display:none;flex-direction:column;">
+            <!-- DAG toolbar -->
+            <div id="dag-toolbar" style="display:flex;align-items:center;gap:10px;padding:7px 12px;border-bottom:1px solid var(--border);flex-shrink:0;">
+              <span style="font-size:11px;color:var(--faint);font-weight:600;letter-spacing:0.4px;">LEGEND</span>
+              <span class="dag-legend done">✓ done</span>
+              <span class="dag-legend active">▶ active</span>
+              <span class="dag-legend pending">○ pending</span>
+              <span class="dag-legend failed">✕ failed</span>
+              <div style="margin-left:auto;display:flex;gap:6px;">
+                <button class="dag-btn" onclick="dagZoom(0.15)" title="Zoom in">+</button>
+                <button class="dag-btn" onclick="dagZoom(-0.15)" title="Zoom out">−</button>
+                <button class="dag-btn" onclick="dagFit()" title="Fit">⊡</button>
+              </div>
+            </div>
+            <!-- SVG canvas -->
+            <div id="dag-canvas" style="flex:1;overflow:auto;position:relative;">
+              <div class="empty-state" style="padding:40px 16px;">
+                <div style="font-size:28px;opacity:0.2;margin-bottom:10px;">◈</div>
+                <p>No goals recorded yet</p>
+              </div>
             </div>
           </div>
 
@@ -608,6 +626,6 @@
 </div><!-- /.main -->
 
 <script src="https://cdn.jsdelivr.net/npm/js-yaml@4/dist/js.yaml.min.js"></script>
-<script src="/app.js"></script>
+<script src="/app.js?v=1785162997"></script>
 </body>
 </html>
