@@ -8,8 +8,8 @@
 
 HorizonX wraps Claude Code, Codex, and OpenHands with the infrastructure they need to run reliably for hours — crash recovery, spin detection, budget governance, cross-session memory, structured goal tracking, and operator-in-the-loop gates.
 
-[![CI](https://github.com/your-org/horizonx/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/horizonx/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/headcrabz/horizonX/actions/workflows/ci.yml/badge.svg)](https://github.com/headcrabz/horizonX/actions)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Tests: 277 passing](https://img.shields.io/badge/tests-277%20passing-brightgreen.svg)](tests/)
 
@@ -175,6 +175,70 @@ Facts persist across runs indefinitely. Agents stop re-discovering the same thin
 
 ---
 
+## Agent harness setup
+
+HorizonX ships drivers for four agents. Each needs its own binary or API key:
+
+### Claude Code (default)
+```bash
+# Install Claude Code CLI
+npm install -g @anthropic-ai/claude-code
+
+# Authenticate (subscription or API key)
+claude /login
+# OR
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+```yaml
+agent:
+  type: claude_code
+  model: claude-opus-4-8        # or claude-sonnet-4-6, claude-haiku-4-5
+  extra:
+    permission_mode: bypassPermissions   # acceptEdits | auto | bypassPermissions
+    max_budget_usd: 2.0                  # native claude budget cap (optional)
+```
+
+### Codex (OpenAI)
+```bash
+npm install -g @openai/codex
+export OPENAI_API_KEY=sk-...
+```
+```yaml
+agent:
+  type: codex
+  model: codex-mini-latest      # or o4-mini
+```
+
+### OpenHands
+```bash
+pip install openhands-ai
+export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY
+```
+```yaml
+agent:
+  type: openhands
+  model: claude-opus-4-8
+```
+
+### Custom / SDK agent (no binary needed)
+```python
+from pathlib import Path
+from horizonx.core.types import Step, StepType
+
+async def my_agent(prompt: str, workspace_path: Path):
+    # yield Step objects as your agent works
+    yield Step(session_id="", sequence=0, type=StepType.THOUGHT,
+               content={"text": "Starting task..."})
+    # ... do work, yield more steps ...
+
+# Register inline:
+task = Task(agent=AgentConfig(type="sdk", extra={"callable": my_agent}))
+```
+
+Or ship as a pip package with an entry-point (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+---
+
 ## Pluggable architecture
 
 All extension points use Python entry-points — ship a pip package and it works:
@@ -270,6 +334,6 @@ Core runtime is implemented, tested, and ready for production use on long-horizo
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).
 
 Built by [Anshul Mittal](https://www.linkedin.com/in/anshulnsit/).
