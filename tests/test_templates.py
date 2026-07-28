@@ -108,11 +108,12 @@ def test_validator_configs_have_type_and_command(lib):
 
 
 # ---------------------------------------------------------------------------
-# API endpoint
+# API endpoint (requires dashboard extras — skipped in base CI)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_api_returns_15_templates():
+    pytest.importorskip("fastapi", reason="pip install horizonx[dashboard]")
     from httpx import ASGITransport, AsyncClient
 
     from horizonx.dashboard.app import create_app
@@ -127,6 +128,7 @@ async def test_api_returns_15_templates():
 
 @pytest.mark.asyncio
 async def test_api_get_single_template():
+    pytest.importorskip("fastapi", reason="pip install horizonx[dashboard]")
     from httpx import ASGITransport, AsyncClient
 
     from horizonx.dashboard.app import create_app
@@ -139,6 +141,7 @@ async def test_api_get_single_template():
 
 @pytest.mark.asyncio
 async def test_api_404_for_missing_template():
+    pytest.importorskip("fastapi", reason="pip install horizonx[dashboard]")
     from httpx import ASGITransport, AsyncClient
 
     from horizonx.dashboard.app import create_app
