@@ -392,9 +392,28 @@
       </div>
       <span style="font-size:12px;color:var(--faint);" id="launch-mode-hint">Configure your job using the form below</span>
       <div style="margin-left:auto;display:flex;align-items:center;gap:10px;">
+        <button class="btn btn-ghost" style="font-size:12px;" onclick="openTemplatePanel()"
+                title="Browse 15 curated goal node templates">⊡ Goal Templates</button>
         <button id="launch-btn" class="btn btn-primary" onclick="submitLaunch()">▶ Launch Run</button>
         <span id="launch-status" style="font-size:12.5px;color:var(--faint);"></span>
       </div>
+    </div>
+
+    <!-- ═══ TEMPLATE PANEL ═══ -->
+    <div id="template-panel" style="display:none;border:1px solid var(--border);border-radius:10px;
+         background:var(--surface);overflow:hidden;flex-shrink:0;">
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;
+                  border-bottom:1px solid var(--border);">
+        <span style="font-size:11px;font-weight:700;letter-spacing:0.8px;
+                     text-transform:uppercase;color:var(--faint);">Goal Templates</span>
+        <div id="template-domain-tabs" style="display:flex;gap:4px;"></div>
+        <span style="font-size:11px;color:var(--faint);margin-left:4px;">
+          — click any template to copy its goal node into the YAML editor</span>
+        <button onclick="closeTemplatePanel()"
+                style="margin-left:auto;color:var(--faint);font-size:16px;line-height:1;">✕</button>
+      </div>
+      <div id="template-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
+           gap:8px;padding:12px;max-height:260px;overflow-y:auto;"></div>
     </div>
 
     <!-- ═══ FORM MODE ═══ -->
