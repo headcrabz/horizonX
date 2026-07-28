@@ -21,6 +21,7 @@ from typing import Any
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
+from horizonx.core.task_board import append_task_board
 from horizonx.core.types import GoalStatus, Run, Step
 from horizonx.strategies._agent_builder import build_agent as _build_agent
 
@@ -78,12 +79,25 @@ class DecompositionFirst:
             if goal is None:
                 break
 
+            # Atomically claim in DB — safe for future parallel execution
+            claimed = await rt.store.claim_goal(run.id, goal.id, session_id="pending")
+            if not claimed:
+                continue  # another agent claimed it; pick next leaf
+
             graph.mark_in_progress(goal.id, by_session="pending")
             graph.save(graph_path)
 
             session = await rt.start_session(run, target_goal=goal)
             graph.mark_in_progress(goal.id, by_session=session.id)
+            goal.assigned_to_session = session.id
             graph.save(graph_path)
+            append_task_board(
+                run.workspace_path,
+                event="claimed",
+                goal_id=goal.id,
+                session_id=session.id,
+                agent_type=run.task.agent.type,
+            )
 
             agent = _build_agent(run.task.agent)
             workspace = Workspace(path=run.workspace_path, env={})
@@ -116,8 +130,14 @@ class DecompositionFirst:
 
             if any_abort or (not all_continue and goal.attempts >= self.max_attempts_per_goal):
                 graph.mark_failed(goal.id, by_session=session.id)
+                await rt.store.release_goal(run.id, goal.id)
+                append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
+                                  session_id=session.id, agent_type=run.task.agent.type)
             elif all_continue:
                 graph.mark_done(goal.id, by_session=session.id)
+                await rt.store.release_goal(run.id, goal.id)
+                append_task_board(run.workspace_path, event="completed", goal_id=goal.id,
+                                  session_id=session.id, agent_type=run.task.agent.type)
             else:
                 goal.attempts += 1
 

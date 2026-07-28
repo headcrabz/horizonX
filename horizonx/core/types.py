@@ -327,6 +327,7 @@ class GoalNode(BaseModel):
     notes: str = ""
     last_updated_at: datetime = Field(default_factory=utcnow)
     last_updated_by_session: str | None = None
+    assigned_to_session: str | None = None  # set by claim_goal(); cleared on done/failed
 
     @field_validator("id")
     @classmethod

@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS goals (
     attempts                 INTEGER NOT NULL DEFAULT 0,
     notes                    TEXT,
     last_updated_at          TEXT NOT NULL,
-    last_updated_by_session  TEXT
+    last_updated_by_session  TEXT,
+    assigned_to_session      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_goals_run ON goals(run_id, status);
 
@@ -161,6 +162,11 @@ class SqliteStore:
         with self._conn() as c:
             _apply_wal(c)
             c.executescript(SCHEMA)
+            # Migration: add assigned_to_session to existing DBs that predate HX-20
+            try:
+                c.execute("ALTER TABLE goals ADD COLUMN assigned_to_session TEXT")
+            except Exception:
+                pass  # column already exists
 
     async def _run_sync(self, fn: Callable[..., _T], *args: Any) -> _T:
         loop = asyncio.get_running_loop()
@@ -345,14 +351,16 @@ class SqliteStore:
             c.execute(
                 """\
                 INSERT INTO goals (id, run_id, parent_id, name, description, verification_criteria,
-                                   status, attempts, notes, last_updated_at, last_updated_by_session)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                                   status, attempts, notes, last_updated_at, last_updated_by_session,
+                                   assigned_to_session)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status,
                     attempts=excluded.attempts,
                     notes=excluded.notes,
                     last_updated_at=excluded.last_updated_at,
-                    last_updated_by_session=excluded.last_updated_by_session
+                    last_updated_by_session=excluded.last_updated_by_session,
+                    assigned_to_session=excluded.assigned_to_session
                 """,
                 (
                     g.id,
@@ -366,11 +374,50 @@ class SqliteStore:
                     g.notes,
                     g.last_updated_at.isoformat(),
                     g.last_updated_by_session,
+                    g.assigned_to_session,
                 ),
             )
 
     async def save_goal(self, run_id: str, g: GoalNode) -> None:
         return await self._run_sync(self._sync_save_goal, run_id, g)
+
+    def _sync_claim_goal(self, run_id: str, goal_id: str, session_id: str) -> bool:
+        """Atomically claim a PENDING goal for a session.
+
+        Uses BEGIN IMMEDIATE to prevent two parallel agents double-claiming the
+        same leaf. Returns True if this session won the claim, False if another
+        session already claimed or the goal is no longer PENDING.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE goals SET assigned_to_session=?, status='in_progress' "
+                "WHERE id=? AND run_id=? AND status='pending' AND assigned_to_session IS NULL",
+                (session_id, goal_id, run_id),
+            )
+            claimed = cur.rowcount == 1
+            conn.commit()
+            return claimed
+        except Exception:
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    async def claim_goal(self, run_id: str, goal_id: str, session_id: str) -> bool:
+        return await self._run_sync(self._sync_claim_goal, run_id, goal_id, session_id)
+
+    def _sync_release_goal(self, run_id: str, goal_id: str) -> None:
+        """Clear the assignment when a goal completes or fails."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE goals SET assigned_to_session=NULL WHERE id=? AND run_id=?",
+                (goal_id, run_id),
+            )
+
+    async def release_goal(self, run_id: str, goal_id: str) -> None:
+        return await self._run_sync(self._sync_release_goal, run_id, goal_id)
 
     def _sync_load_goal(self, run_id: str, goal_id: str) -> GoalNode | None:
         from horizonx.core.types import GoalStatus
@@ -600,6 +647,7 @@ class SqliteStore:
                     notes=row["notes"] or "",
                     last_updated_at=row["last_updated_at"],
                     last_updated_by_session=row["last_updated_by_session"],
+                    assigned_to_session=row["assigned_to_session"],
                 )
             )
         # Reconstruct children from parent_id relationships

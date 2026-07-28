@@ -18,6 +18,7 @@ from horizonx.core.goal_graph import GoalGraph
 from horizonx.core.knowledge import RunKnowledgeStore
 from horizonx.core.llm_client import call_llm_json
 from horizonx.core.session_manager import SessionManager
+from horizonx.core.task_board import append_task_board
 from horizonx.core.types import (
     GateAction,
     GoalNode,
@@ -156,12 +157,27 @@ class SequentialSubgoals:
     # ------------------------------------------------------------------
 
     async def _run_goal_session(self, run: Run, rt: Any, graph: GoalGraph, goal: GoalNode) -> None:
+        # Atomically claim in DB before mutating in-memory graph.
+        # Returns False only if a concurrent agent already claimed this goal
+        # (shouldn't happen in sequential strategy, but guards future parallel use).
+        claimed = await rt.store.claim_goal(run.id, goal.id, session_id="pending")
+        if not claimed:
+            return  # another agent claimed it first; caller will pick next leaf
+
         graph.mark_in_progress(goal.id, by_session="pending")
         graph.save(run.workspace_path / "goals.json")
 
         session = await rt.start_session(run, target_goal=goal)
         graph.mark_in_progress(goal.id, by_session=session.id)
+        goal.assigned_to_session = session.id
         graph.save(run.workspace_path / "goals.json")
+        append_task_board(
+            run.workspace_path,
+            event="claimed",
+            goal_id=goal.id,
+            session_id=session.id,
+            agent_type=run.task.agent.type,
+        )
 
         sm = SessionManager(run)
         prompt = sm.compose_prompt(target_goal=goal)
@@ -211,6 +227,9 @@ class SequentialSubgoals:
 
         if any_abort:
             graph.mark_failed(goal.id, by_session=session.id)
+            await rt.store.release_goal(run.id, goal.id)
+            append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
+                              session_id=session.id, agent_type=run.task.agent.type)
             await rt.end_session(session, SessionStatus.ERRORED)
             return
 
@@ -223,6 +242,9 @@ class SequentialSubgoals:
             decision = await rt.request_hitl(run, reason="validator_or_spin", context=ctx)
             if decision.action == "abort":
                 graph.mark_failed(goal.id, by_session=session.id)
+                await rt.store.release_goal(run.id, goal.id)
+                append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
+                                  session_id=session.id, agent_type=run.task.agent.type)
                 await rt.end_session(session, SessionStatus.ERRORED)
                 return
             if decision.action == "modify":
@@ -235,9 +257,15 @@ class SequentialSubgoals:
 
         if all_continue:
             graph.mark_done(goal.id, by_session=session.id)
+            await rt.store.release_goal(run.id, goal.id)
+            append_task_board(run.workspace_path, event="completed", goal_id=goal.id,
+                              session_id=session.id, agent_type=run.task.agent.type)
         else:
             if goal.attempts >= goal.max_attempts:
                 graph.mark_failed(goal.id, by_session=session.id)
+                await rt.store.release_goal(run.id, goal.id)
+                append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
+                                  session_id=session.id, agent_type=run.task.agent.type)
 
         await rt.end_session(session, result.status or SessionStatus.COMPLETED)
 
