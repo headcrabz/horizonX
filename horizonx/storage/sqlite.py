@@ -21,6 +21,7 @@ from horizonx.core.types import (
     Session,
     SpinReport,
     Step,
+    ValidatorConfig,
 )
 
 _T = TypeVar("_T")
@@ -80,7 +81,9 @@ CREATE TABLE IF NOT EXISTS goals (
     notes                    TEXT,
     last_updated_at          TEXT NOT NULL,
     last_updated_by_session  TEXT,
-    assigned_to_session      TEXT
+    assigned_to_session      TEXT,
+    validators               TEXT,
+    inherit_validators       INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_goals_run ON goals(run_id, status);
 
@@ -165,6 +168,15 @@ class SqliteStore:
             # Migration: add assigned_to_session to existing DBs that predate HX-20
             try:
                 c.execute("ALTER TABLE goals ADD COLUMN assigned_to_session TEXT")
+            except Exception:
+                pass  # column already exists
+            # Migration: add validators / inherit_validators to DBs that predate GE-03
+            try:
+                c.execute("ALTER TABLE goals ADD COLUMN validators TEXT")
+            except Exception:
+                pass  # column already exists
+            try:
+                c.execute("ALTER TABLE goals ADD COLUMN inherit_validators INTEGER NOT NULL DEFAULT 1")
             except Exception:
                 pass  # column already exists
 
@@ -352,15 +364,17 @@ class SqliteStore:
                 """\
                 INSERT INTO goals (id, run_id, parent_id, name, description, verification_criteria,
                                    status, attempts, notes, last_updated_at, last_updated_by_session,
-                                   assigned_to_session)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                                   assigned_to_session, validators, inherit_validators)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status,
                     attempts=excluded.attempts,
                     notes=excluded.notes,
                     last_updated_at=excluded.last_updated_at,
                     last_updated_by_session=excluded.last_updated_by_session,
-                    assigned_to_session=excluded.assigned_to_session
+                    assigned_to_session=excluded.assigned_to_session,
+                    validators=excluded.validators,
+                    inherit_validators=excluded.inherit_validators
                 """,
                 (
                     g.id,
@@ -375,6 +389,8 @@ class SqliteStore:
                     g.last_updated_at.isoformat(),
                     g.last_updated_by_session,
                     g.assigned_to_session,
+                    json.dumps([v.model_dump(mode="json") for v in g.validators]),
+                    1 if g.inherit_validators else 0,
                 ),
             )
 
@@ -428,6 +444,9 @@ class SqliteStore:
             ).fetchone()
         if not row:
             return None
+        row_keys = row.keys()
+        raw_validators = row["validators"] if "validators" in row_keys else None
+        raw_inherit = row["inherit_validators"] if "inherit_validators" in row_keys else 1
         return GoalNode(
             id=row["id"],
             parent_id=row["parent_id"],
@@ -439,6 +458,9 @@ class SqliteStore:
             notes=row["notes"] or "",
             last_updated_at=row["last_updated_at"],
             last_updated_by_session=row["last_updated_by_session"],
+            assigned_to_session=row["assigned_to_session"] if "assigned_to_session" in row_keys else None,
+            validators=[ValidatorConfig(**v) for v in json.loads(raw_validators or "[]")],
+            inherit_validators=bool(raw_inherit) if raw_inherit is not None else True,
         )
 
     async def load_goal(self, run_id: str, goal_id: str) -> GoalNode | None:
@@ -635,6 +657,9 @@ class SqliteStore:
             ).fetchall()
         nodes = []
         for row in rows:
+            row_keys = row.keys()
+            raw_validators = row["validators"] if "validators" in row_keys else None
+            raw_inherit = row["inherit_validators"] if "inherit_validators" in row_keys else 1
             nodes.append(
                 GoalNode(
                     id=row["id"],
@@ -648,6 +673,8 @@ class SqliteStore:
                     last_updated_at=row["last_updated_at"],
                     last_updated_by_session=row["last_updated_by_session"],
                     assigned_to_session=row["assigned_to_session"],
+                    validators=[ValidatorConfig(**v) for v in json.loads(raw_validators or "[]")],
+                    inherit_validators=bool(raw_inherit) if raw_inherit is not None else True,
                 )
             )
         # Reconstruct children from parent_id relationships

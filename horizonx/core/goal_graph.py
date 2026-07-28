@@ -11,7 +11,7 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 
-from horizonx.core.types import GoalNode, GoalStatus, utcnow
+from horizonx.core.types import GoalNode, GoalStatus, ValidatorConfig, utcnow
 
 
 class GoalGraphError(Exception):
@@ -74,6 +74,35 @@ class GoalGraph:
         if goal_id not in self._nodes:
             raise GoalGraphError(f"unknown goal id: {goal_id}")
         return self._nodes[goal_id]
+
+    def effective_validators(
+        self, goal_id: str, task_validators: list[ValidatorConfig] | None = None
+    ) -> list[ValidatorConfig]:
+        """Resolve the validator list that applies to a goal, walking the parent chain.
+
+        Root's implicit base is task_validators when root defines no validators of its
+        own (backward-compatible with plain task.milestone_validators configs). Each node
+        going down the chain overlays its own validators on top, overriding by id. A node
+        with inherit_validators=False receives nothing from its ancestors or the task-level
+        fallback — only its own validators list.
+        """
+        node = self.get(goal_id)
+        merged = self._collect_effective_validators(node, task_validators or [])
+        return list(merged.values())
+
+    def _collect_effective_validators(
+        self, node: GoalNode, task_validators: list[ValidatorConfig]
+    ) -> dict[str, ValidatorConfig]:
+        if node.parent_id is None:
+            base = {v.id: v for v in task_validators}
+        elif node.inherit_validators and node.parent_id in self._nodes:
+            base = self._collect_effective_validators(self._nodes[node.parent_id], task_validators)
+        else:
+            base = {}
+        merged = dict(base)
+        for v in node.validators:
+            merged[v.id] = v
+        return merged
 
     def all_nodes(self) -> Iterable[GoalNode]:
         return self._nodes.values()

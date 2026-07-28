@@ -90,7 +90,7 @@ class DecompositionChecker:
             ))
 
         for node in nodes:
-            self._check_node(node, report, task)
+            self._check_node(node, report, task, graph)
 
         return report
 
@@ -103,11 +103,13 @@ class DecompositionChecker:
 
     # ------------------------------------------------------------------
 
-    def _check_node(self, node: GoalNode, report: DecompositionReport, task: Task) -> None:
+    def _check_node(
+        self, node: GoalNode, report: DecompositionReport, task: Task, graph: GoalGraph
+    ) -> None:
         self._check_vague_name(node, report)
         self._check_description(node, report)
         self._check_too_many_children(node, report)
-        self._check_no_verification_criteria(node, report)
+        self._check_no_verification_criteria(node, report, task, graph)
         self._check_failed_goal_with_no_attempts(node, report)
 
     def _check_vague_name(self, node: GoalNode, report: DecompositionReport) -> None:
@@ -162,18 +164,25 @@ class DecompositionChecker:
                 ),
             ))
 
-    def _check_no_verification_criteria(self, node: GoalNode, report: DecompositionReport) -> None:
+    def _check_no_verification_criteria(
+        self, node: GoalNode, report: DecompositionReport, task: Task, graph: GoalGraph
+    ) -> None:
         # Only flag leaf nodes — non-leaves are verified through their children
-        if not node.children and not node.verification_criteria:
-            report.issues.append(DecompositionIssue(
-                severity="warning",
-                code="NO_CRITERIA",
-                goal_id=node.id,
-                message=(
-                    f"Leaf goal '{node.id}' has no verification criteria. "
-                    "Without criteria, the agent has no definition of done."
-                ),
-            ))
+        if node.children or node.verification_criteria:
+            return
+        # GE-03: a leaf with no text criteria may still have an executable definition
+        # of done via an inherited or own validator — that's a valid substitute.
+        if graph.effective_validators(node.id, task.milestone_validators):
+            return
+        report.issues.append(DecompositionIssue(
+            severity="warning",
+            code="NO_CRITERIA",
+            goal_id=node.id,
+            message=(
+                f"Leaf goal '{node.id}' has no verification criteria. "
+                "Without criteria, the agent has no definition of done."
+            ),
+        ))
 
     def _check_failed_goal_with_no_attempts(self, node: GoalNode, report: DecompositionReport) -> None:
         # A FAILED goal with 0 attempts indicates a data inconsistency

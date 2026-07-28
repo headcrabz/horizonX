@@ -329,6 +329,8 @@ class GoalNode(BaseModel):
     last_updated_at: datetime = Field(default_factory=utcnow)
     last_updated_by_session: str | None = None
     assigned_to_session: str | None = None  # set by claim_goal(); cleared on done/failed
+    validators: list[ValidatorConfig] = Field(default_factory=list)  # own validators; empty = inherit
+    inherit_validators: bool = True  # if False, do not merge parent/task-level validators
 
     @field_validator("id")
     @classmethod

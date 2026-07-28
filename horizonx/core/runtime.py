@@ -26,6 +26,7 @@ from horizonx.core.types import (
     SessionStatus,
     Step,
     Task,
+    ValidatorConfig,
     new_session_id,
 )
 
@@ -171,13 +172,34 @@ class Runtime:
     # Validators
     # ---------------------------------------------------------------
 
+    def _effective_validator_configs(
+        self, run: Run, session: Session | None
+    ) -> list[ValidatorConfig]:
+        """Resolve validators for this validator pass — goal-graph aware (GE-03).
+
+        Falls back to run.task.milestone_validators unchanged when there's no
+        active goal (session is None / no target_goal_id) or no goals.json yet,
+        preserving behavior for strategies that don't use a goal graph.
+        """
+        if session is None or not session.target_goal_id:
+            return run.task.milestone_validators
+        goals_path = run.workspace_path / "goals.json"
+        if not goals_path.exists():
+            return run.task.milestone_validators
+        from horizonx.core.goal_graph import GoalGraph, GoalGraphError
+        try:
+            graph = GoalGraph.load(goals_path)
+            return graph.effective_validators(session.target_goal_id, run.task.milestone_validators)
+        except (GoalGraphError, KeyError, FileNotFoundError):
+            return run.task.milestone_validators
+
     async def run_validators(
         self, run: Run, session: Session | None, *, when: str
     ) -> list[Any]:
         from horizonx.validators.registry import build_validator
 
         decisions = []
-        for vc in run.task.milestone_validators:
+        for vc in self._effective_validator_configs(run, session):
             should_run = (
                 vc.runs == when
                 or (vc.runs == "every_n_sessions" and session and (session.sequence_index + 1) % (vc.n or 1) == 0)
