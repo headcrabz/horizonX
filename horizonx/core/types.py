@@ -283,6 +283,7 @@ class Run(BaseModel):
     current_session_id: str | None = None
     goal_graph_root: str = "g.root"
     cumulative: CumulativeMetrics = Field(default_factory=CumulativeMetrics)
+    decomposition_report: dict[str, Any] | None = None  # set by GE-01 pre-check
 
 
 class Session(BaseModel):
