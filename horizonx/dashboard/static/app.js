@@ -755,6 +755,99 @@ function showLaunch() {
   if (validatorCount === 0) addValidator(); // add default validator row
 }
 
+// ─── Goal Template Panel (GE-02) ─────────────────────────────────────────────
+let _templates = null;
+let _activeDomain = 'all';
+
+window.openTemplatePanel = async () => {
+  const panel = $('template-panel');
+  if (!panel) return;
+  panel.style.display = 'block';
+  if (!_templates) {
+    try {
+      _templates = await api('/api/templates/goal-nodes');
+    } catch {
+      panel.querySelector('#template-grid').innerHTML =
+        '<div style="color:var(--red);font-size:12px;padding:8px;">Could not load templates.</div>';
+      return;
+    }
+  }
+  _renderTemplateDomains();
+  _renderTemplateGrid(_activeDomain);
+};
+
+window.closeTemplatePanel = () => {
+  const panel = $('template-panel');
+  if (panel) panel.style.display = 'none';
+};
+
+function _renderTemplateDomains() {
+  const tabs = $('template-domain-tabs');
+  if (!tabs || !_templates) return;
+  const domains = ['all', ...new Set(_templates.map(t => t.domain).filter(Boolean))];
+  tabs.innerHTML = domains.map(d => `
+    <button onclick="_activeDomain='${d}';_renderTemplateDomains();_renderTemplateGrid('${d}')"
+      style="font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;
+             background:${d===_activeDomain?'var(--accent)':'var(--surface2)'};
+             color:${d===_activeDomain?'white':'var(--muted)'};
+             border:1px solid ${d===_activeDomain?'var(--accent)':'var(--border2)'};">
+      ${d}
+    </button>`).join('');
+}
+
+function _renderTemplateGrid(domain) {
+  const grid = $('template-grid');
+  if (!grid || !_templates) return;
+  const list = domain === 'all' ? _templates : _templates.filter(t => t.domain === domain);
+  grid.innerHTML = list.map(t => `
+    <div onclick="applyTemplate(${JSON.stringify(t.id)})"
+         style="padding:10px 12px;border:1px solid var(--border);border-radius:8px;
+                cursor:pointer;background:var(--surface2);transition:border-color 0.12s;"
+         onmouseover="this.style.borderColor='var(--accent)'"
+         onmouseout="this.style.borderColor='var(--border)'">
+      <div style="font-size:11px;font-weight:700;color:var(--accent-lt);
+                  text-transform:uppercase;letter-spacing:0.4px;margin-bottom:4px;">
+        ${esc(t.domain)} · ${esc(t.id.split('.')[1] || '')}
+      </div>
+      <div style="font-size:12.5px;font-weight:600;color:var(--text);margin-bottom:4px;
+                  line-height:1.3;">${esc(t.name)}</div>
+      <div style="font-size:11px;color:var(--faint);line-height:1.4;">
+        ${t.verification_criteria?.length ?? 0} criteria · ${t.suggested_validators?.length ?? 0} validator(s)
+      </div>
+    </div>`).join('');
+}
+
+window.applyTemplate = (templateId) => {
+  if (!_templates) return;
+  const t = _templates.find(x => x.id === templateId);
+  if (!t) return;
+
+  // Build a goal node YAML snippet
+  const criteriaLines = (t.verification_criteria || []).map(c => `  - "${c}"`).join('\n');
+  const snippet = [
+    `# Goal node from template: ${t.id}`,
+    `id: g.${t.id.replace('.', '-')}`,
+    `name: ${t.name}`,
+    `description: |`,
+    `  ${t.description.trim().replace(/\n/g, '\n  ')}`,
+    `verification_criteria:`,
+    criteriaLines,
+  ].join('\n');
+
+  // Switch to YAML mode and append the snippet
+  setLaunchMode('yaml');
+  const ta = $('launch-yaml');
+  if (ta) {
+    const existing = ta.value.trim();
+    ta.value = existing
+      ? existing + '\n\n# ── Inserted from template ──\n' + snippet
+      : snippet;
+    // Sync back to form state
+    try { syncYamlToForm(); } catch { /* ok */ }
+  }
+  closeTemplatePanel();
+};
+
 window.setLaunchMode = (mode) => {
   launchMode = mode;
   ['form','yaml'].forEach(m => {

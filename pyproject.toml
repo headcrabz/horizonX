@@ -76,6 +76,7 @@ include = ["horizonx*"]
 
 [tool.setuptools.package-data]
 "horizonx.dashboard" = ["static/*"]
+"horizonx.templates" = ["*.yaml"]
 
 [tool.ruff]
 line-length = 100

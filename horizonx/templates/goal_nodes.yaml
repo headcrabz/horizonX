@@ -1,0 +1,358 @@
+# HorizonX Goal Node Template Library — GE-02
+# 15 curated templates across auth / API / testing / refactor / infra.
+#
+# Each template has:
+#   id                  — unique slug (domain.action)
+#   name                — human-readable goal name (copy this into your goal graph)
+#   description         — what "done" means; injected into the agent session prompt
+#   verification_criteria — machine-actionable checklist; used by validators
+#   suggested_validators  — validator configs that pair with this goal
+#   domain              — grouping label for the UI
+
+# ── Auth domain ───────────────────────────────────────────────────────────────
+
+- id: auth.jwt-endpoint
+  domain: auth
+  name: Implement JWT token endpoint returning access and refresh tokens
+  description: >
+    Add POST /token endpoint that accepts username+password credentials,
+    validates them against the user store, and returns a signed JWT access
+    token (15-minute expiry) and a refresh token (7-day expiry). Use RS256
+    signing. Store refresh tokens in the database for revocation support.
+  verification_criteria:
+    - POST /token with valid credentials returns 200 with access_token and refresh_token fields
+    - POST /token with invalid credentials returns 401
+    - Access token is a valid RS256-signed JWT with sub, exp, iat claims
+    - Refresh token is stored in the database and can be queried
+    - All existing tests continue to pass
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+- id: auth.oauth-pkce
+  domain: auth
+  name: Implement OAuth 2.0 Authorization Code Flow with PKCE
+  description: >
+    Add OAuth 2.0 Authorization Code + PKCE flow endpoints: GET /oauth/authorize
+    (redirects to consent screen), POST /oauth/token (exchanges code for tokens),
+    POST /oauth/revoke (revokes tokens). Validate code_challenge using SHA-256.
+    No client secrets required for public clients.
+  verification_criteria:
+    - GET /oauth/authorize with valid client_id and code_challenge returns 302 to redirect_uri
+    - POST /oauth/token with valid code and code_verifier returns access_token
+    - POST /oauth/token with invalid code_verifier returns 400
+    - POST /oauth/revoke invalidates the token
+    - All existing tests continue to pass
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+- id: auth.session-migration
+  domain: auth
+  name: Migrate session-cookie authentication to JWT token-based auth
+  description: >
+    Replace session-cookie authentication with stateless JWT tokens. Remove
+    server-side session storage. Issue JWT on login, validate on each request
+    via Authorization: Bearer header. Maintain backward compatibility for a
+    transition period using an adapter that accepts both cookie sessions and
+    JWT tokens. Update all protected routes to use the new JWT middleware.
+  verification_criteria:
+    - Login endpoint issues a JWT instead of setting a session cookie
+    - "Protected routes accept Authorization: Bearer <token>"
+    - Old session cookies are rejected after migration (or handled by adapter)
+    - No secrets are logged at any log level
+    - All existing tests continue to pass
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+# ── API domain ────────────────────────────────────────────────────────────────
+
+- id: api.crud-resource
+  domain: api
+  name: Implement full CRUD endpoints for a named resource
+  description: >
+    Add POST /resources, GET /resources, GET /resources/{id}, PUT /resources/{id},
+    DELETE /resources/{id} endpoints. Validate input with Pydantic models.
+    Return 404 for missing resources, 422 for validation errors, 409 for
+    duplicate key conflicts. Persist to the database using the existing ORM layer.
+  verification_criteria:
+    - POST /resources creates a resource and returns 201 with the created object
+    - GET /resources returns a list (empty list if none exist)
+    - GET /resources/{id} returns 404 for non-existent id
+    - PUT /resources/{id} updates and returns the updated object
+    - DELETE /resources/{id} returns 204 and the resource is gone
+    - All existing tests continue to pass
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+- id: api.pagination
+  domain: api
+  name: Add cursor-based pagination to list endpoints
+  description: >
+    Add cursor-based pagination to all list endpoints (GET /resources, etc.).
+    Accept cursor and limit query parameters. Return next_cursor in the response
+    when more results exist, null when on the last page. Cursor must be opaque
+    to the client (base64-encoded primary key). Default limit 20, max limit 100.
+  verification_criteria:
+    - GET /resources?limit=5 returns at most 5 results
+    - Response includes next_cursor when more results exist
+    - GET /resources?cursor=<next_cursor> returns the next page
+    - next_cursor is null on the last page
+    - limit > 100 is rejected with 422
+    - All existing tests continue to pass
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+- id: api.rate-limiting
+  domain: api
+  name: Add rate limiting middleware returning 429 on breach
+  description: >
+    Add rate limiting to the API: 100 requests per minute per IP address for
+    unauthenticated requests, 1000 requests per minute per user for authenticated
+    requests. Return 429 Too Many Requests with Retry-After header when the limit
+    is exceeded. Use sliding window algorithm. Store counters in Redis or an
+    in-memory store with TTL.
+  verification_criteria:
+    - 101st request within a minute from same IP returns 429
+    - 429 response includes Retry-After header
+    - Authenticated users have a higher limit than unauthenticated
+    - Rate limit counters reset after the window expires
+    - All existing tests continue to pass
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+# ── Testing domain ────────────────────────────────────────────────────────────
+
+- id: test.coverage-gate
+  domain: testing
+  name: Raise test coverage to target percentage with no regressions
+  description: >
+    Increase overall test coverage to at least 80% (or the configured target).
+    Add unit and integration tests for uncovered code paths. Do not delete or
+    weaken existing tests. Focus on branch coverage in critical paths: auth,
+    payment, data persistence. All new tests must be deterministic and not
+    rely on external services.
+  verification_criteria:
+    - pytest --cov reports coverage >= 80%
+    - No existing tests have been deleted or weakened
+    - All tests pass
+    - No flaky tests (run suite 3 times, all pass)
+  suggested_validators:
+    - id: coverage_gate
+      type: shell
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest --cov=. --cov-fail-under=80 -q
+
+- id: test.integration-suite
+  domain: testing
+  name: Add integration tests for the named module against a real database
+  description: >
+    Write integration tests that exercise the module end-to-end against a real
+    (test) database, not mocks. Use pytest fixtures to spin up and tear down
+    the database. Cover the happy path, error paths, and edge cases. Tests must
+    be isolated: each test starts with a clean database state.
+  verification_criteria:
+    - Integration tests exist in tests/integration/ directory
+    - Tests use a real database (not mocks for the DB layer)
+    - Each test tears down its own state (no test pollution)
+    - pytest tests/integration/ passes with zero failures
+    - All existing tests continue to pass
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+- id: test.contract-tests
+  domain: testing
+  name: Add API contract tests against the OpenAPI specification
+  description: >
+    Add contract tests that validate the running API against the OpenAPI spec.
+    Every endpoint in the spec must have at least one contract test verifying
+    request/response schema conformance. Use schemathesis or a similar tool.
+    Tests must catch schema drift: if the code changes the response shape, the
+    contract test must fail.
+  verification_criteria:
+    - Contract tests exist and cover all endpoints in the OpenAPI spec
+    - Running schemathesis (or equivalent) against the local server returns 0 failures
+    - A deliberate schema violation in the code causes a test failure
+    - All existing tests continue to pass
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+# ── Refactor domain ───────────────────────────────────────────────────────────
+
+- id: refactor.extract-module
+  domain: refactor
+  name: Extract logic from an oversized file into its own module
+  description: >
+    Identify logic in the target file that has a clear, single responsibility
+    and move it to a new dedicated module. Update all import sites. The
+    extracted module must have its own unit tests. The original file must
+    become shorter and more focused. No behavioral changes — this is a pure
+    structural refactor.
+  verification_criteria:
+    - The extracted module exists as a separate file with its own tests
+    - All import sites updated to use the new module path
+    - No behavioral changes (existing tests still pass with no modifications)
+    - The original file is measurably shorter (at least 20% fewer lines)
+    - mypy reports no type errors
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+- id: refactor.dependency-update
+  domain: refactor
+  name: Update a named dependency to the latest stable version fixing breaking changes
+  description: >
+    Update the dependency to the latest stable version in requirements.txt /
+    pyproject.toml. Identify and fix all breaking changes introduced by the
+    new version. Run the full test suite to confirm no regressions. Document
+    any behavioral changes in a CHANGELOG entry. Do not update other
+    dependencies as a side effect.
+  verification_criteria:
+    - requirements.txt / pyproject.toml specifies the new version
+    - All tests pass with the new version installed
+    - No other dependencies were changed as a side effect
+    - mypy reports no new type errors from the updated package
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short
+
+- id: refactor.type-annotations
+  domain: refactor
+  name: Add complete type annotations to a module so mypy passes with no errors
+  description: >
+    Add PEP 484 type annotations to all public functions, methods, and module-
+    level variables in the target module. Fix any type errors revealed by
+    strict mypy. Do not change runtime behavior. Use Python 3.11+ syntax
+    (X | Y instead of Union[X, Y], list[X] instead of List[X]).
+  verification_criteria:
+    - mypy --strict <module> reports zero errors
+    - All existing tests continue to pass
+    - No runtime behavior changed (no logic modifications)
+    - No use of `Any` except where genuinely unavoidable (document why)
+  suggested_validators:
+    - id: mypy_clean
+      type: shell
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: python -m mypy horizonx/ --ignore-missing-imports
+
+# ── Infra domain ──────────────────────────────────────────────────────────────
+
+- id: infra.dockerfile
+  domain: infra
+  name: Add a production-ready Dockerfile with multi-stage build
+  description: >
+    Create a Dockerfile with a multi-stage build: (1) builder stage installs
+    dependencies and compiles assets, (2) production stage copies only
+    the built artifacts and runs as a non-root user. The final image must
+    be under 200MB. Pin the base image to a specific digest. Include a
+    .dockerignore file excluding development artifacts.
+  verification_criteria:
+    - docker build . succeeds with exit code 0
+    - docker run <image> starts the application and responds to a health check
+    - The container runs as a non-root user (id output shows uid != 0)
+    - Final image size is under 200MB (docker images shows size)
+    - .dockerignore exists and excludes .git, __pycache__, *.pyc, .env
+  suggested_validators:
+    - id: docker_build
+      type: shell
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: docker build . -t horizonx-test && docker image inspect horizonx-test
+
+- id: infra.ci-pipeline
+  domain: infra
+  name: Add GitHub Actions CI pipeline running tests and linting on every push
+  description: >
+    Create .github/workflows/ci.yml that runs on push and pull_request to main.
+    Pipeline must: install dependencies, run ruff (lint), run mypy (type check),
+    run pytest (tests). Use matrix strategy to test on Python 3.11 and 3.12.
+    Cache pip dependencies between runs. Fail fast on first error in the matrix.
+  verification_criteria:
+    - .github/workflows/ci.yml exists and is valid YAML
+    - Pipeline triggers on push and pull_request to main branch
+    - Matrix covers Python 3.11 and 3.12
+    - ruff, mypy, and pytest steps all present
+    - Pip dependency caching configured
+    - Pipeline passes on current codebase (all checks green)
+  suggested_validators:
+    - id: lint_and_test
+      type: shell
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: python -m ruff check . && python -m pytest tests/ -q
+
+- id: infra.health-endpoint
+  domain: infra
+  name: Add /health endpoint with dependency checks for readiness probing
+  description: >
+    Add GET /health endpoint that returns 200 when the service is healthy and
+    503 when a dependency is down. Check: database connectivity (run a simple
+    query), external API reachability (if applicable). Response must be JSON
+    with status field and per-dependency check results. Response time must be
+    under 500ms. Used by Kubernetes readiness probes and load balancer health
+    checks.
+  verification_criteria:
+    - "GET /health returns 200 with {\"status\": \"ok\"} when all dependencies are up"
+    - GET /health returns 503 when the database is unreachable
+    - Response is JSON with a status field and per-dependency breakdown
+    - Response time is under 500ms under normal conditions
+    - All existing tests continue to pass
+  suggested_validators:
+    - id: tests_pass
+      type: test_suite
+      runs: after_every_session
+      on_fail: pause_for_hitl
+      config:
+        command: pytest tests/ -q --tb=short

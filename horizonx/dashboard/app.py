@@ -17,6 +17,7 @@ from .routes_events import router as events_router
 from .routes_hitl import router as hitl_router
 from .routes_launch import router as launch_router
 from .routes_runs import router as runs_router
+from .routes_templates import router as templates_router
 
 
 def create_app(
@@ -45,6 +46,7 @@ def create_app(
     app.include_router(events_router, prefix="/api")
     app.include_router(hitl_router, prefix="/api")
     app.include_router(launch_router, prefix="/api")
+    app.include_router(templates_router, prefix="/api")
 
     @app.get("/api/health")
     async def health() -> dict[str, object]:
