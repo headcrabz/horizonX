@@ -257,14 +257,31 @@ function renderRunHeader(run) {
   $('run-status-badge').innerHTML = badge(run.status) +
     (run.status === 'running' ? ' <span class="pulse" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--blue);margin-left:4px;"></span>' : '');
 
-  $('run-metrics-row').innerHTML = [
+  const chips = [
     `<div class="metric-chip"><span>Sessions</span><span class="val">${cm.sessions_count??0}</span></div>`,
     `<div class="metric-chip"><span>Steps</span><span class="val">${cm.steps_count??0}</span></div>`,
     `<div class="metric-chip green"><span>Cost</span><span class="val">${fmtUSD(cm.usd)}</span></div>`,
     `<div class="metric-chip"><span>Wall</span><span class="val">${duration(run.started_at,run.completed_at)}</span></div>`,
     `<div class="metric-chip"><span>Tok in</span><span class="val">${fmtTok(cm.tokens_in)}</span></div>`,
     `<div class="metric-chip"><span>Tok out</span><span class="val">${fmtTok(cm.tokens_out)}</span></div>`,
-  ].join('');
+  ];
+  // GE-01: decomposition quality badge
+  const rpt = run.decomposition_report;
+  if (rpt && (rpt.error_count > 0 || rpt.warning_count > 0)) {
+    const errTxt  = rpt.error_count  ? `${rpt.error_count} error${rpt.error_count  >1?'s':''}` : '';
+    const warnTxt = rpt.warning_count ? `${rpt.warning_count} warning${rpt.warning_count>1?'s':''}` : '';
+    const label   = [errTxt, warnTxt].filter(Boolean).join(', ');
+    const colour  = rpt.error_count ? 'var(--red)' : 'var(--yellow)';
+    const titles  = rpt.issues.map(i => `[${i.severity.toUpperCase()}] ${i.goal_id || ''}: ${i.message}`).join('\n');
+    chips.push(
+      `<div class="metric-chip" style="border-color:${colour};cursor:pointer;"
+            title="${esc(titles)}" onclick="loadDecompositionReport('${esc(run.id)}')">
+         <span style="color:${colour};">⚠ Graph</span>
+         <span class="val" style="color:${colour};">${esc(label)}</span>
+       </div>`
+    );
+  }
+  $('run-metrics-row').innerHTML = chips.join('');
 
   // Budget gauge
   const spent = cm.usd || 0;
@@ -664,6 +681,20 @@ async function loadSpinReports(runId) {
     updateSpinPanel(reports);
   } catch { /* endpoint may not exist on all backends */ }
 }
+
+// GE-01 decomposition report — fetches live and shows in a modal-style alert
+window.loadDecompositionReport = async (runId) => {
+  try {
+    const rpt = await api(`/api/runs/${runId}/decomposition-report`);
+    if (!rpt.issues?.length) { alert('No decomposition issues found.'); return; }
+    const lines = rpt.issues.map(i =>
+      `[${i.severity.toUpperCase()}] ${i.goal_id || 'graph'} (${i.code})\n  ${i.message}`
+    ).join('\n\n');
+    alert(`Decomposition Quality Report\n${rpt.error_count} error(s) · ${rpt.warning_count} warning(s)\n\n${lines}`);
+  } catch (e) {
+    alert(`Could not load report: ${e.message}`);
+  }
+};
 
 function updateSpinPanel(reports) {
   const layerMap = {

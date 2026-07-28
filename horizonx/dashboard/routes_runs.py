@@ -76,3 +76,30 @@ async def list_spin_reports(
     store: SqliteStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
     return await store.list_spin_reports(run_id)
+
+
+@router.get("/runs/{run_id}/decomposition-report")
+async def get_decomposition_report(
+    run_id: str,
+    store: SqliteStore = Depends(get_store),
+) -> dict[str, Any]:
+    """Return the GE-01 decomposition quality report for this run.
+
+    Re-checks the current goals.json on the fly so the report reflects
+    any graph changes since the run started (e.g. after re_decompose).
+    """
+    from horizonx.core.decomposition_checker import DecompositionChecker
+    try:
+        run = await store.load_run(run_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
+
+    goals_path = run.workspace_path / "goals.json"
+    if not goals_path.exists():
+        # No graph yet — return empty report
+        return {"error_count": 0, "warning_count": 0, "issues": []}
+
+    from horizonx.core.goal_graph import GoalGraph
+    graph = GoalGraph.load(goals_path)
+    report = DecompositionChecker().check_graph(graph, run.task)
+    return report.to_dict()

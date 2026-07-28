@@ -75,6 +75,21 @@ class Runtime:
         await self.store.save_run(run)
         await self.bus.publish(Event(type="run.started", run_id=run.id))
 
+        # GE-01: decomposition quality pre-check (after goals.json exists)
+        goals_path = run.workspace_path / "goals.json"
+        if goals_path.exists():
+            from horizonx.core.decomposition_checker import DecompositionChecker
+            report = DecompositionChecker().check_file(goals_path, task)
+            run.decomposition_report = report.to_dict()
+            if report.has_errors:
+                run.status = RunStatus.FAILED
+                await self.store.save_run(run)
+                await self.bus.publish(Event(
+                    type="run.failed", run_id=run.id,
+                    payload={"error": "decomposition_errors", "report": report.to_dict()},
+                ))
+                return run
+
         strategy_cls = self._load_strategy(task.strategy.kind)
         strategy = strategy_cls(task.strategy.config)
 
@@ -82,6 +97,13 @@ class Runtime:
             try:
                 async for event in strategy.execute(run, self):
                     await self.bus.publish(event)
+                    # Re-run decomposition check after graph is first written
+                    if not goals_path.exists():
+                        pass
+                    elif not hasattr(run, "decomposition_report") or not run.decomposition_report:
+                        from horizonx.core.decomposition_checker import DecompositionChecker
+                        rpt = DecompositionChecker().check_file(goals_path, task)
+                        run.decomposition_report = rpt.to_dict()
                 run.status = RunStatus.COMPLETED
                 await self.bus.publish(Event(type="run.completed", run_id=run.id))
             except Exception as exc:
