@@ -69,6 +69,9 @@ secrets/
 .claude/worktrees/
 CLAUDE.md.bak
 
+# Local Git worktrees
+.worktrees/
+
 # Workspace files
 *.code-workspace
 
