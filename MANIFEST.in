@@ -1,0 +1,2 @@
+# Internal plans are intentionally local-only and must never enter an sdist.
+prune docs/planning

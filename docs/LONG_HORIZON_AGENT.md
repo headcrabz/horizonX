@@ -1,6 +1,11 @@
 # HorizonX — A Long-Horizon Agent Execution Harness
 
 > The complete design document. Concepts → Architecture → Strategies → Context → Anti-Cycling → Operations → Use Cases → Roadmap. One file.
+>
+> **Implementation status note (2026-07-31):** this document combines implemented components,
+> target architecture, pseudocode, and roadmap. It is not a production support contract. The
+> current alpha boundaries are listed in the README support matrix and §42; architectural prose
+> elsewhere describes intended behavior unless §42 explicitly says it is verified.
 
 ---
 
@@ -2288,16 +2293,15 @@ horizonx/
 └── cli.py                 # `horizonx run`, `watch`, `show`, `fork`, `compare`
 ```
 
-### Minimal CLI
+### Current CLI
 
 ```bash
-horizonx run examples/coding_oauth/ --agent claude-code --strategy sequential
-horizonx run --config configs/my_task.yaml --resume run-abc123
+horizonx run examples/demo_word_counter/task.yaml
+horizonx run examples/demo_word_counter/task.yaml --resume run-abc123
 horizonx watch run-abc123
 horizonx show run-abc123
-horizonx fork run-abc123 --mutation '{"agent.model":"claude-sonnet-4-6"}'
-horizonx merge run-abc123 run-fork-xyz
-horizonx compare run-abc123 run-def456
+horizonx list
+horizonx fork run-abc123 --mutation '{"kind":"single"}'
 horizonx export run-abc123 --format json > run.json
 horizonx serve --port 8080                    # web dashboard
 ```
@@ -2305,80 +2309,76 @@ horizonx serve --port 8080                    # web dashboard
 ### Minimal Python SDK usage
 
 ```python
-from horizonx import Task, Runtime
-from horizonx.strategies import SequentialSubgoals
-from horizonx.agents import ClaudeCodeAgent
-from horizonx.validators import TestSuiteGate, LLMProgressGate
+import asyncio
+from pathlib import Path
 
-task = Task(
-    id="build-oauth-001",
-    name="Implement OAuth 2.0",
-    prompt=open("prompts/oauth.md").read(),
-    horizon_class="very_long",
-    strategy=SequentialSubgoals(target_subgoals=(40, 80), per_session_max_steps=50),
-    agent=ClaudeCodeAgent(model="claude-opus-4-7", thinking_budget=10000,
-                          allowed_tools=["Read","Edit","Bash","Glob","Grep"]),
-    milestone_validators=[
-        TestSuiteGate(runs="after_every_session", command="pytest tests/"),
-        LLMProgressGate(runs_every_n=5, model="claude-haiku-4-5"),
-    ],
-    handoff_files=["progress.md","goals.json","decisions.jsonl","failures.jsonl"],
-    resources={"max_hours": 12, "max_tokens": 5_000_000, "max_usd": 50},
-)
+import yaml
 
-runtime = Runtime(db_url="sqlite:///horizonx.db")
-report = await runtime.run(task)
+from horizonx import Runtime, Task
+from horizonx.storage import SqliteStore
+
+
+async def main() -> None:
+    data = yaml.safe_load(Path("examples/demo_word_counter/task.yaml").read_text())
+    task = Task.model_validate(data)
+    async with Runtime(store=SqliteStore("horizonx.db")) as runtime:
+        run = await runtime.run(task)
+    print(run.id, run.status.value)
+
+
+asyncio.run(main())
 ```
 
 ---
 
 ## 42. Implementation status and roadmap
 
-### Implemented ✅
+HorizonX is an **alpha research preview**. A component can exist and have focused tests without
+being wired into every strategy or satisfying an end-to-end reliability guarantee. The README
+support matrix is the concise public contract.
 
-| Component | Notes |
-|---|---|
-| `core/types.py` — Task, Run, Session, Step, GoalNode, WorkspaceConfig | Full Pydantic v2 schema. `AgentConfig.type` is `str` to allow third-party types. |
-| `core/runtime.py` — orchestrator | `start/end_session`, `record_step`, `run_validators`, `check_spin`, `charge(result)`, `request_hitl`. Async context manager for store cleanup. |
-| `core/goal_graph.py` — versioned DAG | Cycle detection, dependency ordering, status propagation, `last_updated_by_session` tracking |
-| `core/event_bus.py` — in-memory pub/sub | Events include `goals.re_decomposed`, `budget.velocity_alert`, `hitl.resolved` |
-| `core/summarizer.py` — context compression | Structured output, Haiku model by default |
-| `core/spin_detector.py` — **7 layers** | ExactLoop (dual-threshold), EditRevert, ScorePlateau, ToolThrashing (IDEMPOTENT/MUTATING frozensets), BucketedHash, Semantic, **CrossSessionSpinLayer** |
-| `core/housekeeping.py` — step budget refund | Classifies mandatory cleanup steps so they don't consume agent step budget |
-| `core/knowledge.py` — per-run FTS5 decisions | `RunKnowledgeStore`: relevance-ranked decision injection replacing tail-20 recency |
-| `core/governor.py` — resource limits | `charge()` wired to real token events from `SessionRunResult`. `CostVelocityMonitor` (doubling detector). `UsageStore` for per-workspace daily accounting. HITL fires at 75% via `asyncio.create_task`. |
-| `core/usage.py` — workspace budgets | `UsageStore` + `CostVelocityMonitor`. Pre-flight budget check in `Runtime.run()`. |
-| `storage/sqlite.py` — durable store | Single-worker `ThreadPoolExecutor`, WAL mode. Tables: runs, sessions (+ `housekeeping_steps`), steps, goals, validations, hitl_events, spin_reports, `pending_runs`, `workspace_usage` |
-| `agents/claude_code.py` — full driver | stream-json, session resume, populates `tokens_in/out/cost_usd` in `SessionRunResult` |
-| `agents/codex.py` — full driver | JSONL stream, stdin prompt, resume, usage populated |
-| `agents/openhands.py` — full driver | CLI + server mode, event streaming |
-| `agents/custom.py` — subprocess wrapper | 4 prompt modes, text/jsonl output, cancel, timeout |
-| `agents/sdk.py` — API-based driver | Wraps any Python async generator; no subprocess needed |
-| `agents/template.py` — third-party template | Documents `BaseAgent` protocol for external driver authors |
-| `strategies/_agent_builder.py` — shared dispatch | `_BUILTIN_AGENTS` fast-path + `horizonx.agents` entry-points fallback; used by all 8 strategies |
-| All 8 strategies | single, sequential, ralph, tree, monitor, decomposition, pair, self_critique — all use `_agent_builder` |
-| All 6 validators | test_suite, shell, llm_judge, metric, git, goal_graph — registry uses `horizonx.validators` entry-points |
-| `hitl/gate.py` — real Slack HITL | Block Kit cards, 3-attempt webhook retry (0/5/15s backoff), `timeout_minutes` escalation, `re_decompose` action wired to LLM goal restructuring |
-| `memory/knowledge_store.py` — cross-run FTS5 | `WorkspaceKnowledgeStore`: persists facts across runs, stored relative to workspace root, never `~/.horizonx/` |
-| `memory/handoff.py` — session sync | `KnowledgeHandoffDir.sync()` indexes `knowledge/*.md` with YAML frontmatter tag support |
-| `dashboard/` — crash-safe web UI | FastAPI + SSE. `pending_runs` table. `recovery.py` re-attaches in-flight runs on startup. |
-| `agents/repair.py` | Dangling tool-call repair |
-| `cli.py` | `run`, `watch`, `show`, `list`, `fork`, `serve`, `knowledge` |
-| `.github/workflows/ci.yml` | Python 3.11 + 3.12 matrix, ruff + pytest |
-| `docker-compose.yml` | Zero-config local setup |
-| **277 tests, all passing** | Module-aligned test files including new: test_hitl_gate, test_re_decompose, test_knowledge_store, test_sdk_agent, test_usage, test_dashboard_routes |
+### Current component inventory
 
-### Planned 📋
+| Area | Status | Boundary |
+|---|---|---|
+| Pydantic task/run/session/config models and registries | Implemented | Strategy names remain a fixed schema literal even though agent and validator registries accept extensions. |
+| Runtime primitives, local SQLite store, and in-memory event bus | Experimental integration | Goal state has competing JSON/DB representations; migrations, contention, recovery, and lifecycle invariants need hardening. |
+| Claude Code, Codex, OpenHands, custom subprocess, and SDK drivers | Experimental | Driver modules and focused tests exist; structured transport and cross-provider capability parity are not verified. |
+| Eight strategy modules | Experimental | They do not yet share one executor, failure contract, validator mapping, budget path, or cleanup path. |
+| Goal graph and six validators | Experimental | Graph and validator components exist; terminal-state correctness and evidence-backed completion are not universal. |
+| Seven spin-analysis components | Under hardening | The sequential strategy invokes the combined detector; universal strategy wiring and configured actions are incomplete. |
+| Resource governor, usage store, and deterministic policy engine | Under hardening | Enforcement and metrics are not uniform across every strategy and provider. |
+| FTS5 run/workspace knowledge and Markdown handoff modules | Components only | Cross-run sync, retrieval, and prompt injection are not connected to the normal execution lifecycle. |
+| Slack HITL and re-decomposition components | Under hardening | Durable waits, authenticated callbacks, idempotent decisions, and real cancellation are incomplete. |
+| Dashboard, pending-run records, and SSE | Experimental | SSE is in-memory; recovery can lose provider state or strand a run after a repeated crash. |
+| CLI | Implemented subset | Current commands are `run`, `show`, `list`, `watch`, `fork`, `export`, and `serve`; broader operator commands are planned. |
+| CI and automated checks | Implemented | Audited baseline: 341 tests pass with one collection warning; Ruff and Mypy pass. This is not production certification. |
+| Docker Compose | Development stub | A built image, correct binding, valid health check, install verification, and host smoke test are not yet provided. |
 
-- `PolicyEngine` — T1 Python callable policies (task_intake, session_start, step_emit phases)
-- Z3 SMT constraint policies (optional `horizonx[z3]`)
-- LLM classifier policies (optional `horizonx[policy-llm]`, runs every N steps)
-- `DELEGATE` step type — dynamic sub-agent delegation for specialist routing
-- A2A Protocol driver + server endpoint for cross-orchestrator interop
-- Atomic task claim semantics (`BEGIN IMMEDIATE`) for parallel multi-agent goal assignment
-- PostgreSQL backend
-- Multi-process / distributed runs (Redis event bus)
-- `composite` strategy — pipeline multiple strategies in sequence
+### Required before reliability claims
+
+- Make SQLite authoritative for goal state and add explicit migrations, foreign keys, busy
+  handling, integrity checks, backup, and restore.
+- Define one terminal-state machine and one central attempt lifecycle used by every strategy.
+- Materialize a real repository in an isolated environment; wire and verify setup commands,
+  mounts, secrets, timeouts, and process-tree cancellation.
+- Persist provider session IDs before a crash can lose them; add append-only events, attempts,
+  leases, idempotent recovery, and durable operator commands.
+- Normalize Claude/Codex events before accounting and spin detection; reconcile tokens, cost,
+  sessions, steps, cache usage, and wall time without treating unknown cost as zero.
+- Wire knowledge sync/curation into the lifecycle with provenance, conflict handling, retention,
+  and reproducible retrieval.
+- Prove the local product with real-repository, forced-crash, cancel, package-install, and Docker
+  smoke tests before describing it as production-grade.
+
+### Later roadmap
+
+- Evidence graphs and calibrated completion contracts.
+- Structured harness capability negotiation and native provider transports.
+- Versioned skill curation, replay labs, counterfactual harness comparison, and adaptive routing.
+- Durable work identities, handoffs, mailboxes, delegation, and an evidence-gated merge queue.
+- GitHub/Linear reconciliation, PostgreSQL multi-worker operation, Graph Pack portability, and
+  optional A2A interoperability when concrete demand justifies them.
 
 ---
 

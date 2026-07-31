@@ -4,31 +4,42 @@
   <img src="docs/horizonx_banner.png" alt="HorizonX — Long-horizon agent execution harness" width="100%"/>
 </p>
 
-**A production-grade execution harness for long-horizon AI agent tasks.**
+**Alpha research preview of a vendor-neutral control plane for long-horizon agent tasks.**
 
-HorizonX wraps Claude Code, Codex, and OpenHands with the infrastructure they need to run reliably for hours — crash recovery, spin detection, budget governance, cross-session memory, structured goal tracking, and operator-in-the-loop gates.
+HorizonX coordinates Claude Code, Codex, OpenHands, and custom agents around durable run state,
+goal graphs, validation, resource policies, and operator controls. The repository contains tested
+building blocks for those capabilities, but several end-to-end guarantees are still being
+hardened. It is suitable for local evaluation and development—not unattended or production use.
 
 [![CI](https://github.com/headcrabz/horizonX/actions/workflows/ci.yml/badge.svg)](https://github.com/headcrabz/horizonX/actions)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Tests: 277 passing](https://img.shields.io/badge/tests-277%20passing-brightgreen.svg)](tests/)
+[![Tests: 341 passing](https://img.shields.io/badge/tests-341%20passing-brightgreen.svg)](tests/)
 
 ---
 
 ## What it does
 
-HorizonX is not an agent. It's the runtime layer that makes agents reliable.
+HorizonX is not an agent. It is an experimental runtime layer around existing agent harnesses.
 
-You bring a task. HorizonX handles the rest:
+The current alpha includes:
 
-- **Crash recovery** — every tool call is persisted before the next one runs. Kill the process at any moment; resume from exactly where it stopped using the agent's own session ID.
-- **7-layer spin detection** — catches loops, oscillation, score plateaus, tool thrashing, and cross-session stagnation before they cost real money.
-- **Budget governance** — Slack alert at 75% spend, hard stop at 100%, per-workspace daily limits, cost velocity runaway detection.
-- **Cross-session memory** — agents write facts to `workspace/knowledge/*.md`; HorizonX indexes them via FTS5 and injects relevant facts into future session prompts automatically.
-- **Structured goal graph** — tasks decompose into a DAG; agents *propose* completion; validators *accept*. Premature completion is prevented by construction.
-- **Pluggable strategies** — 8 built-in execution topologies (single, sequential, pair, tree, self-critique, decomposition, monitor, ralph). Switch strategies per task in YAML.
-- **Operator gates** — Slack Block Kit HITL with approve / modify / re-decompose actions. Operators can restructure the goal graph mid-run.
-- **Real-time observability** — SSE event stream to dashboard, CLI `watch`, and Slack.
+- **Durable records** — SQLite stores runs, sessions, steps, validations, HITL records, and usage.
+  Exact crash-point recovery and authoritative goal persistence are under hardening.
+- **Spin-analysis components** — seven detectors cover repetition, oscillation, plateaus, and
+  cross-session stagnation. Universal invocation and response semantics are not yet guaranteed.
+- **Resource-policy components** — token, cost, time, and workspace-budget models exist. Uniform
+  enforcement across all strategies and providers is under hardening.
+- **Knowledge components** — FTS5 knowledge storage and Markdown handoff sync exist as modules.
+  Automatic cross-run sync and prompt injection are not yet wired into the production run path.
+- **Goal graphs and validators** — DAG planning and six validator types are implemented. Database
+  authority, terminal-state correctness, and evidence-backed completion are under hardening.
+- **Eight strategy modules** — single, sequential, pair, tree, self-critique, decomposition,
+  monitor, and ralph. They are experimental until they share one verified execution lifecycle.
+- **Operator and observability components** — Slack HITL, dashboard SSE, and CLI watch exist.
+  Durable commands, real cancellation, authenticated callbacks, and event replay are planned.
+
+See the [support matrix](#project-status) before relying on a capability.
 
 ---
 
@@ -39,12 +50,12 @@ pip install -e ".[dev]"
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # Run a task
-horizonx run examples/demo_governance/task.yaml
+horizonx run examples/demo_word_counter/task.yaml
 
 # Watch it live
 horizonx watch <run-id>
 
-# Resume after a crash
+# Resume an existing run at a supported session boundary (experimental)
 horizonx run task.yaml --resume <run-id>
 
 # Launch the dashboard
@@ -52,11 +63,8 @@ pip install -e ".[dashboard]"
 horizonx serve
 ```
 
-Or with Docker:
-```bash
-docker compose up
-# Dashboard at http://localhost:8080
-```
+The checked-in Compose file is currently a development stub, not a supported quick start. Image
+packaging, container binding, and health checks remain under hardening.
 
 ---
 
@@ -267,7 +275,10 @@ task = Task(agent=AgentConfig(type="sdk", extra={"callable": my_agent_fn}))
 
 ---
 
-## Architecture
+## Target architecture
+
+This diagram is the intended converged lifecycle. In the alpha, strategy modules still invoke
+parts of the lifecycle differently; the [support matrix](#project-status) is authoritative.
 
 ```
 Task (YAML / Python)
@@ -282,7 +293,7 @@ Task (YAML / Python)
         → ResourceGovernor       (charges tokens/cost, checks thresholds)
         → KnowledgeHandoffDir    (indexes knowledge/*.md to FTS5)
     → EventBus                   (SSE → dashboard / CLI watch / Slack)
-    → SqliteStore                (all state persisted — WAL mode, crash-safe)
+    → SqliteStore                (local durable state; recovery hardening in progress)
 ```
 
 ---
@@ -309,26 +320,31 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how to write custom agents, strategie
 
 ## Project status
 
-Core runtime is implemented, tested, and ready for production use on long-horizon tasks.
+HorizonX is an **alpha research preview**. “Implemented” below means the component exists and has
+focused tests; it does not imply a verified production guarantee.
 
-| Component | Status |
-|---|---|
-| Core runtime (run, session, goal graph, event bus) | ✅ |
-| SQLite store — WAL mode, async ThreadPoolExecutor | ✅ |
-| All 8 execution strategies | ✅ |
-| 7-layer spin detector + cross-session layer | ✅ |
-| Claude Code + Codex + OpenHands + SDK agent drivers | ✅ |
-| Housekeeping step budget refund | ✅ |
-| Real Slack HITL — Block Kit, retry, timeout escalation | ✅ |
-| Budget governance — charge wiring, velocity runaway | ✅ |
-| Cross-run knowledge store (FTS5) | ✅ |
-| re_decompose HITL — LLM goal restructuring | ✅ |
-| Dashboard — crash-safe launch, pending run recovery | ✅ |
-| All milestone validators (shell, test_suite, llm_judge, metric, git, goal_graph) | ✅ |
-| CI (GitHub Actions, Python 3.11 + 3.12) | ✅ |
-| 277 tests, all passing | ✅ |
-| PolicyEngine (T1 Python callables) | 🔧 Planned v1.1 |
-| A2A Protocol interop | 🔧 Planned v1.1 |
+| Capability | Alpha status | Current boundary |
+|---|---|---|
+| Python models, registries, and plugin entry points | Implemented | Third-party agent and validator names are supported; third-party strategy names are blocked by the current config schema. |
+| CLI `run`, `show`, `list`, `watch`, `fork`, `export`, `serve` | Implemented | Everyday `init/status/attach/steer/cancel/resume/evidence/doctor` workflow is planned. |
+| SQLite run/session/step persistence | Implemented, local-only | Goal authority, migrations, foreign keys, contention handling, integrity, backup, and restore need hardening. Use one local HorizonX daemon. |
+| Claude Code, Codex, OpenHands, custom, and SDK drivers | Experimental | CLI transports exist; structured native transports, capability negotiation, and cross-provider parity are not verified. |
+| Eight execution strategy modules | Experimental | Lifecycle, failure, validator, budget, cleanup, and recovery behavior is not yet uniform. |
+| Goal graph and six validator types | Experimental | SQLite and `goals.json` can disagree; terminal-state and evidence semantics need hardening. |
+| Resume and dashboard pending-run recovery | Under hardening | Resume is session-boundary oriented; a crash can lose provider resume state or strand a pending run. Exact crash-point recovery is not claimed. |
+| Seven spin-detection components | Under hardening | The sequential path invokes the combined detector; universal wiring and configured response behavior are not yet verified. |
+| Resource governor and usage store | Under hardening | Enforcement and accounting are not uniform across strategies/providers; unknown provider cost must not be interpreted as zero. |
+| FTS5 knowledge store and handoff sync | Components only | The store and sync modules are not yet connected to the normal runtime/strategy lifecycle. Automatic cross-run memory is not claimed. |
+| Slack HITL and dashboard controls | Under hardening | Durable decisions, authenticated callbacks, restart-safe waits, and process-tree cancellation are not complete. |
+| SSE dashboard and JSONL trajectory | Experimental | SSE is in-memory and has no durable cursor/replay guarantee. |
+| Local workspace execution | Experimental | Runs currently materialize an empty local workspace; repository checkout and setup-command semantics need hardening. |
+| Docker, Podman, and E2B execution | Configuration only | Configuration models exist, but non-local environment execution is not wired into the runtime. |
+| Multi-run/multi-worker concurrency | Not supported | Goal identity, leases, and worker coordination must be made durable before concurrent execution is safe. |
+| Automated verification | Implemented | 341 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
+
+Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or
+operate HorizonX as a production-grade long-horizon controller.
 
 ---
 
