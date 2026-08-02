@@ -30,16 +30,13 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.event_bus import Event
 from horizonx.core.types import (
     Run,
     RunStatus,
-    SessionStatus,
-    Step,
     StrategyOutcome,
 )
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 CRITIQUE_SYSTEM = """\
 You are a code critic for a self-improving agent loop. Your role is to:
@@ -91,15 +88,10 @@ class SelfCritique:
         self.write_progress: bool = config.get("write_progress", True)
 
     async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
-        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
-        agent = _build_agent(run.task.agent)
         history: list[dict[str, Any]] = []
 
         for round_n in range(self.max_rounds):
             # ---- Implementer session ----
-            impl_session = await rt.start_session(run, target_goal=None)
-            cancel = CancelToken()
-
             if round_n == 0:
                 impl_prompt = run.task.prompt
             else:
@@ -115,22 +107,12 @@ class SelfCritique:
                     original_prompt=run.task.prompt,
                 )
 
-            async def on_impl_step(step: Step, s: Any = impl_session) -> None:
-                step.session_id = s.id
-                await rt.record_step(s, step)
-
-            impl_result = await agent.run_session(
-                impl_prompt, workspace,
-                on_step=on_impl_step,
-                cancel_token=cancel,
-                session_id=impl_session.id,
+            impl_attempt = await AttemptExecutor(rt).execute(
+                run, prompt=impl_prompt
             )
-            if impl_result.agent_session_id:
-                impl_session.agent_session_id = impl_result.agent_session_id
-            rt.charge(impl_result)
-            await rt.end_session(impl_session, impl_result.status or SessionStatus.COMPLETED)
+            impl_result = impl_attempt.agent
 
-            if impl_result.status != SessionStatus.COMPLETED:
+            if not impl_attempt.succeeded:
                 yield StrategyOutcome(
                     status=RunStatus.FAILED,
                     reason="implementer_failed",
@@ -139,7 +121,9 @@ class SelfCritique:
                 return
 
             # ---- Critic session ----
-            critic_result = await self._run_critic(run, rt, workspace, round_n)
+            critic_result = await self._run_critic(
+                run, rt, run.workspace_path, round_n
+            )
             score = critic_result.get("score", 0.0)
             verdict = critic_result.get("verdict", "revise")
             history.append({"round": round_n, "score": score, "verdict": verdict})
@@ -175,22 +159,24 @@ class SelfCritique:
         )
 
     async def _run_critic(
-        self, run: Run, rt: Any, workspace: Workspace, round_n: int
+        self, run: Run, rt: Any, workspace_path: Path, round_n: int
     ) -> dict[str, Any]:
         if self.critic_type == "llm":
-            return await self._llm_critic(run, workspace, round_n)
+            return await self._llm_critic(run, workspace_path, round_n)
         if self.critic_type == "shell":
-            return await self._shell_critic(workspace)
+            return await self._shell_critic(workspace_path)
         if self.critic_type == "agent":
-            return await self._agent_critic(run, rt, workspace, round_n)
+            return await self._agent_critic(run, rt, workspace_path, round_n)
         return {"score": 0.5, "verdict": "revise", "issues": [], "suggestions": [],
                 "summary": f"unknown critic type: {self.critic_type}"}
 
-    async def _llm_critic(self, run: Run, workspace: Workspace, round_n: int) -> dict[str, Any]:
+    async def _llm_critic(
+        self, run: Run, workspace_path: Path, round_n: int
+    ) -> dict[str, Any]:
         from horizonx.core.llm_client import call_llm_json
 
         # Collect workspace snapshot for critic
-        files_context = self._collect_workspace_context(workspace.path)
+        files_context = self._collect_workspace_context(workspace_path)
         user_prompt = (
             f"Round {round_n + 1} critique.\n\n"
             f"GOAL:\n{run.task.prompt[:1000]}\n\n"
@@ -212,14 +198,14 @@ class SelfCritique:
             return {"score": 0.5, "verdict": "revise", "issues": [],
                     "suggestions": [str(e)], "summary": "LLM critic exception"}
 
-    async def _shell_critic(self, workspace: Workspace) -> dict[str, Any]:
+    async def _shell_critic(self, workspace_path: Path) -> dict[str, Any]:
         import asyncio as aio
         if not self.critic_command:
             return {"score": 0.5, "verdict": "revise", "issues": [], "suggestions": [],
                     "summary": "no shell critic command configured"}
         proc = await aio.create_subprocess_shell(
             self.critic_command,
-            cwd=str(workspace.path),
+            cwd=str(workspace_path),
             stdout=aio.subprocess.PIPE,
             stderr=aio.subprocess.PIPE,
         )
@@ -236,31 +222,21 @@ class SelfCritique:
         }
 
     async def _agent_critic(
-        self, run: Run, rt: Any, workspace: Workspace, round_n: int
+        self, run: Run, rt: Any, workspace_path: Path, round_n: int
     ) -> dict[str, Any]:
-        agent = _build_agent(run.task.agent)
-        critique_out = workspace.path / "_critic_output.json"
+        critique_out = workspace_path / "_critic_output.json"
         critic_prompt = (
             f"You are a code critic. Review the workspace and output critique JSON to "
             f"`_critic_output.json`.\n\nCRITIQUE_SYSTEM:\n{CRITIQUE_SYSTEM}\n\n"
             f"GOAL:\n{run.task.prompt[:500]}"
         )
-        critic_session = await rt.start_session(run, target_goal=None)
-
-        async def on_critic_step(step: Step, s: Any = critic_session) -> None:
-            step.session_id = s.id
-            await rt.record_step(s, step)
-
-        result = await agent.run_session(
-            critic_prompt, workspace,
-            on_step=on_critic_step,
-            session_id=critic_session.id,
+        attempt = await AttemptExecutor(rt).execute(
+            run,
+            prompt=critic_prompt,
+            workspace_path=workspace_path,
         )
-        rt.charge(result)
-        await rt.end_session(
-            critic_session, result.status or SessionStatus.COMPLETED
-        )
-        if result.status != SessionStatus.COMPLETED:
+        result = attempt.agent
+        if not attempt.succeeded:
             return {
                 "score": 0.0,
                 "verdict": "revise",

@@ -3,6 +3,8 @@
 See docs/LONG_HORIZON_AGENT.md for the full design.
 """
 
+from horizonx.core.attempt_executor import AttemptExecutor
+from horizonx.core.attempt_result import AttemptResult
 from horizonx.core.event_bus import Event, EventBus, InMemoryBus
 from horizonx.core.runtime import Runtime
 from horizonx.core.types import (
@@ -52,6 +54,8 @@ __all__ = [
     "SpinDetectionConfig",
     "HITLConfig",
     "Runtime",
+    "AttemptExecutor",
+    "AttemptResult",
     "Event",
     "EventBus",
     "InMemoryBus",

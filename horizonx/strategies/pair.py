@@ -22,10 +22,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.event_bus import Event
-from horizonx.core.types import Run, RunStatus, SessionStatus, Step, StrategyOutcome
-from horizonx.strategies._agent_builder import build_agent as _build_agent
+from horizonx.core.types import Run, RunStatus, StrategyOutcome
 
 NAVIGATOR_SYSTEM_TEMPLATE = """\
 You are the Navigator in a pair-programming loop. Review the current state of the
@@ -103,20 +102,13 @@ class PairProgramming:
     async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
         yield Event(type="run.started", run_id=run.id, payload={"strategy": "pair"})
 
-        driver_agent = _build_agent(run.task.agent)
         nav_config = run.task.agent.model_copy()
         if self.navigator_model:
             nav_config = run.task.agent.model_copy(update={"model": self.navigator_model})
-        navigator_agent = _build_agent(nav_config)
-
-        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
         history: list[dict[str, Any]] = []
 
         for round_n in range(self.max_rounds):
             # ---- Driver session ----
-            driver_session = await rt.start_session(run, target_goal=None)
-            cancel = CancelToken()
-
             if round_n == 0:
                 driver_prompt = run.task.prompt
             else:
@@ -126,20 +118,12 @@ class PairProgramming:
                     goal=run.task.prompt,
                 )
 
-            async def on_driver_step(step: Step, s: Any = driver_session) -> None:
-                step.session_id = s.id
-                await rt.record_step(s, step)
-
-            driver_result = await driver_agent.run_session(
-                driver_prompt, workspace, on_step=on_driver_step,
-                cancel_token=cancel, session_id=driver_session.id,
+            driver_attempt = await AttemptExecutor(rt).execute(
+                run, prompt=driver_prompt
             )
-            if driver_result.agent_session_id:
-                driver_session.agent_session_id = driver_result.agent_session_id
-            rt.charge(driver_result)
-            await rt.end_session(driver_session, driver_result.status or SessionStatus.COMPLETED)
+            driver_result = driver_attempt.agent
 
-            if driver_result.status != SessionStatus.COMPLETED:
+            if not driver_attempt.succeeded:
                 yield StrategyOutcome(
                     status=RunStatus.FAILED,
                     reason="driver_failed",
@@ -148,27 +132,18 @@ class PairProgramming:
                 return
 
             # ---- Navigator session ----
-            nav_session = await rt.start_session(run, target_goal=None)
-            nav_cancel = CancelToken()
-
             nav_prompt = NAVIGATOR_SYSTEM_TEMPLATE.format(
                 round_n=round_n + 1,
                 goal=run.task.prompt[:800],
             )
 
-            async def on_nav_step(step: Step, s: Any = nav_session) -> None:
-                step.session_id = s.id
-                await rt.record_step(s, step)
-
-            nav_result = await navigator_agent.run_session(
-                nav_prompt, workspace, on_step=on_nav_step,
-                cancel_token=nav_cancel, session_id=nav_session.id,
+            nav_attempt = await AttemptExecutor(rt).execute(
+                run,
+                prompt=nav_prompt,
+                agent_config=nav_config,
             )
-            if nav_result.agent_session_id:
-                nav_session.agent_session_id = nav_result.agent_session_id
-            rt.charge(nav_result)
-            await rt.end_session(nav_session, nav_result.status or SessionStatus.COMPLETED)
-            if nav_result.status != SessionStatus.COMPLETED:
+            nav_result = nav_attempt.agent
+            if not nav_attempt.succeeded:
                 yield StrategyOutcome(
                     status=RunStatus.FAILED,
                     reason="navigator_failed",

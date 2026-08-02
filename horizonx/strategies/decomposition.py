@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
 from horizonx.core.task_board import append_task_board
@@ -27,11 +27,9 @@ from horizonx.core.types import (
     Run,
     RunStatus,
     SessionStatus,
-    Step,
     StrategyOutcome,
     new_session_id,
 )
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 DECOMPOSER_SYSTEM = """\
 You are a task planner for a long-horizon agent framework. Given a high-level goal,
@@ -107,20 +105,13 @@ class DecompositionFirst:
             await rt.store.create_graph(run.id, graph)
             await rt.store.ensure_goal_projection(run.id, graph_path)
 
-            session = await rt.start_session(
-                run, target_goal=goal, session_id=session_id
-            )
             append_task_board(
                 run.workspace_path,
                 event="claimed",
                 goal_id=goal.id,
-                session_id=session.id,
+                session_id=session_id,
                 agent_type=run.task.agent.type,
             )
-
-            agent = _build_agent(run.task.agent)
-            workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
-            cancel = CancelToken()
 
             prompt = (
                 f"Sub-goal: {goal.name}\n\n"
@@ -130,25 +121,31 @@ class DecompositionFirst:
                 + f"\n\nOriginal task context:\n{run.task.prompt[:1000]}"
             )
 
-            async def on_step(step: Step, s: Any = session) -> None:
-                step.session_id = s.id
-                await rt.record_step(s, step)
-
-            result = await agent.run_session(
-                prompt, workspace, on_step=on_step,
-                cancel_token=cancel, session_id=session.id,
+            is_final_goal = all(
+                leaf.id == goal.id or leaf.status == GoalStatus.DONE
+                for leaf in graph.leaves()
             )
-            if result.agent_session_id:
-                session.agent_session_id = result.agent_session_id
-            rt.charge(result)
+            validator_stages = (
+                ("after_every_session", "final")
+                if is_final_goal
+                else ("after_every_session",)
+            )
+            attempt = await AttemptExecutor(rt).execute(
+                run,
+                prompt=prompt,
+                target_goal=goal,
+                session_id=session_id,
+                validator_stages=validator_stages,
+            )
+            session = attempt.session
+            result = attempt.agent
 
-            if result.status != SessionStatus.COMPLETED:
+            if not attempt.succeeded:
                 graph.mark_failed(goal.id, by_session=session.id)
                 goal.assigned_to_session = None
                 await rt.store.release_goal(run.id, goal.id)
                 await rt.store.create_graph(run.id, graph)
                 await rt.store.ensure_goal_projection(run.id, graph_path)
-                await rt.end_session(session, result.status)
                 yield StrategyOutcome(
                     status=(
                         RunStatus.TIMED_OUT
@@ -160,13 +157,8 @@ class DecompositionFirst:
                 )
                 return
 
-            decisions = await rt.run_validators(run, session, when="after_every_session")
-            if all(
-                leaf.id == goal.id or leaf.status == GoalStatus.DONE
-                for leaf in graph.leaves()
-            ):
-                decisions.extend(await rt.run_validators(run, session, when="final"))
-                final_validated = True
+            decisions = attempt.decisions
+            final_validated = final_validated or is_final_goal
 
             from horizonx.core.types import GateAction
             any_abort = any(d.decision == GateAction.ABORT for d in decisions)
@@ -241,7 +233,6 @@ class DecompositionFirst:
                 goal.version += 1
                 await rt.store.release_goal(run.id, goal.id)
 
-            await rt.end_session(session, result.status or SessionStatus.COMPLETED)
             await rt.store.create_graph(run.id, graph)
             await rt.store.ensure_goal_projection(run.id, graph_path)
 

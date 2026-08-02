@@ -14,7 +14,7 @@ hardened. It is suitable for local evaluation and development—not unattended o
 [![CI](https://github.com/headcrabz/horizonX/actions/workflows/ci.yml/badge.svg)](https://github.com/headcrabz/horizonX/actions)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Tests: 405 passing](https://img.shields.io/badge/tests-405%20passing-brightgreen.svg)](tests/)
+[![Tests: 436 passing](https://img.shields.io/badge/tests-436%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -26,8 +26,8 @@ The current alpha includes:
 
 - **Durable records** — SQLite stores runs, sessions, steps, validations, HITL records, and usage.
   Goal persistence is authoritative and run-scoped; exact crash-point recovery is under hardening.
-- **Spin-analysis components** — seven detectors cover repetition, oscillation, plateaus, and
-  cross-session stagnation. Universal invocation and response semantics are not yet guaranteed.
+- **Spin analysis** — seven detectors cover repetition, oscillation, plateaus, and cross-session
+  stagnation. Every strategy uses the shared detector path; richer recovery actions are planned.
 - **Resource-policy components** — token, cost, time, and workspace-budget models exist. Uniform
   enforcement across all strategies and providers is under hardening.
 - **Knowledge components** — FTS5 knowledge storage and Markdown handoff sync exist as modules.
@@ -35,7 +35,8 @@ The current alpha includes:
 - **Goal graphs and validators** — DAG planning and six validator types are implemented. Database
   recovery, a complete evidence contract, and unattended operation are under hardening.
 - **Eight strategy modules** — single, sequential, pair, tree, self-critique, decomposition,
-  monitor, and ralph. They are experimental until they share one verified execution lifecycle.
+  monitor, and ralph. Their agent calls share one session, recording, limit, charging, spin,
+  validation, and cleanup lifecycle.
 - **Operator and observability components** — Slack HITL, dashboard SSE, and CLI watch exist.
   Durable commands, real cancellation, authenticated callbacks, and event replay are planned.
 
@@ -213,7 +214,7 @@ for node fields, validator inheritance, and transition rules.
 
 ## Spin detection layers
 
-Loops that the agent can't detect itself are caught by HorizonX automatically:
+HorizonX checks for loops every five recorded agent steps:
 
 | Layer | Catches |
 |---|---|
@@ -225,7 +226,8 @@ Loops that the agent can't detect itself are caught by HorizonX automatically:
 | `SemanticProgress` | LLM judge: is the agent actually advancing on the stated goal? |
 | `CrossSession` | Multiple sessions completed but zero goal nodes transitioned to DONE |
 
-Soft-threshold triggers a diagnostic injection. Hard-threshold terminates the session and notifies the operator.
+An advisory response lets the session continue; a hard response cancels it with a distinct
+`spin` outcome. Durable retry and operator-escalation commands are still under hardening.
 
 ---
 
@@ -358,25 +360,28 @@ async def my_agent_fn(prompt: str, workspace_path: Path):
 task = Task(agent=AgentConfig(type="sdk", extra={"callable": my_agent_fn}))
 ```
 
+A strategy plugin owns the loop topology but should route each agent invocation through the
+public `horizonx.AttemptExecutor` contract. That preserves the same persisted session, event
+recording, limits, charging, spin checks, validator callbacks, and cleanup behavior as built-ins.
+
 ---
 
 ## Target architecture
 
-This diagram is the intended converged lifecycle. In the alpha, strategy modules still invoke
-parts of the lifecycle differently; the [support matrix](#project-status) is authoritative.
+This diagram shows the current shared attempt path. Recovery, durable commands, and knowledge
+curation remain separate hardening work; the [support matrix](#project-status) is authoritative.
 
 ```
 Task (YAML / Python)
   → Runtime.run()
     → Budget pre-check (workspace daily limit)
-    → Strategy.execute()         (decides session loop shape)
-      → SessionManager           (composes prompt + knowledge injection)
+    → Strategy.execute()         (decides loop shape and composes prompts)
+      → AttemptExecutor          (one bounded, persisted agent attempt)
         → Agent.run_session()    (spawns subprocess, yields Steps)
           → TrajectoryRecorder   (persists Steps to SQLite + JSONL)
         → SpinDetector           (7 layers, in-session + cross-session)
         → Runtime.run_validators (gates: continue / pause / abort)
         → ResourceGovernor       (charges tokens/cost, checks thresholds)
-        → KnowledgeHandoffDir    (indexes knowledge/*.md to FTS5)
     → EventBus                   (SSE → dashboard / CLI watch / Slack)
     → SqliteStore                (local durable state; recovery hardening in progress)
 ```
@@ -410,22 +415,22 @@ focused tests; it does not imply a verified production guarantee.
 
 | Capability | Alpha status | Current boundary |
 |---|---|---|
-| Python models, registries, and plugin entry points | Implemented | Third-party agent and validator names are supported; third-party strategy names are blocked by the current config schema. |
+| Python models, registries, and plugin entry points | Implemented | Third-party agent, validator, and strategy names are supported; plugins remain responsible for conforming to their public protocol. |
 | CLI execution, inspection, dashboard, and database maintenance | Implemented subset | `run`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint` are available; broader operator workflows are planned. |
 | SQLite orchestration persistence | Implemented, local-only | Run-scoped goal identity, migrations, foreign keys, bounded contention, integrity checks, backup, restore, and atomic goal transitions are implemented. Use one local HorizonX daemon and keep the database on a local filesystem. |
 | Claude Code, Codex, OpenHands, custom, and SDK drivers | Experimental | CLI transports exist; structured native transports, capability negotiation, and cross-provider parity are not verified. |
-| Eight execution strategy modules | Experimental | Every built-in yields a typed terminal outcome and shares final-validator semantics; attempt, cleanup, budget, and recovery paths still need one executor. |
+| Eight execution strategy modules | Experimental | Every built-in yields a typed terminal outcome and routes agent calls through one attempt executor; topology-specific retry and exact crash recovery still need hardening. |
 | Goal graph and six validator types | Experimental | SQLite is authoritative and `goals.json` is an atomic projection; completion rejection no longer reports a successful run, while evidence calibration still needs hardening. |
 | Resume and dashboard pending-run recovery | Under hardening | Resume is session-boundary oriented; a crash can lose provider resume state or strand a pending run. Exact crash-point recovery is not claimed. |
-| Seven spin-detection components | Under hardening | The sequential path invokes the combined detector; universal wiring and configured response behavior are not yet verified. |
-| Resource governor and usage store | Under hardening | Enforcement and accounting are not uniform across strategies/providers; unknown provider cost must not be interpreted as zero. |
+| Seven spin-detection components | Under hardening | All built-in strategy attempts use the combined detector path; durable retry, strategy-switch, and operator-response actions are not complete. |
+| Resource governor and usage store | Under hardening | All built-in strategy attempts share charging and per-session step/time limits; session-count enforcement, concurrency, and unknown provider cost still need hardening. |
 | FTS5 knowledge store and handoff sync | Components only | The store and sync modules are not yet connected to the normal runtime/strategy lifecycle. Automatic cross-run memory is not claimed. |
 | Slack HITL and dashboard controls | Under hardening | Durable decisions, authenticated callbacks, restart-safe waits, and process-tree cancellation are not complete. |
 | SSE dashboard and JSONL trajectory | Experimental | SSE is in-memory and has no durable cursor/replay guarantee. |
 | Local workspace execution | Implemented, local-only | Local paths use contained Git worktrees; clone URLs, refs, optional branches/submodules, setup commands with an environment allowlist, metadata, and safe session-boundary resume are covered. Process containment and exact crash recovery still need hardening. |
 | Docker, Podman, and E2B execution | Not supported | Unimplemented backend values are rejected by configuration instead of being silently treated as local execution. |
 | Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |
-| Automated verification | Implemented | 405 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Automated verification | Implemented | 436 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
 | Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
 
 Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or

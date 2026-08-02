@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from horizonx.core.event_bus import InMemoryBus
 from horizonx.core.governor import BudgetExceeded, ResourceGovernor
+from horizonx.core.runtime import Runtime
 from horizonx.core.types import (
     AgentConfig,
     ResourceLimits,
@@ -70,3 +72,18 @@ class TestGovernor:
             gov.charge(tokens_in=200, tokens_out=100)
             assert run.cumulative.tokens_in == 300
             assert run.cumulative.tokens_out == 150
+
+    @pytest.mark.asyncio
+    async def test_runtime_releases_governor_reference_after_exception(
+        self, tmp_path: Path
+    ) -> None:
+        runtime = Runtime(
+            store=MagicMock(), workspace_root=tmp_path / "workspaces"
+        )
+        run = _make_run()
+
+        with pytest.raises(RuntimeError, match="strategy failed"):
+            async with runtime._governor(run):
+                raise RuntimeError("strategy failed")
+
+        assert runtime._governor_ref is None

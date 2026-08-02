@@ -170,17 +170,17 @@ class AgentConfig(BaseModel):
 
 
 class StrategyConfig(BaseModel):
-    kind: Literal[
-        "single",
-        "sequential",
-        "ralph",
-        "tree",
-        "monitor",
-        "decomposition",
-        "pair",
-        "self_critique",
-    ]
+    # str allows third-party strategies registered via horizonx.strategies entry points.
+    kind: str
     config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("strategy kind must not be blank")
+        return value
 
 
 class RepositoryConfig(BaseModel):

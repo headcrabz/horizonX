@@ -27,10 +27,9 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.event_bus import Event
-from horizonx.core.types import Run, RunStatus, SessionStatus, Step, StrategyOutcome
-from horizonx.strategies._agent_builder import build_agent as _build_agent
+from horizonx.core.types import Run, RunStatus, SessionStatus, StrategyOutcome
 
 
 class MonitorRespond:
@@ -77,7 +76,6 @@ class MonitorRespond:
                 if responder_outcome is not None:
                     yield responder_outcome
                     return
-                await rt.run_validators(run, None, when="after_every_session")
 
             await asyncio.sleep(self.poll_interval_seconds)
 
@@ -130,29 +128,18 @@ class MonitorRespond:
     async def _run_responder(
         self, run: Run, rt: Any, trigger_count: int
     ) -> StrategyOutcome | None:
-        session = await rt.start_session(run, target_goal=None)
-        agent = _build_agent(run.task.agent)
-        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
-        cancel = CancelToken()
-
         prompt = self.responder_prompt_template.format(
             base_prompt=run.task.prompt,
             trigger_count=trigger_count,
         )
 
-        async def on_step(step: Step, s: Any = session) -> None:
-            step.session_id = s.id
-            await rt.record_step(s, step)
-
-        result = await agent.run_session(
-            prompt, workspace, on_step=on_step,
-            cancel_token=cancel, session_id=session.id,
+        attempt = await AttemptExecutor(rt).execute(
+            run,
+            prompt=prompt,
+            validator_stages=("after_every_session",),
         )
-        if result.agent_session_id:
-            session.agent_session_id = result.agent_session_id
-        rt.charge(result)
-        await rt.end_session(session, result.status or SessionStatus.COMPLETED)
-        if result.status != SessionStatus.COMPLETED:
+        result = attempt.agent
+        if not attempt.succeeded:
             return StrategyOutcome(
                 status=(
                     RunStatus.TIMED_OUT

@@ -227,7 +227,7 @@ async def test_final_rejection_prevents_sequential_root_completion(tmp_path: Pat
         with (
             patch.object(runtime, "run_validators", side_effect=validator_policy),
             patch(
-                "horizonx.strategies.sequential._build_agent",
+                "horizonx.core.attempt_executor.build_agent",
                 return_value=MockAgent(),
             ),
         ):

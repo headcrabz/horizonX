@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
 from horizonx.core.knowledge import RunKnowledgeStore
@@ -29,33 +29,6 @@ from horizonx.core.types import (
     StrategyOutcome,
     new_session_id,
 )
-
-_BUILTIN_AGENTS: dict[str, str] = {
-    "claude_code": "horizonx.agents.claude_code:ClaudeCodeAgent",
-    "codex":       "horizonx.agents.codex:CodexAgent",
-    "custom":      "horizonx.agents.custom:CustomAgent",
-    "mock":        "horizonx.agents.mock:MockAgent",
-}
-
-
-def _build_agent(ac: Any) -> Any:
-    """Build an agent driver from AgentConfig. Supports built-ins and installed entry-points."""
-    import importlib
-    from importlib.metadata import entry_points
-
-    # Fast path: built-ins
-    if ac.type in _BUILTIN_AGENTS:
-        module_path, cls_name = _BUILTIN_AGENTS[ac.type].rsplit(":", 1)
-        cls = getattr(importlib.import_module(module_path), cls_name)
-        return cls(ac)
-
-    # Plugin path: horizonx.agents entry-points
-    eps = {ep.name: ep for ep in entry_points(group="horizonx.agents")}
-    if ac.type in eps:
-        cls = eps[ac.type].load()
-        return cls(ac)
-
-    raise ValueError(f"unknown agent type: {ac.type!r}")
 
 
 class SequentialSubgoals:
@@ -127,30 +100,11 @@ class SequentialSubgoals:
     # ------------------------------------------------------------------
 
     async def _run_initializer(self, run: Run, rt: Any) -> None:
-        session = await rt.start_session(run, target_goal=None)
         sm = SessionManager(run)
         prompt = sm.compose_prompt(target_goal=None)
-        agent = _build_agent(run.task.agent)
-        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
-
-        async def on_step(step: Any) -> None:
-            step.session_id = session.id
-            await rt.record_step(session, step)
-
-        cancel_token = CancelToken()
-        result = await agent.run_session(
-            session_prompt=prompt,
-            workspace=workspace,
-            on_step=on_step,
-            cancel_token=cancel_token,
-            session_id=session.id,
-        )
-        if result.agent_session_id:
-            session.agent_session_id = result.agent_session_id
-        rt.charge(result)
-        await rt.end_session(session, result.status or SessionStatus.COMPLETED)
-        if result.status != SessionStatus.COMPLETED:
-            raise RuntimeError(f"initializer ended with {result.status.value}")
+        attempt = await AttemptExecutor(rt).execute(run, prompt=prompt)
+        if not attempt.succeeded:
+            raise RuntimeError(f"initializer ended with {attempt.status.value}")
 
         # Verify goals.json was created; if not, we cannot continue.
         graph_path = run.workspace_path / "goals.json"
@@ -199,43 +153,35 @@ class SequentialSubgoals:
         await rt.store.create_graph(run.id, graph)
         await rt.store.ensure_goal_projection(run.id, run.workspace_path / "goals.json")
 
-        session = await rt.start_session(run, target_goal=goal, session_id=session_id)
         append_task_board(
             run.workspace_path,
             event="claimed",
             goal_id=goal.id,
-            session_id=session.id,
+            session_id=session_id,
             agent_type=run.task.agent.type,
         )
 
         sm = SessionManager(run)
         prompt = sm.compose_prompt(target_goal=goal)
-        agent = _build_agent(run.task.agent)
-        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
-
-        cancel_token = CancelToken()
-
-        async def on_step(step: Any) -> None:
-            step.session_id = session.id
-            await rt.record_step(session, step)
-            # Mid-session spin check every N steps
-            if session.steps_count > 0 and session.steps_count % 5 == 0:
-                report = await rt.check_spin(session, run)
-                if report and report.detected:
-                    cancel_token.cancel(reason=f"spin:{report.layer}")
-
-        result = await agent.run_session(
-            session_prompt=prompt,
-            workspace=workspace,
-            resume_session_id=session.agent_session_id,
-            on_step=on_step,
-            cancel_token=cancel_token,
-            session_id=session.id,
+        is_final_goal = all(
+            leaf.id == goal.id or leaf.status == GoalStatus.DONE
+            for leaf in graph.leaves()
         )
-        if result.agent_session_id:
-            session.agent_session_id = result.agent_session_id
-        rt.charge(result)
-        if result.status != SessionStatus.COMPLETED:
+        validator_stages = (
+            ("after_every_session", "final")
+            if is_final_goal
+            else ("after_every_session",)
+        )
+        attempt = await AttemptExecutor(rt).execute(
+            run,
+            prompt=prompt,
+            target_goal=goal,
+            session_id=session_id,
+            validator_stages=validator_stages,
+        )
+        session = attempt.session
+        result = attempt.agent
+        if not attempt.succeeded:
             graph.mark_failed(goal.id, by_session=session.id)
             goal.assigned_to_session = None
             await rt.store.release_goal(run.id, goal.id)
@@ -246,7 +192,6 @@ class SequentialSubgoals:
                 session_id=session.id,
                 agent_type=run.task.agent.type,
             )
-            await rt.end_session(session, result.status)
             return (
                 True,
                 False,
@@ -272,18 +217,11 @@ class SequentialSubgoals:
             run.workspace_path / "decisions.jsonl"
         )
 
-        # Run validators after session
-        decisions = await rt.run_validators(run, session, when="after_every_session")
-        final_validated = False
-        if all(
-            leaf.id == goal.id or leaf.status == GoalStatus.DONE
-            for leaf in graph.leaves()
-        ):
-            decisions.extend(await rt.run_validators(run, session, when="final"))
-            final_validated = True
+        decisions = attempt.decisions
+        final_validated = is_final_goal
 
         # Decide goal outcome
-        spin_cancelled = cancel_token.cancelled and "spin" in cancel_token.reason
+        spin_cancelled = attempt.spin_detected
         any_pause = any(d.decision == GateAction.PAUSE_FOR_HITL for d in decisions)
         any_abort = any(d.decision == GateAction.ABORT for d in decisions)
         all_continue = all(d.decision == GateAction.CONTINUE for d in decisions) if decisions else True
@@ -294,7 +232,6 @@ class SequentialSubgoals:
             await rt.store.release_goal(run.id, goal.id)
             append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                               session_id=session.id, agent_type=run.task.agent.type)
-            await rt.end_session(session, SessionStatus.ERRORED)
             return (
                 True,
                 final_validated,
@@ -308,7 +245,7 @@ class SequentialSubgoals:
         if spin_cancelled or any_pause:
             ctx = {
                 "goal_id": goal.id,
-                "spin_reason": cancel_token.reason if spin_cancelled else None,
+                "spin_reason": "spin_detected" if spin_cancelled else None,
                 "validator_decisions": [d.model_dump() for d in decisions],
             }
             decision = await rt.request_hitl(run, reason="validator_or_spin", context=ctx)
@@ -318,7 +255,6 @@ class SequentialSubgoals:
                 await rt.store.release_goal(run.id, goal.id)
                 append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                                   session_id=session.id, agent_type=run.task.agent.type)
-                await rt.end_session(session, SessionStatus.ERRORED)
                 return (
                     True,
                     final_validated,
@@ -349,7 +285,6 @@ class SequentialSubgoals:
                 goal.version += 1
                 await rt.store.release_goal(run.id, goal.id)
             # Continue the loop (do not mark done)
-            await rt.end_session(session, result.status or SessionStatus.COMPLETED)
             return True, final_validated, None
 
         if all_continue:
@@ -371,7 +306,6 @@ class SequentialSubgoals:
                 goal.version += 1
                 await rt.store.release_goal(run.id, goal.id)
 
-        await rt.end_session(session, result.status or SessionStatus.COMPLETED)
         return True, final_validated, None
 
     # ------------------------------------------------------------------

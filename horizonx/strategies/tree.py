@@ -23,10 +23,9 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.event_bus import Event
-from horizonx.core.types import Run, RunStatus, SessionStatus, Step, StrategyOutcome
-from horizonx.strategies._agent_builder import build_agent as _build_agent
+from horizonx.core.types import Run, RunStatus, StrategyOutcome
 
 
 class TreeOfTrials:
@@ -125,30 +124,18 @@ class TreeOfTrials:
     async def _run_branch(
         self, run: Run, rt: Any, branch_dir: Path, branch_idx: int, depth: int
     ) -> None:
-        session = await rt.start_session(run, target_goal=None)
-        agent = _build_agent(run.task.agent)
-        workspace = Workspace(path=branch_dir, env=rt.workspace_env(run))
-        cancel = CancelToken()
-
         prompt = (
             f"Tree-of-trials exploration — depth {depth + 1}, branch {branch_idx + 1}.\n\n"
             f"{run.task.prompt}"
         )
 
-        async def on_step(step: Step, s: Any = session) -> None:
-            step.session_id = s.id
-            await rt.record_step(s, step)
-
-        result = await agent.run_session(
-            prompt, workspace, on_step=on_step,
-            cancel_token=cancel, session_id=session.id,
+        attempt = await AttemptExecutor(rt).execute(
+            run,
+            prompt=prompt,
+            workspace_path=branch_dir,
         )
-        if result.agent_session_id:
-            session.agent_session_id = result.agent_session_id
-        rt.charge(result)
-        await rt.end_session(session, result.status or SessionStatus.COMPLETED)
-        if result.status != SessionStatus.COMPLETED:
-            raise RuntimeError(f"tree branch ended with {result.status.value}")
+        if not attempt.succeeded:
+            raise RuntimeError(f"tree branch ended with {attempt.status.value}")
 
     async def _score_branch(self, branch_dir: Path, run: Run) -> float:
         if self.scorer_type == "shell" and self.scorer_command:

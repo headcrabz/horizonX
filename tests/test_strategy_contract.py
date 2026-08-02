@@ -54,6 +54,8 @@ def _run(tmp_path: Path) -> Run:
 def _runtime_double(store: object | None = None) -> MagicMock:
     rt = MagicMock()
     rt.store = store or MagicMock()
+    if isinstance(rt.store, MagicMock):
+        rt.store.save_session = AsyncMock()
     rt.start_session = AsyncMock(
         return_value=Session(
             id="sess-contract", run_id="run-contract", sequence_index=0
@@ -63,6 +65,7 @@ def _runtime_double(store: object | None = None) -> MagicMock:
     rt.record_step = AsyncMock()
     rt.run_validators = AsyncMock(return_value=[])
     rt.request_hitl = AsyncMock()
+    rt.workspace_env.return_value = {}
     return rt
 
 
@@ -79,7 +82,7 @@ async def test_single_agent_error_is_a_failed_outcome(tmp_path: Path) -> None:
     rt = _runtime_double()
     agent = MockAgent(status=SessionStatus.ERRORED, error="provider failed")
 
-    with patch("horizonx.strategies.single._build_agent", return_value=agent):
+    with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
         outcome = await _outcome(SingleSession({}), _run(tmp_path), rt)
 
     assert outcome.status == RunStatus.FAILED
@@ -99,7 +102,7 @@ async def test_decomposition_agent_error_cannot_complete_goal(tmp_path: Path) ->
         with (
             patch.object(strategy, "_decompose", new=AsyncMock(return_value=graph)),
             patch(
-                "horizonx.strategies.decomposition._build_agent", return_value=agent
+                "horizonx.core.attempt_executor.build_agent", return_value=agent
             ),
         ):
             outcome = await _outcome(strategy, _run(tmp_path), rt)
@@ -126,7 +129,7 @@ async def test_sequential_agent_error_cannot_complete_goal(tmp_path: Path) -> No
     agent = MockAgent(status=SessionStatus.ERRORED, error="provider failed")
     try:
         with patch(
-            "horizonx.strategies.sequential._build_agent", return_value=agent
+            "horizonx.core.attempt_executor.build_agent", return_value=agent
         ):
             outcome = await _outcome(SequentialSubgoals({}), _run(tmp_path), rt)
 
@@ -145,8 +148,8 @@ async def test_sequential_agent_error_cannot_complete_goal(tmp_path: Path) -> No
 @pytest.mark.parametrize(
     ("strategy", "agent_target"),
     [
-        (DecompositionFirst({}), "horizonx.strategies.decomposition._build_agent"),
-        (SequentialSubgoals({}), "horizonx.strategies.sequential._build_agent"),
+        (DecompositionFirst({}), "horizonx.core.attempt_executor.build_agent"),
+        (SequentialSubgoals({}), "horizonx.core.attempt_executor.build_agent"),
     ],
 )
 async def test_goal_strategy_validator_abort_is_an_aborted_outcome(
@@ -204,7 +207,7 @@ async def test_decomposition_validator_pause_uses_operator_decision(
     rt.request_hitl = AsyncMock(return_value=HITLDecision(action="approve"))
     try:
         with patch(
-            "horizonx.strategies.decomposition._build_agent", return_value=MockAgent()
+            "horizonx.core.attempt_executor.build_agent", return_value=MockAgent()
         ):
             outcome = await _outcome(DecompositionFirst({}), _run(tmp_path), rt)
 
@@ -292,7 +295,7 @@ async def test_pair_navigator_failure_is_not_completion(tmp_path: Path) -> None:
             SessionRunResult(status=SessionStatus.ERRORED, error="review failed"),
         ]
     )
-    with patch("horizonx.strategies.pair._build_agent", return_value=agent):
+    with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
         outcome = await _outcome(strategy, _run(tmp_path), rt)
 
     assert outcome.status == RunStatus.FAILED
@@ -314,7 +317,7 @@ async def test_self_critique_reviewer_failure_is_not_completion(
             SessionRunResult(status=SessionStatus.ERRORED, error="review failed"),
         ]
     )
-    with patch("horizonx.strategies.self_critique._build_agent", return_value=agent):
+    with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
         outcome = await _outcome(strategy, _run(tmp_path), rt)
 
     assert outcome.status == RunStatus.FAILED
@@ -337,7 +340,7 @@ async def test_monitor_responder_failure_is_a_failed_outcome(tmp_path: Path) -> 
     agent = MockAgent(status=SessionStatus.ERRORED, error="response failed")
     with (
         patch.object(strategy, "_check_trigger", new=AsyncMock(return_value=True)),
-        patch("horizonx.strategies.monitor._build_agent", return_value=agent),
+        patch("horizonx.core.attempt_executor.build_agent", return_value=agent),
     ):
         outcome = await _outcome(strategy, _run(tmp_path), _runtime_double())
 
@@ -370,7 +373,7 @@ async def test_ralph_all_iteration_timeouts_are_not_completion(tmp_path: Path) -
     with (
         patch.object(strategy, "_git_init"),
         patch.object(strategy, "_measure", new=AsyncMock(return_value=1.0)),
-        patch("horizonx.strategies.ralph.asyncio.wait_for", side_effect=timeout_once),
+        patch("horizonx.core.attempt_executor.asyncio.wait_for", side_effect=timeout_once),
     ):
         outcome = await _outcome(strategy, _run(tmp_path), _runtime_double())
 

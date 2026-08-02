@@ -79,7 +79,7 @@ class TestPairProgramming:
 
         call_count = [0]
 
-        async def mock_run_session(prompt, workspace, **kwargs):
+        async def mock_run_session(session_prompt, workspace, **kwargs):
             from horizonx.core.types import SessionRunResult, SessionStatus
             call_count[0] += 1
             if call_count[0] % 2 == 0:  # navigator turn
@@ -88,7 +88,7 @@ class TestPairProgramming:
                 )
             return SessionRunResult(status=SessionStatus.COMPLETED)
 
-        with patch("horizonx.strategies.pair._build_agent") as mock_build:
+        with patch("horizonx.core.attempt_executor.build_agent") as mock_build:
             mock_agent = MagicMock()
             mock_agent.run_session = mock_run_session
             mock_build.return_value = mock_agent

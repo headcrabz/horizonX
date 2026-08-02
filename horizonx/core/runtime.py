@@ -34,6 +34,17 @@ from horizonx.core.types import (
 from horizonx.environments.base import PreparedWorkspace, SetupCommandError, WorkspaceError
 from horizonx.environments.git import GitWorktreeBackend
 
+_BUILTIN_STRATEGIES = {
+    "decomposition": "horizonx.strategies.decomposition:DecompositionFirst",
+    "monitor": "horizonx.strategies.monitor:MonitorRespond",
+    "pair": "horizonx.strategies.pair:PairProgramming",
+    "ralph": "horizonx.strategies.ralph:RalphLoop",
+    "self_critique": "horizonx.strategies.self_critique:SelfCritique",
+    "sequential": "horizonx.strategies.sequential:SequentialSubgoals",
+    "single": "horizonx.strategies.single:SingleSession",
+    "tree": "horizonx.strategies.tree:TreeOfTrials",
+}
+
 
 class Runtime:
     """Top-level orchestrator. One Runtime serves N concurrent Runs.
@@ -77,6 +88,9 @@ class Runtime:
                     f"workspace {task.workspace.workspace_id!r} daily budget "
                     f"${task.workspace.daily_budget_usd:.2f} already spent (${spent:.2f} today)"
                 )
+        # Resolve and validate execution code before creating a run or touching a repository.
+        strategy_cls = self._load_strategy(task.strategy.kind)
+        strategy = strategy_cls(task.strategy.config)
         run = await self._load_or_create(task, resume_from)
         await self.store.save_run(run)
         try:
@@ -113,9 +127,6 @@ class Runtime:
                     ),
                 )
                 return run
-
-        strategy_cls = self._load_strategy(task.strategy.kind)
-        strategy = strategy_cls(task.strategy.config)
 
         async with self._governor(run):
             try:
@@ -500,9 +511,11 @@ class Runtime:
             velocity_monitor=velocity_monitor,
         )
         self._governor_ref = gov
-        async with gov:
-            yield
-        self._governor_ref = None
+        try:
+            async with gov:
+                yield
+        finally:
+            self._governor_ref = None
 
     # ---------------------------------------------------------------
     # Loading
@@ -619,16 +632,19 @@ class Runtime:
 
     @staticmethod
     def _load_strategy(kind: str) -> Any:
-        # Look up via entry points
-        for ep in importlib.metadata.entry_points(group="horizonx.strategies"):
+        entry_points = list(
+            importlib.metadata.entry_points(group="horizonx.strategies")
+        )
+        for ep in entry_points:
             if ep.name == kind:
                 return ep.load()
-        # Fallback to direct import (for dev without install)
-        module = importlib.import_module(f"horizonx.strategies.{kind}")
-        # First class in module that ends with strategy-ish names
-        for name in dir(module):
-            cls = getattr(module, name)
-            if isinstance(cls, type) and name not in ("Strategy", "BaseModel", "Path"):
-                if hasattr(cls, "execute"):
-                    return cls
-        raise ValueError(f"unknown strategy: {kind}")
+        target = _BUILTIN_STRATEGIES.get(kind)
+        if target is not None:
+            module_name, object_name = target.split(":", maxsplit=1)
+            return getattr(importlib.import_module(module_name), object_name)
+        available = sorted(
+            _BUILTIN_STRATEGIES.keys() | {entry.name for entry in entry_points}
+        )
+        raise ValueError(
+            f"unknown strategy {kind!r}; available: {', '.join(available)}"
+        )

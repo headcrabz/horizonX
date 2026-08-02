@@ -14,10 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.event_bus import Event
 from horizonx.core.types import Run, RunStatus, SessionStatus, StrategyOutcome
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 RALPH_PROMPT_TEMPLATE = """\
 Iteration {iter_index} — {iters_left} iterations and {minutes_left} minutes remaining.
@@ -87,8 +86,6 @@ class RalphLoop:
                 (self.total_minutes * 60 - (time.monotonic() - start)) / max(1, self.fixed_minutes_per_iter * 60)
             )
             minutes_left = round((self.total_minutes * 60 - (time.monotonic() - start)) / 60, 1)
-            session = await rt.start_session(run, target_goal=None)
-
             prompt = RALPH_PROMPT_TEMPLATE.format(
                 iter_index=iter_index,
                 current_metric=best,
@@ -99,46 +96,23 @@ class RalphLoop:
                 user_prompt=run.task.prompt,
             )
 
-            agent = _build_agent(run.task.agent)
-            cancel_token = CancelToken()
+            attempt = await AttemptExecutor(rt).execute(
+                run,
+                prompt=prompt,
+                workspace_path=workspace,
+                timeout_seconds=self.fixed_minutes_per_iter * 60 * 1.5,
+            )
+            result = attempt.agent
 
-            _session = session
-
-            async def on_step(step: Any, _s: Any = _session) -> None:
-                step.session_id = _s.id
-                await rt.record_step(_s, step)
-
-            ws = Workspace(path=workspace, env=rt.workspace_env(run))
-
-            try:
-                result = await asyncio.wait_for(
-                    agent.run_session(
-                        session_prompt=prompt,
-                        workspace=ws,
-                        on_step=on_step,
-                        cancel_token=cancel_token,
-                        session_id=session.id,
-                    ),
-                    timeout=self.fixed_minutes_per_iter * 60 * 1.5,
-                )
-                if result.agent_session_id:
-                    session.agent_session_id = result.agent_session_id
-            except TimeoutError:
-                cancel_token.cancel("iteration timeout")
-                result = None
-
-            if result is None:
+            if attempt.status == SessionStatus.TIMEOUT:
                 timed_out_iterations += 1
-                await rt.end_session(session, SessionStatus.TIMEOUT)
                 yield Event(
                     type="retry.attempted",
                     run_id=run.id,
                     payload={"iter": iter_index, "reason": "iteration_timeout"},
                 )
                 continue
-            rt.charge(result)
-            await rt.end_session(session, result.status or SessionStatus.COMPLETED)
-            if result.status != SessionStatus.COMPLETED:
+            if not attempt.succeeded:
                 yield StrategyOutcome(
                     status=(
                         RunStatus.TIMED_OUT

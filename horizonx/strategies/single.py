@@ -8,10 +8,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from horizonx.agents.base import Workspace
+from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.event_bus import Event
 from horizonx.core.types import Run, RunStatus, SessionStatus, StrategyOutcome
-from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 
 class SingleSession:
@@ -21,35 +20,20 @@ class SingleSession:
         self.config = config
 
     async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
-        session = await rt.start_session(run, target_goal=None)
-        agent = _build_agent(run.task.agent)
-
-        async def on_step(step: Any) -> None:
-            step.session_id = session.id
-            await rt.record_step(session, step)
-
-        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
-        result = await agent.run_session(
-            session_prompt=run.task.prompt,
-            workspace=workspace,
-            on_step=on_step,
-            session_id=session.id,
+        attempt = await AttemptExecutor(rt).execute(
+            run,
+            prompt=run.task.prompt,
         )
-        if result.agent_session_id:
-            session.agent_session_id = result.agent_session_id
-
-        rt.charge(result)
-        await rt.end_session(session, result.status or SessionStatus.COMPLETED)
-        if result.status != SessionStatus.COMPLETED:
+        if not attempt.succeeded:
             terminal_status = (
                 RunStatus.TIMED_OUT
-                if result.status == SessionStatus.TIMEOUT
+                if attempt.status == SessionStatus.TIMEOUT
                 else RunStatus.FAILED
             )
             yield StrategyOutcome(
                 status=terminal_status,
-                reason=f"agent_{result.status.value}",
-                details={"error": result.error},
+                reason=f"agent_{attempt.status.value}",
+                details={"error": attempt.agent.error},
             )
             return
         yield StrategyOutcome(status=RunStatus.COMPLETED)

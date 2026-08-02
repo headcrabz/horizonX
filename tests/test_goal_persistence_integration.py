@@ -122,7 +122,7 @@ async def test_sequential_persists_graph_before_first_claim(tmp_path: Path) -> N
     )
     try:
         agent = MockAgent(steps=[])
-        with patch("horizonx.strategies.sequential._build_agent", return_value=agent):
+        with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
             run = await asyncio.wait_for(runtime.run(task), timeout=2)
         persisted = await store.load_graph(run.id)
 
