@@ -6,25 +6,162 @@ See docs/LONG_HORIZON_AGENT.md §17 for the schema.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
+import platform
 import sqlite3
+import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from horizonx.core.types import (
     GateDecision,
     GoalNode,
+    GoalStatus,
     Run,
     Session,
     SpinReport,
     Step,
     ValidatorConfig,
+    utcnow,
+)
+from horizonx.storage.migrations import (
+    prepare_schema,
+    read_schema_version,
+    record_current_schema,
 )
 
 _T = TypeVar("_T")
+
+if TYPE_CHECKING:
+    from horizonx.core.goal_graph import GoalGraph
+
+
+class StoreError(RuntimeError):
+    """Base class for typed operational store failures."""
+
+
+class StoreBusyError(StoreError):
+    """Raised after SQLite remains locked for the configured busy timeout."""
+
+
+class GoalTransitionError(StoreError):
+    """Raised when a requested goal status transition is not allowed."""
+
+
+class GoalVersionConflict(StoreError):
+    """Raised when optimistic goal version preconditions do not match."""
+
+
+_ALLOWED_GOAL_TRANSITIONS: dict[GoalStatus, frozenset[GoalStatus]] = {
+    GoalStatus.PENDING: frozenset(
+        {GoalStatus.IN_PROGRESS, GoalStatus.BLOCKED, GoalStatus.SKIPPED}
+    ),
+    GoalStatus.IN_PROGRESS: frozenset(
+        {GoalStatus.PENDING, GoalStatus.DONE, GoalStatus.FAILED, GoalStatus.BLOCKED}
+    ),
+    GoalStatus.BLOCKED: frozenset({GoalStatus.PENDING, GoalStatus.FAILED}),
+    GoalStatus.DONE: frozenset(),
+    GoalStatus.FAILED: frozenset(),
+    GoalStatus.SKIPPED: frozenset(),
+}
+
+
+def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
+_NETWORK_FILESYSTEMS = frozenset(
+    {
+        "9p",
+        "afpfs",
+        "cifs",
+        "davfs",
+        "fuse.sshfs",
+        "nfs",
+        "nfs4",
+        "smbfs",
+    }
+)
+
+
+def _existing_parent(path: Path) -> Path:
+    candidate = path.expanduser().resolve(strict=False)
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def _unescape_mount_path(value: str) -> str:
+    for escaped, character in (
+        ("\\040", " "),
+        ("\\011", "\t"),
+        ("\\012", "\n"),
+        ("\\134", "\\"),
+    ):
+        value = value.replace(escaped, character)
+    return value
+
+
+def _filesystem_type(path: Path) -> str | None:
+    """Return the containing filesystem type when the platform exposes it."""
+    existing = _existing_parent(path)
+    system = platform.system()
+    if system == "Linux":
+        try:
+            entries: list[tuple[int, str]] = []
+            with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+                for line in mountinfo:
+                    left, separator, right = line.partition(" - ")
+                    if not separator:
+                        continue
+                    fields = left.split()
+                    details = right.split()
+                    if len(fields) < 5 or not details:
+                        continue
+                    mount_point = _unescape_mount_path(fields[4])
+                    try:
+                        common = os.path.commonpath((str(existing), mount_point))
+                    except ValueError:
+                        continue
+                    if common == mount_point:
+                        entries.append((len(mount_point), details[0]))
+            return max(entries)[1] if entries else None
+        except OSError:
+            return None
+    if system == "Darwin":
+        try:
+            result = subprocess.run(
+                ["stat", "-f", "%T", str(existing)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    return None
+
+
+def _assert_local_database_path(db_path: str | Path) -> None:
+    raw = str(db_path)
+    if raw == ":memory:":
+        raise StoreError(
+            "SqliteStore requires a file-backed database for durable async operations"
+        )
+    if raw.startswith(("//", "\\\\", "smb://", "nfs://", "afp://")):
+        raise StoreError("SQLite database must be on a local filesystem")
+    filesystem = _filesystem_type(Path(raw))
+    if filesystem is not None and filesystem.lower() in _NETWORK_FILESYSTEMS:
+        raise StoreError(
+            "SQLite database must be on a local filesystem; "
+            f"detected {filesystem}"
+        )
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS runs (
@@ -70,22 +207,38 @@ CREATE TABLE IF NOT EXISTS steps (
 CREATE INDEX IF NOT EXISTS idx_steps_session ON steps(session_id, sequence);
 
 CREATE TABLE IF NOT EXISTS goals (
-    id                       TEXT PRIMARY KEY,
     run_id                   TEXT NOT NULL,
-    parent_id                TEXT,
+    id                       TEXT NOT NULL,
     name                     TEXT NOT NULL,
     description              TEXT NOT NULL,
     verification_criteria    TEXT NOT NULL,
     status                   TEXT NOT NULL,
     attempts                 INTEGER NOT NULL DEFAULT 0,
+    max_attempts             INTEGER NOT NULL DEFAULT 3,
+    progress_pct             REAL NOT NULL DEFAULT 0.0,
+    version                  INTEGER NOT NULL DEFAULT 0,
     notes                    TEXT,
     last_updated_at          TEXT NOT NULL,
     last_updated_by_session  TEXT,
     assigned_to_session      TEXT,
     validators               TEXT,
-    inherit_validators       INTEGER NOT NULL DEFAULT 1
+    inherit_validators       INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (run_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_goals_run ON goals(run_id, status);
+
+CREATE TABLE IF NOT EXISTS goal_edges (
+    run_id       TEXT NOT NULL,
+    from_goal_id TEXT NOT NULL,
+    to_goal_id   TEXT NOT NULL,
+    edge_type    TEXT NOT NULL CHECK (edge_type IN ('parent', 'dependency')),
+    position     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, from_goal_id, to_goal_id, edge_type),
+    FOREIGN KEY (run_id, from_goal_id) REFERENCES goals(run_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id, to_goal_id) REFERENCES goals(run_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_goal_edges_to
+    ON goal_edges(run_id, to_goal_id, edge_type);
 
 CREATE TABLE IF NOT EXISTS validations (
     id           TEXT PRIMARY KEY,
@@ -142,8 +295,10 @@ CREATE INDEX IF NOT EXISTS idx_workspace_usage ON workspace_usage(workspace_id, 
 """
 
 
-def _apply_wal(conn: sqlite3.Connection) -> None:
-    """Enable WAL mode for better concurrent read/write performance."""
+def _configure_connection(conn: sqlite3.Connection, busy_timeout_ms: int) -> None:
+    """Apply the required safety and concurrency policy to every connection."""
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
 
@@ -155,30 +310,21 @@ class SqliteStore:
     at a time. This avoids blocking the asyncio event loop on DB operations.
     """
 
-    def __init__(self, db_path: str | Path = "horizonx.db"):
+    def __init__(self, db_path: str | Path = "horizonx.db", *, busy_timeout_ms: int = 5000):
+        if not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 0:
+            raise ValueError("busy_timeout_ms must be a non-negative integer")
+        _assert_local_database_path(db_path)
         self.db_path = str(db_path)
+        self.busy_timeout_ms = busy_timeout_ms
         # Single worker — SQLite serialises writes; more workers add contention
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sqlite")
         self._sync_init_schema()
 
     def _sync_init_schema(self) -> None:
         with self._conn() as c:
-            _apply_wal(c)
+            prepare_schema(c)
             c.executescript(SCHEMA)
-            # Migration: add assigned_to_session to existing DBs that predate HX-20
-            try:
-                c.execute("ALTER TABLE goals ADD COLUMN assigned_to_session TEXT")
-            except Exception:
-                pass  # column already exists
-            # Migration: add validators / inherit_validators to DBs that predate GE-03
-            try:
-                c.execute("ALTER TABLE goals ADD COLUMN validators TEXT")
-            except Exception:
-                pass  # column already exists
-            try:
-                c.execute("ALTER TABLE goals ADD COLUMN inherit_validators INTEGER NOT NULL DEFAULT 1")
-            except Exception:
-                pass  # column already exists
+            record_current_schema(c)
 
     async def _run_sync(self, fn: Callable[..., _T], *args: Any) -> _T:
         loop = asyncio.get_running_loop()
@@ -187,13 +333,137 @@ class SqliteStore:
     async def close(self) -> None:
         self._executor.shutdown(wait=True)
 
+    def _sync_schema_version(self) -> int:
+        with self._conn() as c:
+            return read_schema_version(c)
+
+    async def schema_version(self) -> int:
+        return await self._run_sync(self._sync_schema_version)
+
+    def _sync_connection_settings(self) -> dict[str, int | str]:
+        with self._conn() as c:
+            return {
+                "foreign_keys": int(c.execute("PRAGMA foreign_keys").fetchone()[0]),
+                "busy_timeout": int(c.execute("PRAGMA busy_timeout").fetchone()[0]),
+                "journal_mode": str(c.execute("PRAGMA journal_mode").fetchone()[0]),
+                "synchronous": int(c.execute("PRAGMA synchronous").fetchone()[0]),
+            }
+
+    async def connection_settings(self) -> dict[str, int | str]:
+        """Report the effective safety policy of a fresh store connection."""
+        return await self._run_sync(self._sync_connection_settings)
+
+    def _sync_integrity_check(self) -> list[str]:
+        with self._conn() as c:
+            rows = c.execute("PRAGMA integrity_check").fetchall()
+        return [str(row[0]) for row in rows]
+
+    async def integrity_check(self) -> list[str]:
+        return await self._run_sync(self._sync_integrity_check)
+
+    def _sync_checkpoint(self) -> tuple[int, int, int]:
+        with self._conn() as c:
+            row = c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if row is None:  # pragma: no cover - SQLite always returns one row
+            raise StoreError("WAL checkpoint returned no result")
+        return int(row[0]), int(row[1]), int(row[2])
+
+    async def checkpoint(self) -> tuple[int, int, int]:
+        return await self._run_sync(self._sync_checkpoint)
+
+    def _sync_state_digest(self) -> str:
+        with self._conn() as c:
+            tables = [
+                row["name"]
+                for row in c.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                ).fetchall()
+            ]
+            state: dict[str, list[str]] = {}
+            for table in tables:
+                quoted_table = table.replace('"', '""')
+                rows = c.execute(f'SELECT * FROM "{quoted_table}"').fetchall()
+                state[table] = sorted(
+                    json.dumps(dict(row), sort_keys=True, default=str) for row in rows
+                )
+        payload = json.dumps(state, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    async def state_digest(self) -> str:
+        """Return a deterministic digest of logical user-table contents."""
+        return await self._run_sync(self._sync_state_digest)
+
+    def _sync_backup(self, destination: Path) -> None:
+        if destination.resolve(strict=False) == Path(self.db_path).resolve(strict=False):
+            raise StoreError("backup destination must be a different path")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000)
+        target = sqlite3.connect(destination)
+        try:
+            _configure_connection(source, self.busy_timeout_ms)
+            _configure_connection(target, self.busy_timeout_ms)
+            source.backup(target)
+            target.commit()
+            result = target.execute("PRAGMA integrity_check").fetchall()
+            if [str(row[0]) for row in result] != ["ok"]:
+                raise StoreError(f"backup integrity check failed: {result}")
+        finally:
+            target.close()
+            source.close()
+
+    async def backup(self, destination: str | Path) -> Path:
+        path = Path(destination)
+        await self._run_sync(self._sync_backup, path)
+        return path
+
+    def _sync_restore(self, source_path: Path) -> None:
+        if source_path.resolve(strict=False) == Path(self.db_path).resolve(strict=False):
+            raise StoreError("restore source must be a different path")
+        if not source_path.is_file():
+            raise FileNotFoundError(source_path)
+        source = sqlite3.connect(source_path)
+        target = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000)
+        try:
+            _configure_connection(source, self.busy_timeout_ms)
+            _configure_connection(target, self.busy_timeout_ms)
+            source_result = source.execute("PRAGMA integrity_check").fetchall()
+            if [str(row[0]) for row in source_result] != ["ok"]:
+                raise StoreError(f"restore source integrity check failed: {source_result}")
+            source.backup(target)
+            target.commit()
+            prepare_schema(target)
+            target.executescript(SCHEMA)
+            record_current_schema(target)
+            target.commit()
+            target_result = target.execute("PRAGMA integrity_check").fetchall()
+            if [str(row[0]) for row in target_result] != ["ok"]:
+                raise StoreError(f"restored database integrity check failed: {target_result}")
+        finally:
+            target.close()
+            source.close()
+
+    async def restore(self, source: str | Path) -> None:
+        await self._run_sync(self._sync_restore, Path(source))
+
     @contextmanager
     def _conn(self):  # type: ignore[no-untyped-def]
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000)
         conn.row_factory = sqlite3.Row
         try:
+            _configure_connection(conn, self.busy_timeout_ms)
             yield conn
             conn.commit()
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if _is_busy_error(exc):
+                raise StoreBusyError(
+                    f"database remained busy for {self.busy_timeout_ms}ms"
+                ) from exc
+            raise
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -358,44 +628,266 @@ class SqliteStore:
     # Goals
     # ------------------------------------------------------------------
 
-    def _sync_save_goal(self, run_id: str, g: GoalNode) -> None:
-        with self._conn() as c:
-            c.execute(
-                """\
-                INSERT INTO goals (id, run_id, parent_id, name, description, verification_criteria,
-                                   status, attempts, notes, last_updated_at, last_updated_by_session,
-                                   assigned_to_session, validators, inherit_validators)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET
+    def _upsert_goal_row(
+        self, c: sqlite3.Connection, run_id: str, g: GoalNode
+    ) -> None:
+        c.execute(
+            """\
+                INSERT INTO goals (run_id, id, name, description, verification_criteria,
+                                   status, attempts, max_attempts, progress_pct, version, notes,
+                                   last_updated_at, last_updated_by_session, assigned_to_session,
+                                   validators, inherit_validators)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(run_id, id) DO UPDATE SET
+                    name=excluded.name,
+                    description=excluded.description,
+                    verification_criteria=excluded.verification_criteria,
                     status=excluded.status,
                     attempts=excluded.attempts,
+                    max_attempts=excluded.max_attempts,
+                    progress_pct=excluded.progress_pct,
+                    version=excluded.version,
                     notes=excluded.notes,
                     last_updated_at=excluded.last_updated_at,
                     last_updated_by_session=excluded.last_updated_by_session,
                     assigned_to_session=excluded.assigned_to_session,
                     validators=excluded.validators,
                     inherit_validators=excluded.inherit_validators
-                """,
-                (
-                    g.id,
-                    run_id,
-                    g.parent_id,
-                    g.name,
-                    g.description,
-                    json.dumps(g.verification_criteria),
-                    g.status.value,
-                    g.attempts,
-                    g.notes,
-                    g.last_updated_at.isoformat(),
-                    g.last_updated_by_session,
-                    g.assigned_to_session,
-                    json.dumps([v.model_dump(mode="json") for v in g.validators]),
-                    1 if g.inherit_validators else 0,
-                ),
+            """,
+            (
+                run_id,
+                g.id,
+                g.name,
+                g.description,
+                json.dumps(g.verification_criteria),
+                g.status.value,
+                g.attempts,
+                g.max_attempts,
+                g.progress_pct,
+                g.version,
+                g.notes,
+                g.last_updated_at.isoformat(),
+                g.last_updated_by_session,
+                g.assigned_to_session,
+                json.dumps([v.model_dump(mode="json") for v in g.validators]),
+                1 if g.inherit_validators else 0,
+            ),
+        )
+
+    def _replace_goal_edges(
+        self, c: sqlite3.Connection, run_id: str, g: GoalNode
+    ) -> None:
+        c.execute(
+            "DELETE FROM goal_edges WHERE run_id=? AND to_goal_id=? "
+            "AND edge_type IN ('parent', 'dependency')",
+            (run_id, g.id),
+        )
+        if g.parent_id is not None:
+            c.execute(
+                "INSERT INTO goal_edges (run_id, from_goal_id, to_goal_id, edge_type) "
+                "VALUES (?, ?, ?, 'parent')",
+                (run_id, g.parent_id, g.id),
             )
+        c.executemany(
+            "INSERT INTO goal_edges "
+            "(run_id, from_goal_id, to_goal_id, edge_type, position) "
+            "VALUES (?, ?, ?, 'dependency', ?)",
+            [
+                (run_id, dependency_id, g.id, position)
+                for position, dependency_id in enumerate(g.depends_on)
+            ],
+        )
+
+    def _sync_save_goal(self, run_id: str, g: GoalNode) -> None:
+        with self._conn() as c:
+            self._upsert_goal_row(c, run_id, g)
+            self._replace_goal_edges(c, run_id, g)
 
     async def save_goal(self, run_id: str, g: GoalNode) -> None:
         return await self._run_sync(self._sync_save_goal, run_id, g)
+
+    def _replace_graph_rows(
+        self, c: sqlite3.Connection, run_id: str, graph: GoalGraph
+    ) -> None:
+        nodes = list(graph.all_nodes())
+        c.execute("DELETE FROM goals WHERE run_id=?", (run_id,))
+        for node in nodes:
+            self._upsert_goal_row(c, run_id, node)
+        for node in nodes:
+            c.executemany(
+                "INSERT INTO goal_edges "
+                "(run_id, from_goal_id, to_goal_id, edge_type, position) "
+                "VALUES (?, ?, ?, 'parent', ?)",
+                [
+                    (run_id, node.id, child_id, position)
+                    for position, child_id in enumerate(node.children)
+                ],
+            )
+            c.executemany(
+                "INSERT INTO goal_edges "
+                "(run_id, from_goal_id, to_goal_id, edge_type, position) "
+                "VALUES (?, ?, ?, 'dependency', ?)",
+                [
+                    (run_id, dependency_id, node.id, position)
+                    for position, dependency_id in enumerate(node.depends_on)
+                ],
+            )
+
+    def _sync_create_graph(self, run_id: str, graph: GoalGraph) -> None:
+        with self._conn() as c:
+            self._replace_graph_rows(c, run_id, graph)
+
+    async def create_graph(self, run_id: str, graph: GoalGraph) -> None:
+        """Atomically replace a run's complete graph in the authoritative store."""
+        return await self._run_sync(self._sync_create_graph, run_id, graph)
+
+    def _sync_replace_pending_subgraph(self, run_id: str, graph: GoalGraph) -> None:
+        with self._conn() as c:
+            existing_nodes = self._list_goals_from_connection(c, run_id)
+            if not existing_nodes:
+                raise KeyError(f"goal graph not found for run: {run_id}")
+            candidates = {node.id: node for node in graph.all_nodes()}
+            for completed in (
+                node for node in existing_nodes if node.status == GoalStatus.DONE
+            ):
+                candidate = candidates.get(completed.id)
+                if (
+                    candidate is None
+                    or candidate.model_dump(mode="json")
+                    != completed.model_dump(mode="json")
+                ):
+                    raise GoalTransitionError(
+                        f"completed goal cannot be removed or rewritten: {completed.id}"
+                    )
+            self._replace_graph_rows(c, run_id, graph)
+
+    async def replace_pending_subgraph(self, run_id: str, graph: GoalGraph) -> None:
+        """Replace unfinished planning while preserving completed nodes exactly."""
+        return await self._run_sync(self._sync_replace_pending_subgraph, run_id, graph)
+
+    def _sync_load_graph(self, run_id: str) -> GoalGraph | None:
+        from horizonx.core.goal_graph import GoalGraph
+
+        nodes = self._sync_list_goals(run_id)
+        if not nodes:
+            return None
+        return GoalGraph({node.id: node for node in nodes})
+
+    async def load_graph(self, run_id: str) -> GoalGraph | None:
+        return await self._run_sync(self._sync_load_graph, run_id)
+
+    def _sync_ensure_goal_projection(self, run_id: str, path: Path) -> bool:
+        from horizonx.core.goal_graph import GoalGraph, GoalGraphError
+
+        graph = self._sync_load_graph(run_id)
+        if graph is None:
+            raise KeyError(f"goal graph not found for run: {run_id}")
+        try:
+            projected = GoalGraph.load(path)
+            current = {
+                node.id: node.model_dump(mode="json") for node in graph.all_nodes()
+            }
+            existing = {
+                node.id: node.model_dump(mode="json") for node in projected.all_nodes()
+            }
+            if existing == current:
+                return False
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, GoalGraphError, ValueError):
+            pass
+        graph.save(path)
+        return True
+
+    async def ensure_goal_projection(self, run_id: str, path: Path) -> bool:
+        """Regenerate a missing, corrupt, or stale JSON projection from SQLite."""
+        return await self._run_sync(self._sync_ensure_goal_projection, run_id, path)
+
+    def _sync_transition_goal(
+        self,
+        run_id: str,
+        goal_id: str,
+        expected_version: int,
+        to_status: GoalStatus,
+        session_id: str | None,
+    ) -> GoalNode:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT status, version FROM goals WHERE run_id=? AND id=?",
+                (run_id, goal_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"goal not found: {run_id}/{goal_id}")
+            current_status = GoalStatus(row["status"])
+            current_version = int(row["version"])
+            if current_version != expected_version:
+                raise GoalVersionConflict(
+                    f"goal version conflict for {run_id}/{goal_id}: "
+                    f"expected {expected_version}, found {current_version}"
+                )
+            if to_status not in _ALLOWED_GOAL_TRANSITIONS[current_status]:
+                raise GoalTransitionError(
+                    f"invalid goal transition for {run_id}/{goal_id}: "
+                    f"{current_status.value} -> {to_status.value}"
+                )
+
+            entering_progress = to_status == GoalStatus.IN_PROGRESS
+            leaving_progress = to_status in {
+                GoalStatus.PENDING,
+                GoalStatus.DONE,
+                GoalStatus.FAILED,
+                GoalStatus.BLOCKED,
+                GoalStatus.SKIPPED,
+            }
+            cur = c.execute(
+                """
+                UPDATE goals
+                SET status=?,
+                    version=version + 1,
+                    attempts=attempts + ?,
+                    progress_pct=CASE WHEN ? = 'done' THEN 100.0 ELSE progress_pct END,
+                    assigned_to_session=?,
+                    last_updated_at=?,
+                    last_updated_by_session=?
+                WHERE run_id=? AND id=? AND version=?
+                """,
+                (
+                    to_status.value,
+                    1 if entering_progress else 0,
+                    to_status.value,
+                    None if leaving_progress else session_id,
+                    utcnow().isoformat(),
+                    session_id,
+                    run_id,
+                    goal_id,
+                    expected_version,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise GoalVersionConflict(
+                    f"goal version changed while transitioning {run_id}/{goal_id}"
+                )
+        goal = self._sync_load_goal(run_id, goal_id)
+        if goal is None:  # pragma: no cover - protected by the transaction above
+            raise KeyError(f"goal not found after transition: {run_id}/{goal_id}")
+        return goal
+
+    async def transition_goal(
+        self,
+        run_id: str,
+        goal_id: str,
+        *,
+        expected_version: int,
+        to_status: GoalStatus,
+        session_id: str | None = None,
+    ) -> GoalNode:
+        """Apply an allowed optimistic goal transition atomically."""
+        return await self._run_sync(
+            self._sync_transition_goal,
+            run_id,
+            goal_id,
+            expected_version,
+            to_status,
+            session_id,
+        )
 
     def _sync_claim_goal(self, run_id: str, goal_id: str, session_id: str) -> bool:
         """Atomically claim a PENDING goal for a session.
@@ -404,20 +896,30 @@ class SqliteStore:
         same leaf. Returns True if this session won the claim, False if another
         session already claimed or the goal is no longer PENDING.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000)
+        _configure_connection(conn, self.busy_timeout_ms)
         try:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
-                "UPDATE goals SET assigned_to_session=?, status='in_progress' "
+                "UPDATE goals SET assigned_to_session=?, status='in_progress', "
+                "attempts=attempts + 1, version=version + 1, "
+                "last_updated_at=?, last_updated_by_session=? "
                 "WHERE id=? AND run_id=? AND status='pending' AND assigned_to_session IS NULL",
-                (session_id, goal_id, run_id),
+                (session_id, utcnow().isoformat(), session_id, goal_id, run_id),
             )
             claimed = cur.rowcount == 1
             conn.commit()
             return claimed
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if _is_busy_error(exc):
+                raise StoreBusyError(
+                    f"database remained busy for {self.busy_timeout_ms}ms"
+                ) from exc
+            raise
         except Exception:
             conn.rollback()
-            return False
+            raise
         finally:
             conn.close()
 
@@ -442,25 +944,51 @@ class SqliteStore:
             row = c.execute(
                 "SELECT * FROM goals WHERE run_id=? AND id=?", (run_id, goal_id)
             ).fetchone()
-        if not row:
-            return None
-        row_keys = row.keys()
-        raw_validators = row["validators"] if "validators" in row_keys else None
-        raw_inherit = row["inherit_validators"] if "inherit_validators" in row_keys else 1
+            if not row:
+                return None
+            edges = c.execute(
+                "SELECT from_goal_id, to_goal_id, edge_type FROM goal_edges "
+                "WHERE run_id=? AND (from_goal_id=? OR to_goal_id=?) "
+                "ORDER BY edge_type, position",
+                (run_id, goal_id, goal_id),
+            ).fetchall()
+        parent_id = next(
+            (
+                edge["from_goal_id"]
+                for edge in edges
+                if edge["edge_type"] == "parent" and edge["to_goal_id"] == goal_id
+            ),
+            None,
+        )
+        children = [
+            edge["to_goal_id"]
+            for edge in edges
+            if edge["edge_type"] == "parent" and edge["from_goal_id"] == goal_id
+        ]
+        depends_on = [
+            edge["from_goal_id"]
+            for edge in edges
+            if edge["edge_type"] == "dependency" and edge["to_goal_id"] == goal_id
+        ]
         return GoalNode(
             id=row["id"],
-            parent_id=row["parent_id"],
+            parent_id=parent_id,
             name=row["name"],
             description=row["description"],
             verification_criteria=json.loads(row["verification_criteria"]),
             status=GoalStatus(row["status"]),
+            children=children,
+            depends_on=depends_on,
             attempts=row["attempts"],
+            max_attempts=row["max_attempts"],
+            progress_pct=row["progress_pct"],
+            version=row["version"],
             notes=row["notes"] or "",
             last_updated_at=row["last_updated_at"],
             last_updated_by_session=row["last_updated_by_session"],
-            assigned_to_session=row["assigned_to_session"] if "assigned_to_session" in row_keys else None,
-            validators=[ValidatorConfig(**v) for v in json.loads(raw_validators or "[]")],
-            inherit_validators=bool(raw_inherit) if raw_inherit is not None else True,
+            assigned_to_session=row["assigned_to_session"],
+            validators=[ValidatorConfig(**v) for v in json.loads(row["validators"] or "[]")],
+            inherit_validators=bool(row["inherit_validators"]),
         )
 
     async def load_goal(self, run_id: str, goal_id: str) -> GoalNode | None:
@@ -647,44 +1175,68 @@ class SqliteStore:
     ) -> list[Step]:
         return await self._run_sync(self._sync_list_steps, session_id, limit, after_sequence)
 
-    def _sync_list_goals(self, run_id: str) -> list[GoalNode]:
+    def _list_goals_from_connection(
+        self, c: sqlite3.Connection, run_id: str
+    ) -> list[GoalNode]:
         from horizonx.core.types import GoalStatus
 
-        with self._conn() as c:
-            rows = c.execute(
-                "SELECT * FROM goals WHERE run_id=? ORDER BY id",
-                (run_id,),
-            ).fetchall()
+        rows = c.execute(
+            "SELECT * FROM goals WHERE run_id=? ORDER BY id",
+            (run_id,),
+        ).fetchall()
+        edges = c.execute(
+            "SELECT from_goal_id, to_goal_id, edge_type FROM goal_edges "
+            "WHERE run_id=? ORDER BY edge_type, position",
+            (run_id,),
+        ).fetchall()
         nodes = []
         for row in rows:
-            row_keys = row.keys()
-            raw_validators = row["validators"] if "validators" in row_keys else None
-            raw_inherit = row["inherit_validators"] if "inherit_validators" in row_keys else 1
+            goal_id = row["id"]
+            parent_id = next(
+                (
+                    edge["from_goal_id"]
+                    for edge in edges
+                    if edge["edge_type"] == "parent" and edge["to_goal_id"] == goal_id
+                ),
+                None,
+            )
             nodes.append(
                 GoalNode(
-                    id=row["id"],
-                    parent_id=row["parent_id"],
+                    id=goal_id,
+                    parent_id=parent_id,
                     name=row["name"],
                     description=row["description"],
                     verification_criteria=json.loads(row["verification_criteria"] or "[]"),
                     status=GoalStatus(row["status"]),
+                    children=[
+                        edge["to_goal_id"]
+                        for edge in edges
+                        if edge["edge_type"] == "parent"
+                        and edge["from_goal_id"] == goal_id
+                    ],
+                    depends_on=[
+                        edge["from_goal_id"]
+                        for edge in edges
+                        if edge["edge_type"] == "dependency"
+                        and edge["to_goal_id"] == goal_id
+                    ],
                     attempts=row["attempts"],
+                    max_attempts=row["max_attempts"],
+                    progress_pct=row["progress_pct"],
+                    version=row["version"],
                     notes=row["notes"] or "",
                     last_updated_at=row["last_updated_at"],
                     last_updated_by_session=row["last_updated_by_session"],
                     assigned_to_session=row["assigned_to_session"],
-                    validators=[ValidatorConfig(**v) for v in json.loads(raw_validators or "[]")],
-                    inherit_validators=bool(raw_inherit) if raw_inherit is not None else True,
+                    validators=[ValidatorConfig(**v) for v in json.loads(row["validators"] or "[]")],
+                    inherit_validators=bool(row["inherit_validators"]),
                 )
             )
-        # Reconstruct children from parent_id relationships
-        id_to_node = {n.id: n for n in nodes}
-        for node in nodes:
-            if node.parent_id and node.parent_id in id_to_node:
-                parent = id_to_node[node.parent_id]
-                if node.id not in parent.children:
-                    parent.children.append(node.id)
         return nodes
+
+    def _sync_list_goals(self, run_id: str) -> list[GoalNode]:
+        with self._conn() as c:
+            return self._list_goals_from_connection(c, run_id)
 
     async def list_goals(self, run_id: str) -> list[GoalNode]:
         return await self._run_sync(self._sync_list_goals, run_id)

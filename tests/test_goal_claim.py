@@ -1,4 +1,4 @@
-"""Tests for HX-20: atomic goal claim semantics."""
+"""Tests for atomic goal claim semantics."""
 from __future__ import annotations
 
 import asyncio

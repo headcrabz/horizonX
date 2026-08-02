@@ -1,15 +1,17 @@
 """Durable hierarchical goal graph.
 
-The single source of truth for what's happening in a run. Stored as
-goals.json in the workspace and mirrored to the goals table.
+SQLite is the orchestration source of truth. ``goals.json`` is an atomic,
+human-readable projection used for agent handoffs.
 See docs/LONG_HORIZON_AGENT.md §12.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterable
 from pathlib import Path
+from uuid import uuid4
 
 from horizonx.core.types import GoalNode, GoalStatus, ValidatorConfig, utcnow
 
@@ -60,7 +62,16 @@ class GoalGraph:
             "root": self.ROOT_ID,
             "nodes": {nid: n.model_dump(mode="json") for nid, n in self._nodes.items()},
         }
-        path.write_text(json.dumps(data, indent=2, default=str))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("w") as handle:
+                json.dump(data, handle, indent=2, default=str)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # Queries

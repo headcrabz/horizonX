@@ -14,7 +14,7 @@ hardened. It is suitable for local evaluation and development—not unattended o
 [![CI](https://github.com/headcrabz/horizonX/actions/workflows/ci.yml/badge.svg)](https://github.com/headcrabz/horizonX/actions)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Tests: 341 passing](https://img.shields.io/badge/tests-341%20passing-brightgreen.svg)](tests/)
+[![Tests: 365 passing](https://img.shields.io/badge/tests-365%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -326,11 +326,11 @@ focused tests; it does not imply a verified production guarantee.
 | Capability | Alpha status | Current boundary |
 |---|---|---|
 | Python models, registries, and plugin entry points | Implemented | Third-party agent and validator names are supported; third-party strategy names are blocked by the current config schema. |
-| CLI `run`, `show`, `list`, `watch`, `fork`, `export`, `serve` | Implemented | Everyday `init/status/attach/steer/cancel/resume/evidence/doctor` workflow is planned. |
-| SQLite run/session/step persistence | Implemented, local-only | Goal authority, migrations, foreign keys, contention handling, integrity, backup, and restore need hardening. Use one local HorizonX daemon. |
+| CLI execution, inspection, dashboard, and database maintenance | Implemented subset | `run`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint` are available; broader operator workflows are planned. |
+| SQLite orchestration persistence | Implemented, local-only | Run-scoped goal identity, migrations, foreign keys, bounded contention, integrity checks, backup, restore, and atomic goal transitions are implemented. Use one local HorizonX daemon and keep the database on a local filesystem. |
 | Claude Code, Codex, OpenHands, custom, and SDK drivers | Experimental | CLI transports exist; structured native transports, capability negotiation, and cross-provider parity are not verified. |
 | Eight execution strategy modules | Experimental | Lifecycle, failure, validator, budget, cleanup, and recovery behavior is not yet uniform. |
-| Goal graph and six validator types | Experimental | SQLite and `goals.json` can disagree; terminal-state and evidence semantics need hardening. |
+| Goal graph and six validator types | Experimental | SQLite is authoritative and `goals.json` is an atomic human-readable projection; terminal-state and evidence semantics still need hardening. |
 | Resume and dashboard pending-run recovery | Under hardening | Resume is session-boundary oriented; a crash can lose provider resume state or strand a pending run. Exact crash-point recovery is not claimed. |
 | Seven spin-detection components | Under hardening | The sequential path invokes the combined detector; universal wiring and configured response behavior are not yet verified. |
 | Resource governor and usage store | Under hardening | Enforcement and accounting are not uniform across strategies/providers; unknown provider cost must not be interpreted as zero. |
@@ -339,8 +339,8 @@ focused tests; it does not imply a verified production guarantee.
 | SSE dashboard and JSONL trajectory | Experimental | SSE is in-memory and has no durable cursor/replay guarantee. |
 | Local workspace execution | Experimental | Runs currently materialize an empty local workspace; repository checkout and setup-command semantics need hardening. |
 | Docker, Podman, and E2B execution | Configuration only | Configuration models exist, but non-local environment execution is not wired into the runtime. |
-| Multi-run/multi-worker concurrency | Not supported | Goal identity, leases, and worker coordination must be made durable before concurrent execution is safe. |
-| Automated verification | Implemented | 341 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |
+| Automated verification | Implemented | 365 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
 | Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
 
 Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or

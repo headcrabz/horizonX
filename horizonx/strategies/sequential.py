@@ -25,6 +25,7 @@ from horizonx.core.types import (
     GoalStatus,
     Run,
     SessionStatus,
+    new_session_id,
 )
 
 _BUILTIN_AGENTS: dict[str, str] = {
@@ -72,8 +73,12 @@ class SequentialSubgoals:
             yield Event(type="run.started", run_id=run.id, payload={"phase": "initializer"})
             await self._run_initializer(run, rt)
 
-        # Load (or reload) the graph
-        graph = GoalGraph.load(graph_path)
+        # Commit an initializer-produced graph once, then treat SQLite as authoritative.
+        graph = await rt.store.load_graph(run.id)
+        if graph is None:
+            graph = GoalGraph.load(graph_path)
+            await rt.store.create_graph(run.id, graph)
+        await rt.store.ensure_goal_projection(run.id, graph_path)
 
         # Phase 2 — Iterate sub-goals
         while True:
@@ -82,7 +87,8 @@ class SequentialSubgoals:
                 break  # all done or all blocked
 
             await self._run_goal_session(run, rt, graph, goal)
-            graph.save(graph_path)
+            await rt.store.create_graph(run.id, graph)
+            await rt.store.ensure_goal_projection(run.id, graph_path)
             yield Event(
                 type="goal.in_progress" if goal.status != GoalStatus.DONE else "goal.done",
                 run_id=run.id,
@@ -160,17 +166,17 @@ class SequentialSubgoals:
         # Atomically claim in DB before mutating in-memory graph.
         # Returns False only if a concurrent agent already claimed this goal
         # (shouldn't happen in sequential strategy, but guards future parallel use).
-        claimed = await rt.store.claim_goal(run.id, goal.id, session_id="pending")
+        session_id = new_session_id()
+        claimed = await rt.store.claim_goal(run.id, goal.id, session_id=session_id)
         if not claimed:
             return  # another agent claimed it first; caller will pick next leaf
 
-        graph.mark_in_progress(goal.id, by_session="pending")
-        graph.save(run.workspace_path / "goals.json")
+        graph.mark_in_progress(goal.id, by_session=session_id)
+        goal.assigned_to_session = session_id
+        await rt.store.create_graph(run.id, graph)
+        await rt.store.ensure_goal_projection(run.id, run.workspace_path / "goals.json")
 
-        session = await rt.start_session(run, target_goal=goal)
-        graph.mark_in_progress(goal.id, by_session=session.id)
-        goal.assigned_to_session = session.id
-        graph.save(run.workspace_path / "goals.json")
+        session = await rt.start_session(run, target_goal=goal, session_id=session_id)
         append_task_board(
             run.workspace_path,
             event="claimed",
@@ -227,6 +233,7 @@ class SequentialSubgoals:
 
         if any_abort:
             graph.mark_failed(goal.id, by_session=session.id)
+            goal.assigned_to_session = None
             await rt.store.release_goal(run.id, goal.id)
             append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                               session_id=session.id, agent_type=run.task.agent.type)
@@ -242,6 +249,7 @@ class SequentialSubgoals:
             decision = await rt.request_hitl(run, reason="validator_or_spin", context=ctx)
             if decision.action == "abort":
                 graph.mark_failed(goal.id, by_session=session.id)
+                goal.assigned_to_session = None
                 await rt.store.release_goal(run.id, goal.id)
                 append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                                   session_id=session.id, agent_type=run.task.agent.type)
@@ -250,19 +258,27 @@ class SequentialSubgoals:
             if decision.action == "modify":
                 graph.append_notes(goal.id, f"HITL guidance: {decision.instruction}", by_session=session.id)
             if decision.action == "re_decompose":
-                await self._re_decompose(run, rt, goal, decision.instruction)
+                replaced = await self._re_decompose(
+                    run, rt, goal, decision.instruction
+                )
+                if replaced:
+                    persisted = await rt.store.load_graph(run.id)
+                    if persisted is not None:
+                        graph._nodes = dict(persisted._nodes)
             # Continue the loop (do not mark done)
             await rt.end_session(session, result.status or SessionStatus.COMPLETED)
             return
 
         if all_continue:
             graph.mark_done(goal.id, by_session=session.id)
+            goal.assigned_to_session = None
             await rt.store.release_goal(run.id, goal.id)
             append_task_board(run.workspace_path, event="completed", goal_id=goal.id,
                               session_id=session.id, agent_type=run.task.agent.type)
         else:
             if goal.attempts >= goal.max_attempts:
                 graph.mark_failed(goal.id, by_session=session.id)
+                goal.assigned_to_session = None
                 await rt.store.release_goal(run.id, goal.id)
                 append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                                   session_id=session.id, agent_type=run.task.agent.type)
@@ -270,18 +286,22 @@ class SequentialSubgoals:
         await rt.end_session(session, result.status or SessionStatus.COMPLETED)
 
     # ------------------------------------------------------------------
-    # HITL re-decomposition (HX-10)
+    # HITL re-decomposition
     # ------------------------------------------------------------------
 
-    async def _re_decompose(self, run: Run, rt: Any, current_goal: GoalNode, instruction: str) -> None:
+    async def _re_decompose(
+        self, run: Run, rt: Any, current_goal: GoalNode, instruction: str
+    ) -> bool:
         """LLM-restructures pending/in-progress goals based on operator instruction."""
         import sys
 
         graph_path = run.workspace_path / "goals.json"
-        if not graph_path.exists():
-            return
-
-        graph = GoalGraph.load(graph_path)
+        graph = await rt.store.load_graph(run.id)
+        if graph is None:
+            if not graph_path.exists():
+                return False
+            graph = GoalGraph.load(graph_path)
+            await rt.store.create_graph(run.id, graph)
         done_ids = {nid for nid, n in graph._nodes.items() if n.status.value == "done"}
         restructurable = {
             nid: n.model_dump(mode="json")
@@ -289,7 +309,7 @@ class SequentialSubgoals:
             if n.status.value != "done"
         }
         if not restructurable:
-            return
+            return False
 
         prompt = (
             f"You are restructuring a goal graph for a long-horizon agent task.\n\n"
@@ -337,14 +357,14 @@ class SequentialSubgoals:
                             parent.children.append(nid)
 
                 new_graph = GoalGraph(merged_nodes)
-                new_graph.save(graph_path)
-                for g in new_graph._nodes.values():
-                    await rt.store.save_goal(run.id, g)
+                await rt.store.replace_pending_subgraph(run.id, new_graph)
+                await rt.store.ensure_goal_projection(run.id, graph_path)
                 await rt.bus.publish(Event(
                     type="goals.re_decomposed",
                     run_id=run.id,
                     payload={"instruction": instruction, "new_goal_count": len(new_nodes_raw)},
                 ))
-                return
+                return True
             except Exception as exc:
                 sys.stderr.write(f"[re_decompose] attempt {attempt + 1} failed: {exc}\n")
+        return False

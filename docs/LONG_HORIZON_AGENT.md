@@ -383,10 +383,19 @@ class Runtime:
 The goal graph is HorizonX's answer to **"how do you keep an agent on track for hours?"** It comes from Anthropic's pattern in their long-running-agents article.
 
 ### Philosophy
-- Single source of truth for **what is happening**.
-- Stored as `goals.json` in the run workspace and mirrored to the `goals` table.
-- Agent reads at every session start; writes only `notes` and proposes `status`.
-- Strongly-worded prompts ("only modify the `notes` field of YOUR sub-goal") + structural enforcement (`GoalGraphGate`).
+- SQLite is the single source of truth for **what is happening**.
+- `goals.json` is an atomic, human-readable projection regenerated from committed database state.
+- Agents read the projection at session start and report progress through handoff artifacts; the runtime owns goal transitions.
+- Run-scoped goal identity, first-class graph edges, optimistic versions, and transactional claims prevent cross-run collisions and double claims.
+
+The SQLite backend is for one local HorizonX daemon with one serialized writer. The database must
+reside on a local filesystem; network filesystems are rejected. Multi-worker deployments require a
+server database rather than shared access to the SQLite file.
+
+Goal edges use enforced foreign keys because orphaned graph structure is unsafe. Other operational
+records intentionally keep logical identifiers without cascading foreign keys: steps, validations,
+HITL records, spin reports, and usage may be written during partial recovery and retained as audit
+evidence even when a parent lifecycle record is unavailable.
 
 ### Format
 
@@ -1831,7 +1840,7 @@ Some moments need humans. HorizonX surfaces them and waits.
 
 #### re_decompose
 
-When an operator selects `re_decompose` and provides an instruction (e.g. "split the API goal into separate auth and data layers"), a `claude-haiku` call restructures the pending goal sub-graph. The restructured graph is written to `goals.json` and synced to the DB. `goals.re_decomposed` event fires. Validated DONE nodes are re-attached to their parents in the new structure so no completed work is lost.
+When an operator selects `re_decompose` and provides an instruction (e.g. "split the API goal into separate auth and data layers"), a configured planning model restructures the pending goal sub-graph. The replacement commits transactionally to SQLite, preserves completed nodes exactly, and then regenerates `goals.json`. A `goals.re_decomposed` event fires after the commit.
 
 ### HITL config
 
@@ -2342,7 +2351,7 @@ support matrix is the concise public contract.
 | Area | Status | Boundary |
 |---|---|---|
 | Pydantic task/run/session/config models and registries | Implemented | Strategy names remain a fixed schema literal even though agent and validator registries accept extensions. |
-| Runtime primitives, local SQLite store, and in-memory event bus | Experimental integration | Goal state has competing JSON/DB representations; migrations, contention, recovery, and lifecycle invariants need hardening. |
+| Runtime primitives, local SQLite store, and in-memory event bus | Experimental integration | SQLite now owns goal state with explicit migrations, contention handling, integrity operations, and a JSON projection; recovery and broader lifecycle invariants still need hardening. |
 | Claude Code, Codex, OpenHands, custom subprocess, and SDK drivers | Experimental | Driver modules and focused tests exist; structured transport and cross-provider capability parity are not verified. |
 | Eight strategy modules | Experimental | They do not yet share one executor, failure contract, validator mapping, budget path, or cleanup path. |
 | Goal graph and six validators | Experimental | Graph and validator components exist; terminal-state correctness and evidence-backed completion are not universal. |
@@ -2351,14 +2360,14 @@ support matrix is the concise public contract.
 | FTS5 run/workspace knowledge and Markdown handoff modules | Components only | Cross-run sync, retrieval, and prompt injection are not connected to the normal execution lifecycle. |
 | Slack HITL and re-decomposition components | Under hardening | Durable waits, authenticated callbacks, idempotent decisions, and real cancellation are incomplete. |
 | Dashboard, pending-run records, and SSE | Experimental | SSE is in-memory; recovery can lose provider state or strand a run after a repeated crash. |
-| CLI | Implemented subset | Current commands are `run`, `show`, `list`, `watch`, `fork`, `export`, and `serve`; broader operator commands are planned. |
-| CI and automated checks | Implemented | Audited baseline: 341 tests pass with one collection warning; Ruff and Mypy pass. This is not production certification. |
+| CLI | Implemented subset | Current commands include `run`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint`; broader operator commands are planned. |
+| CI and automated checks | Implemented | Audited baseline: 365 tests pass with one collection warning; Ruff and Mypy pass. This is not production certification. |
 | Docker Compose | Development stub | A built image, correct binding, valid health check, install verification, and host smoke test are not yet provided. |
 
 ### Required before reliability claims
 
-- Make SQLite authoritative for goal state and add explicit migrations, foreign keys, busy
-  handling, integrity checks, backup, and restore.
+- Extend the local durability kernel with append-only orchestration events, recovery leases, and a
+  server-database backend for multi-worker deployments.
 - Define one terminal-state machine and one central attempt lifecycle used by every strategy.
 - Materialize a real repository in an isolated environment; wire and verify setup commands,
   mounts, secrets, timeouts, and process-tree cancellation.

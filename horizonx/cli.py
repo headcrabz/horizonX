@@ -1,6 +1,6 @@
 """HorizonX CLI.
 
-Commands: run, watch, show, list, fork, merge, export, serve.
+Commands include execution, inspection, dashboard, and database maintenance.
 """
 
 from __future__ import annotations
@@ -21,7 +21,12 @@ console = Console()
 
 
 @click.group()
-@click.option("--db", default="horizonx.db", envvar="HORIZONX_DB", help="DB URL or path (sqlite default)")
+@click.option(
+    "--db",
+    default="horizonx.db",
+    envvar="HORIZONX_DB",
+    help="Path to the local SQLite database",
+)
 @click.pass_context
 def main(ctx: click.Context, db: str) -> None:
     """HorizonX — long-horizon agent execution harness."""
@@ -138,6 +143,88 @@ def export(ctx: click.Context, run_id: str, fmt: str) -> None:
         click.echo(json.dumps(data, default=str, indent=2))
     else:
         click.echo(yaml.safe_dump(data))
+
+
+@main.command()
+@click.pass_context
+def doctor(ctx: click.Context) -> None:
+    """Check the local database schema, integrity, and connection policy."""
+
+    async def _doctor() -> tuple[int, list[str], dict[str, int | str]]:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return (
+                await store.schema_version(),
+                await store.integrity_check(),
+                await store.connection_settings(),
+            )
+        finally:
+            await store.close()
+
+    version, integrity, settings = asyncio.run(_doctor())
+    console.print(f"Schema version: {version}")
+    console.print(f"Integrity: {', '.join(integrity)}")
+    console.print(
+        "Connection policy: "
+        f"WAL={settings['journal_mode'] == 'wal'}, "
+        f"foreign keys={bool(settings['foreign_keys'])}, "
+        f"busy timeout={settings['busy_timeout']}ms"
+    )
+
+
+@main.command()
+@click.argument("destination", type=click.Path(path_type=Path))
+@click.pass_context
+def backup(ctx: click.Context, destination: Path) -> None:
+    """Create and verify an online backup of the local database."""
+
+    async def _backup() -> Path:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return await store.backup(destination)
+        finally:
+            await store.close()
+
+    path = asyncio.run(_backup())
+    console.print(f"Backup verified: {path}")
+
+
+@main.command()
+@click.argument("source", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.pass_context
+def restore(ctx: click.Context, source: Path) -> None:
+    """Restore the local database from a verified backup."""
+
+    async def _restore() -> None:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            await store.restore(source)
+        finally:
+            await store.close()
+
+    asyncio.run(_restore())
+    console.print(f"Restore verified: {source}")
+
+
+@main.command()
+@click.pass_context
+def checkpoint(ctx: click.Context) -> None:
+    """Flush and truncate the local database write-ahead log."""
+
+    async def _checkpoint() -> tuple[int, int, int]:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return await store.checkpoint()
+        finally:
+            await store.close()
+
+    busy, log_pages, checkpointed_pages = asyncio.run(_checkpoint())
+    if busy:
+        raise click.ClickException("database remained busy during checkpoint")
+    console.print(
+        "Checkpoint complete: "
+        f"log pages={log_pages}, checkpointed pages={checkpointed_pages}"
+    )
 
 
 @main.command()

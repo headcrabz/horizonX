@@ -122,10 +122,15 @@ class Runtime:
     # ---------------------------------------------------------------
 
     async def start_session(
-        self, run: Run, target_goal: GoalNode | None = None
+        self,
+        run: Run,
+        target_goal: GoalNode | None = None,
+        *,
+        session_id: str | None = None,
     ) -> Session:
         sequence = run.cumulative.sessions_count
         session = Session(
+            id=session_id or new_session_id(),
             run_id=run.id,
             sequence_index=sequence,
             target_goal_id=target_goal.id if target_goal else None,

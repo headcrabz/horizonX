@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from horizonx.core.goal_graph import GoalGraph
 from horizonx.core.types import (
     AgentConfig,
     GoalNode,
@@ -54,15 +55,15 @@ def _minimal_goals_with_done_and_pending() -> dict:
                 "name": "root",
                 "description": "root task",
                 "children": ["g.done", "g.pending"],
-                "status": "done",
-                "attempts": 1,
+                "status": "pending",
+                "attempts": 0,
                 "notes": "",
                 "verification_criteria": [],
                 "parent_id": None,
                 "depends_on": [],
                 "max_attempts": 3,
-                "progress_pct": 100.0,
-                "version": 1,
+                "progress_pct": 0.0,
+                "version": 0,
                 "last_updated_by_session": None,
             },
             "g.done": {
@@ -121,6 +122,9 @@ async def test_re_decompose_preserves_done_goals(tmp_path: Path):
     _write_goals(run.workspace_path, _minimal_goals_with_done_and_pending())
 
     rt = _make_rt_mock(tmp_path)
+    await rt.store.create_graph(
+        run.id, GoalGraph.load(run.workspace_path / "goals.json")
+    )
 
     llm_response = {
         "nodes": {
@@ -186,6 +190,16 @@ async def test_re_decompose_preserves_done_goals(tmp_path: Path):
     assert "g.new_sub2" in nodes
     assert nodes["g.new_sub1"]["status"] == "pending"
     assert nodes["g.new_sub2"]["status"] == "pending"
+
+    persisted = await rt.store.load_graph(run.id)
+    assert persisted is not None
+    assert {node.id for node in persisted.all_nodes()} == {
+        "g.root",
+        "g.done",
+        "g.new_sub1",
+        "g.new_sub2",
+    }
+    assert persisted.get("g.done").status.value == "done"
 
 
 @pytest.mark.asyncio

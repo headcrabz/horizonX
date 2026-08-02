@@ -36,14 +36,14 @@ REQUIRED SESSION CLEANUP (run before you finish):
   3. Append your work to: progress.md
   4. Append decisions to: decisions.jsonl
   5. Append failures to: failures.jsonl  (anything you tried that did not work)
-  6. Update goals.json `notes` field for YOUR sub-goal
+  6. Record goal-specific notes in progress.md; goals.json is a read-only runtime projection
   7. ONLY if verification criteria are met, propose status="done" in your final message.
 
 DISCIPLINE:
-  - You may modify only the `notes` field and propose `status` for YOUR sub-goal in goals.json.
+  - Do not modify goals.json; report completion evidence and propose status in your final message.
   - It is unacceptable to delete or edit existing tests.
   - You may NOT mark goals `done` directly — that is the Runtime's job after validators pass.
-  - You may NOT modify other sub-goals' fields.
+  - You may NOT modify goal state directly.
 
 CONTEXT FROM PREVIOUS SESSIONS:
 ========== summary.md ==========

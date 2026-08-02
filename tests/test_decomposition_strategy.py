@@ -34,7 +34,10 @@ async def _make_session(*args: Any, **kwargs: Any) -> Any:
 
 
 def _make_mock_rt(tmp_path: Path) -> Any:
+    from horizonx.storage.sqlite import SqliteStore
+
     rt = MagicMock()
+    rt.store = SqliteStore(tmp_path / "strategy.db")
     rt.start_session = AsyncMock(side_effect=_make_session)
     rt.end_session = AsyncMock()
     rt.record_step = AsyncMock()
@@ -99,8 +102,11 @@ class TestDecompositionFirst:
         rt = _make_mock_rt(tmp_path)
 
         events = []
-        async for ev in d.execute(run, rt):
-            events.append(ev)
+        try:
+            async for ev in d.execute(run, rt):
+                events.append(ev)
+        finally:
+            await rt.store.close()
 
         types = [e.type for e in events]
         assert "run.completed" in types

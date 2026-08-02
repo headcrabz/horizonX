@@ -1,7 +1,7 @@
 """DecompositionFirst — LLM-driven task decomposition before execution.
 
 Phase 1 (Decomposer): a cheap LLM call breaks the top-level prompt into an
-ordered list of sub-goals written to goals.json.
+ordered list of sub-goals committed to the orchestration store.
 Phase 2 (Executor): runs each sub-goal in sequence via agent sessions,
 just like SequentialSubgoals but with LLM-generated goals instead of
 agent-generated ones.
@@ -22,7 +22,7 @@ from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
 from horizonx.core.task_board import append_task_board
-from horizonx.core.types import GoalStatus, Run, Step
+from horizonx.core.types import GoalStatus, Run, Step, new_session_id
 from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 DECOMPOSER_SYSTEM = """\
@@ -64,13 +64,18 @@ class DecompositionFirst:
         if not graph_path.exists():
             yield Event(type="run.started", run_id=run.id, payload={"phase": "decompose"})
             graph = await self._decompose(run)
-            graph.save(graph_path)
+            await rt.store.create_graph(run.id, graph)
+            await rt.store.ensure_goal_projection(run.id, graph_path)
             yield Event(type="goal.in_progress", run_id=run.id, payload={
                 "phase": "decomposed",
                 "subgoal_count": len(list(graph.all_nodes())),
             })
         else:
-            graph = GoalGraph.load(graph_path)
+            graph = await rt.store.load_graph(run.id)
+            if graph is None:
+                graph = GoalGraph.load(graph_path)
+                await rt.store.create_graph(run.id, graph)
+            await rt.store.ensure_goal_projection(run.id, graph_path)
 
         yield Event(type="run.started", run_id=run.id, payload={"phase": "execute"})
 
@@ -80,17 +85,19 @@ class DecompositionFirst:
                 break
 
             # Atomically claim in DB — safe for future parallel execution
-            claimed = await rt.store.claim_goal(run.id, goal.id, session_id="pending")
+            session_id = new_session_id()
+            claimed = await rt.store.claim_goal(run.id, goal.id, session_id=session_id)
             if not claimed:
                 continue  # another agent claimed it; pick next leaf
 
-            graph.mark_in_progress(goal.id, by_session="pending")
-            graph.save(graph_path)
+            graph.mark_in_progress(goal.id, by_session=session_id)
+            goal.assigned_to_session = session_id
+            await rt.store.create_graph(run.id, graph)
+            await rt.store.ensure_goal_projection(run.id, graph_path)
 
-            session = await rt.start_session(run, target_goal=goal)
-            graph.mark_in_progress(goal.id, by_session=session.id)
-            goal.assigned_to_session = session.id
-            graph.save(graph_path)
+            session = await rt.start_session(
+                run, target_goal=goal, session_id=session_id
+            )
             append_task_board(
                 run.workspace_path,
                 event="claimed",
@@ -130,18 +137,21 @@ class DecompositionFirst:
 
             if any_abort or (not all_continue and goal.attempts >= self.max_attempts_per_goal):
                 graph.mark_failed(goal.id, by_session=session.id)
+                goal.assigned_to_session = None
                 await rt.store.release_goal(run.id, goal.id)
                 append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                                   session_id=session.id, agent_type=run.task.agent.type)
             elif all_continue:
                 graph.mark_done(goal.id, by_session=session.id)
+                goal.assigned_to_session = None
                 await rt.store.release_goal(run.id, goal.id)
                 append_task_board(run.workspace_path, event="completed", goal_id=goal.id,
                                   session_id=session.id, agent_type=run.task.agent.type)
             else:
                 goal.attempts += 1
 
-            graph.save(graph_path)
+            await rt.store.create_graph(run.id, graph)
+            await rt.store.ensure_goal_projection(run.id, graph_path)
 
             event_type = "goal.done" if goal.status == GoalStatus.DONE else "goal.in_progress"
             yield Event(type=event_type,  # type: ignore[arg-type]
