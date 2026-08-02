@@ -22,7 +22,15 @@ from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
 from horizonx.core.task_board import append_task_board
-from horizonx.core.types import GoalStatus, Run, Step, new_session_id
+from horizonx.core.types import (
+    GoalStatus,
+    Run,
+    RunStatus,
+    SessionStatus,
+    Step,
+    StrategyOutcome,
+    new_session_id,
+)
 from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 DECOMPOSER_SYSTEM = """\
@@ -58,7 +66,7 @@ class DecompositionFirst:
         self.max_attempts_per_goal: int = config.get("max_attempts_per_goal", 3)
         self.max_subgoals: int = config.get("max_subgoals", 12)
 
-    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event]:
+    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
         graph_path = run.workspace_path / "goals.json"
 
         if not graph_path.exists():
@@ -79,6 +87,7 @@ class DecompositionFirst:
 
         yield Event(type="run.started", run_id=run.id, payload={"phase": "execute"})
 
+        final_validated = False
         while True:
             goal = graph.next_pending_leaf()
             if goal is None:
@@ -88,7 +97,10 @@ class DecompositionFirst:
             session_id = new_session_id()
             claimed = await rt.store.claim_goal(run.id, goal.id, session_id=session_id)
             if not claimed:
-                continue  # another agent claimed it; pick next leaf
+                yield StrategyOutcome(
+                    status=RunStatus.FAILED, reason="goal_claim_unavailable"
+                )
+                return
 
             graph.mark_in_progress(goal.id, by_session=session_id)
             goal.assigned_to_session = session_id
@@ -128,28 +140,108 @@ class DecompositionFirst:
             )
             if result.agent_session_id:
                 session.agent_session_id = result.agent_session_id
+            rt.charge(result)
+
+            if result.status != SessionStatus.COMPLETED:
+                graph.mark_failed(goal.id, by_session=session.id)
+                goal.assigned_to_session = None
+                await rt.store.release_goal(run.id, goal.id)
+                await rt.store.create_graph(run.id, graph)
+                await rt.store.ensure_goal_projection(run.id, graph_path)
+                await rt.end_session(session, result.status)
+                yield StrategyOutcome(
+                    status=(
+                        RunStatus.TIMED_OUT
+                        if result.status == SessionStatus.TIMEOUT
+                        else RunStatus.FAILED
+                    ),
+                    reason=f"agent_{result.status.value}",
+                    details={"goal_id": goal.id, "error": result.error},
+                )
+                return
 
             decisions = await rt.run_validators(run, session, when="after_every_session")
+            if all(
+                leaf.id == goal.id or leaf.status == GoalStatus.DONE
+                for leaf in graph.leaves()
+            ):
+                decisions.extend(await rt.run_validators(run, session, when="final"))
+                final_validated = True
 
             from horizonx.core.types import GateAction
             any_abort = any(d.decision == GateAction.ABORT for d in decisions)
+            any_pause = any(
+                d.decision == GateAction.PAUSE_FOR_HITL for d in decisions
+            )
             all_continue = all(d.decision == GateAction.CONTINUE for d in decisions) if decisions else True
 
-            if any_abort or (not all_continue and goal.attempts >= self.max_attempts_per_goal):
+            terminal_override: StrategyOutcome | None = None
+            if any_abort:
                 graph.mark_failed(goal.id, by_session=session.id)
                 goal.assigned_to_session = None
                 await rt.store.release_goal(run.id, goal.id)
                 append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                                   session_id=session.id, agent_type=run.task.agent.type)
+                terminal_override = StrategyOutcome(
+                    status=RunStatus.ABORTED,
+                    reason="validator_aborted",
+                    details={"goal_id": goal.id},
+                )
+            elif any_pause:
+                decision = await rt.request_hitl(
+                    run,
+                    reason="validator_pause",
+                    context={
+                        "goal_id": goal.id,
+                        "validator_decisions": [d.model_dump() for d in decisions],
+                    },
+                )
+                if decision.action == "abort":
+                    graph.mark_failed(goal.id, by_session=session.id)
+                    goal.assigned_to_session = None
+                    await rt.store.release_goal(run.id, goal.id)
+                    append_task_board(
+                        run.workspace_path,
+                        event="failed",
+                        goal_id=goal.id,
+                        session_id=session.id,
+                        agent_type=run.task.agent.type,
+                    )
+                    terminal_override = StrategyOutcome(
+                        status=RunStatus.ABORTED,
+                        reason="operator_aborted",
+                        details={"goal_id": goal.id},
+                    )
+                else:
+                    if decision.action == "modify":
+                        graph.append_notes(
+                            goal.id,
+                            f"HITL guidance: {decision.instruction}",
+                            by_session=session.id,
+                        )
+                    goal.status = GoalStatus.PENDING
+                    goal.assigned_to_session = None
+                    goal.version += 1
+                    await rt.store.release_goal(run.id, goal.id)
             elif all_continue:
                 graph.mark_done(goal.id, by_session=session.id)
                 goal.assigned_to_session = None
                 await rt.store.release_goal(run.id, goal.id)
                 append_task_board(run.workspace_path, event="completed", goal_id=goal.id,
                                   session_id=session.id, agent_type=run.task.agent.type)
+            elif goal.attempts >= self.max_attempts_per_goal:
+                graph.mark_failed(goal.id, by_session=session.id)
+                goal.assigned_to_session = None
+                await rt.store.release_goal(run.id, goal.id)
+                append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
+                                  session_id=session.id, agent_type=run.task.agent.type)
             else:
-                goal.attempts += 1
+                goal.status = GoalStatus.PENDING
+                goal.assigned_to_session = None
+                goal.version += 1
+                await rt.store.release_goal(run.id, goal.id)
 
+            await rt.end_session(session, result.status or SessionStatus.COMPLETED)
             await rt.store.create_graph(run.id, graph)
             await rt.store.ensure_goal_projection(run.id, graph_path)
 
@@ -159,14 +251,22 @@ class DecompositionFirst:
                 "goal_id": goal.id, "status": goal.status.value,
             })
 
+            if terminal_override is not None:
+                yield terminal_override
+                return
+
             if graph.is_complete():
                 break
 
-        await rt.run_validators(run, None, when="final")
         if graph.is_complete():
-            yield Event(type="run.completed", run_id=run.id, payload={"strategy": "decomposition"})
+            yield StrategyOutcome(
+                status=RunStatus.COMPLETED,
+                details={"_final_validated": final_validated},
+            )
         else:
-            yield Event(type="run.failed", run_id=run.id, payload={"reason": "subgoals_incomplete"})
+            yield StrategyOutcome(
+                status=RunStatus.FAILED, reason="subgoals_incomplete"
+            )
 
     async def _decompose(self, run: Run) -> GoalGraph:
         from horizonx.core.llm_client import call_llm_json

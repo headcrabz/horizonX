@@ -10,7 +10,7 @@ from typing import Any
 
 from horizonx.agents.base import Workspace
 from horizonx.core.event_bus import Event
-from horizonx.core.types import Run, SessionStatus
+from horizonx.core.types import Run, RunStatus, SessionStatus, StrategyOutcome
 from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 
@@ -20,7 +20,7 @@ class SingleSession:
     def __init__(self, config: dict[str, Any]):
         self.config = config
 
-    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event]:
+    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
         session = await rt.start_session(run, target_goal=None)
         agent = _build_agent(run.task.agent)
 
@@ -38,13 +38,18 @@ class SingleSession:
         if result.agent_session_id:
             session.agent_session_id = result.agent_session_id
 
-        await rt.run_validators(run, session, when="final")
+        rt.charge(result)
         await rt.end_session(session, result.status or SessionStatus.COMPLETED)
-        if result.status in {SessionStatus.ERRORED, SessionStatus.SPIN, SessionStatus.TIMEOUT}:
-            yield Event(
-                type="run.failed",
-                run_id=run.id,
-                payload={"strategy": "single", "session_status": result.status.value, "error": result.error},
+        if result.status != SessionStatus.COMPLETED:
+            terminal_status = (
+                RunStatus.TIMED_OUT
+                if result.status == SessionStatus.TIMEOUT
+                else RunStatus.FAILED
+            )
+            yield StrategyOutcome(
+                status=terminal_status,
+                reason=f"agent_{result.status.value}",
+                details={"error": result.error},
             )
             return
-        yield Event(type="run.completed", run_id=run.id, payload={"strategy": "single"})
+        yield StrategyOutcome(status=RunStatus.COMPLETED)

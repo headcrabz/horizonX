@@ -14,7 +14,7 @@ hardened. It is suitable for local evaluation and development—not unattended o
 [![CI](https://github.com/headcrabz/horizonX/actions/workflows/ci.yml/badge.svg)](https://github.com/headcrabz/horizonX/actions)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Tests: 365 passing](https://img.shields.io/badge/tests-365%20passing-brightgreen.svg)](tests/)
+[![Tests: 389 passing](https://img.shields.io/badge/tests-389%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -25,7 +25,7 @@ HorizonX is not an agent. It is an experimental runtime layer around existing ag
 The current alpha includes:
 
 - **Durable records** — SQLite stores runs, sessions, steps, validations, HITL records, and usage.
-  Exact crash-point recovery and authoritative goal persistence are under hardening.
+  Goal persistence is authoritative and run-scoped; exact crash-point recovery is under hardening.
 - **Spin-analysis components** — seven detectors cover repetition, oscillation, plateaus, and
   cross-session stagnation. Universal invocation and response semantics are not yet guaranteed.
 - **Resource-policy components** — token, cost, time, and workspace-budget models exist. Uniform
@@ -33,7 +33,7 @@ The current alpha includes:
 - **Knowledge components** — FTS5 knowledge storage and Markdown handoff sync exist as modules.
   Automatic cross-run sync and prompt injection are not yet wired into the production run path.
 - **Goal graphs and validators** — DAG planning and six validator types are implemented. Database
-  authority, terminal-state correctness, and evidence-backed completion are under hardening.
+  recovery, a complete evidence contract, and unattended operation are under hardening.
 - **Eight strategy modules** — single, sequential, pair, tree, self-critique, decomposition,
   monitor, and ralph. They are experimental until they share one verified execution lifecycle.
 - **Operator and observability components** — Slack HITL, dashboard SSE, and CLI watch exist.
@@ -45,26 +45,64 @@ See the [support matrix](#project-status) before relying on a capability.
 
 ## Quick start
 
-```bash
-pip install -e ".[dev]"
-export ANTHROPIC_API_KEY=sk-ant-...
+Prerequisites: Python 3.11+ and one supported agent CLI. This repository is not yet
+published as a stable package, so install it from source:
 
-# Run a task
+```bash
+git clone https://github.com/headcrabz/horizonX.git
+cd horizonX
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+
+# Confirm the CLI is available
+horizonx --help
+```
+
+Install and authenticate one of the [supported agent harnesses](#agent-harness-setup), then run
+the smallest example:
+
+```bash
 horizonx run examples/demo_word_counter/task.yaml
 
-# Watch it live
+# Inspect the run ID and persisted status
+horizonx list
+horizonx show <run-id>
+```
+
+By default, orchestration state is written to `./horizonx.db` and run artifacts to
+`./horizonx-workspaces/`. Keep the database on a local filesystem and use one HorizonX process.
+To choose another local database, pass `--db path/to/horizonx.db` before the command or set
+`HORIZONX_DB`.
+
+Optional operator views:
+
+```bash
+# Follow a run from another terminal
 horizonx watch <run-id>
 
-# Resume an existing run at a supported session boundary (experimental)
-horizonx run task.yaml --resume <run-id>
-
-# Launch the dashboard
+# Install and launch the dashboard
 pip install -e ".[dashboard]"
 horizonx serve
 ```
 
+Resume is experimental and currently operates at supported session boundaries:
+`horizonx run task.yaml --resume <run-id>`.
+
 The checked-in Compose file is currently a development stub, not a supported quick start. Image
 packaging, container binding, and health checks remain under hardening.
+
+### Examples to try
+
+| Example | What it demonstrates | Command |
+|---|---|---|
+| Word counter | One bounded agent session with a final test gate | `horizonx run examples/demo_word_counter/` |
+| Self critique | Implementer/reviewer iterations with an acceptance score | `horizonx run examples/demo_refactor/` |
+| Coding | A multi-session sequential goal graph | `horizonx run examples/coding/` |
+
+Examples can invoke paid agent/model APIs. Read each `task.yaml` and its resource limits before
+running it. The longer examples describe intended evaluation scenarios; they are not production
+recipes.
 
 ---
 
@@ -106,6 +144,32 @@ resources:
   max_total_usd: 5.0
   max_total_tokens: 500000
 ```
+
+### How goal graphs are created
+
+Choose graph behavior through `strategy.kind` rather than hand-editing runtime state:
+
+- `single`, `pair`, `tree`, `self_critique`, `monitor`, and `ralph` control their own loops and do
+  not require a user-authored goal graph.
+- `sequential` starts with an initializer session that creates `goals.json`, then executes one
+  verifiable leaf goal per session.
+- `decomposition` asks a planning model for a structured graph before starting executor sessions.
+
+For graph strategies, every leaf should fit in one session, state a concrete deliverable, and have
+binary verification criteria. Dependencies must point to existing nodes and the graph must remain
+acyclic. SQLite becomes authoritative after graph creation; workspace `goals.json` is an atomic,
+human-readable projection for inspection and handoff. On resume or fork, HorizonX loads the
+persisted graph instead of silently starting a new plan.
+
+```text
+g.root  Deliver the feature
+├── g.api    Implement endpoint     [API tests pass]
+├── g.auth   Add authorization      [unauthorized requests fail]
+└── g.e2e    Verify complete flow   [depends on g.api and g.auth]
+```
+
+See [the goal-graph design and schema](docs/LONG_HORIZON_AGENT.md#12-goal-graph--durable-hierarchical-plan)
+for node fields, validator inheritance, and transition rules.
 
 ---
 
@@ -161,9 +225,10 @@ workspace:
 
 ---
 
-## Cross-session memory
+## Knowledge and handoff components
 
-Agents write facts as Markdown during sessions:
+HorizonX includes an experimental FTS5 knowledge store and Markdown handoff format. A knowledge
+file looks like this:
 
 ```markdown
 # workspace/knowledge/auth.md
@@ -174,12 +239,9 @@ PyJWT 2.8+ requires explicit algorithm parameter in decode().
 Use: jwt.decode(token, key, algorithms=["HS256"])
 ```
 
-After each session, HorizonX:
-1. Indexes all `knowledge/*.md` files into a per-workspace FTS5 SQLite store
-2. On the next run, searches relevant facts by goal name + description
-3. Injects pinned facts unconditionally + top-K relevant facts into the session prompt
-
-Facts persist across runs indefinitely. Agents stop re-discovering the same things.
+The storage, search, and handoff modules have focused tests, but automatic indexing, retrieval, and
+prompt injection are not yet connected across every normal run path. Treat this as an extension
+surface, not a durable cross-run memory guarantee in the current alpha.
 
 ---
 
@@ -329,8 +391,8 @@ focused tests; it does not imply a verified production guarantee.
 | CLI execution, inspection, dashboard, and database maintenance | Implemented subset | `run`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint` are available; broader operator workflows are planned. |
 | SQLite orchestration persistence | Implemented, local-only | Run-scoped goal identity, migrations, foreign keys, bounded contention, integrity checks, backup, restore, and atomic goal transitions are implemented. Use one local HorizonX daemon and keep the database on a local filesystem. |
 | Claude Code, Codex, OpenHands, custom, and SDK drivers | Experimental | CLI transports exist; structured native transports, capability negotiation, and cross-provider parity are not verified. |
-| Eight execution strategy modules | Experimental | Lifecycle, failure, validator, budget, cleanup, and recovery behavior is not yet uniform. |
-| Goal graph and six validator types | Experimental | SQLite is authoritative and `goals.json` is an atomic human-readable projection; terminal-state and evidence semantics still need hardening. |
+| Eight execution strategy modules | Experimental | Every built-in yields a typed terminal outcome and shares final-validator semantics; attempt, cleanup, budget, and recovery paths still need one executor. |
+| Goal graph and six validator types | Experimental | SQLite is authoritative and `goals.json` is an atomic projection; completion rejection no longer reports a successful run, while evidence calibration still needs hardening. |
 | Resume and dashboard pending-run recovery | Under hardening | Resume is session-boundary oriented; a crash can lose provider resume state or strand a pending run. Exact crash-point recovery is not claimed. |
 | Seven spin-detection components | Under hardening | The sequential path invokes the combined detector; universal wiring and configured response behavior are not yet verified. |
 | Resource governor and usage store | Under hardening | Enforcement and accounting are not uniform across strategies/providers; unknown provider cost must not be interpreted as zero. |
@@ -340,7 +402,7 @@ focused tests; it does not imply a verified production guarantee.
 | Local workspace execution | Experimental | Runs currently materialize an empty local workspace; repository checkout and setup-command semantics need hardening. |
 | Docker, Podman, and E2B execution | Configuration only | Configuration models exist, but non-local environment execution is not wired into the runtime. |
 | Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |
-| Automated verification | Implemented | 365 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Automated verification | Implemented | 389 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
 | Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
 
 Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or

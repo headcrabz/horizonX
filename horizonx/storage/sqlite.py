@@ -19,10 +19,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from horizonx.core.types import (
+    TERMINAL_RUN_STATUSES,
     GateDecision,
     GoalNode,
     GoalStatus,
     Run,
+    RunStatus,
     Session,
     SpinReport,
     Step,
@@ -472,6 +474,8 @@ class SqliteStore:
     # ------------------------------------------------------------------
 
     def _sync_save_run(self, run: Run) -> None:
+        if run.status in TERMINAL_RUN_STATUSES and run.completed_at is None:
+            run.completed_at = utcnow()
         with self._conn() as c:
             c.execute(
                 """\
@@ -479,8 +483,14 @@ class SqliteStore:
                                  started_at, completed_at, current_session_id, goal_graph_root, cumulative)
                 VALUES (?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
-                    status=excluded.status,
-                    completed_at=excluded.completed_at,
+                    status=CASE
+                        WHEN runs.status IN ('completed', 'failed', 'aborted',
+                                             'timed_out', 'budget_exceeded')
+                        THEN runs.status ELSE excluded.status END,
+                    completed_at=CASE
+                        WHEN runs.status IN ('completed', 'failed', 'aborted',
+                                             'timed_out', 'budget_exceeded')
+                        THEN runs.completed_at ELSE excluded.completed_at END,
                     current_session_id=excluded.current_session_id,
                     cumulative=excluded.cumulative
                 """,
@@ -501,6 +511,27 @@ class SqliteStore:
     async def save_run(self, run: Run) -> None:
         return await self._run_sync(self._sync_save_run, run)
 
+    def _sync_transition_run(self, run_id: str, to_status: RunStatus) -> Run:
+        if to_status not in TERMINAL_RUN_STATUSES:
+            raise StoreError(f"run transition target must be terminal: {to_status.value}")
+        with self._conn() as c:
+            row = c.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"run not found: {run_id}")
+            current = RunStatus(row["status"])
+            if current not in TERMINAL_RUN_STATUSES:
+                c.execute(
+                    "UPDATE runs SET status=?, completed_at=COALESCE(completed_at, ?) "
+                    "WHERE id=? AND status NOT IN "
+                    "('completed', 'failed', 'aborted', 'timed_out', 'budget_exceeded')",
+                    (to_status.value, utcnow().isoformat(), run_id),
+                )
+        return self._sync_load_run(run_id)
+
+    async def transition_run(self, run_id: str, to_status: RunStatus) -> Run:
+        """Set a terminal status once; later terminal writes preserve the first result."""
+        return await self._run_sync(self._sync_transition_run, run_id, to_status)
+
     def _sync_load_run(self, run_id: str) -> Run:
         from horizonx.core.types import CumulativeMetrics, RunStatus, Task
 
@@ -514,6 +545,8 @@ class SqliteStore:
             task=Task.model_validate_json(row["task_snapshot"]),
             status=RunStatus(row["status"]),
             workspace_path=Path(row["workspace_path"]),
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
             current_session_id=row["current_session_id"],
             goal_graph_root=row["goal_graph_root"],
             cumulative=CumulativeMetrics.model_validate_json(row["cumulative"] or "{}"),

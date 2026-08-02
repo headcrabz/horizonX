@@ -108,5 +108,7 @@ class TestDecompositionFirst:
         finally:
             await rt.store.close()
 
-        types = [e.type for e in events]
-        assert "run.completed" in types
+        from horizonx.core.types import RunStatus, StrategyOutcome
+
+        outcome = next(e for e in events if isinstance(e, StrategyOutcome))
+        assert outcome.status == RunStatus.COMPLETED

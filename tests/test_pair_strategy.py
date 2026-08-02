@@ -97,6 +97,8 @@ class TestPairProgramming:
             async for ev in p.execute(run, rt):
                 events.append(ev)
 
-        completed = [e for e in events if e.type == "run.completed"]
-        assert len(completed) == 1
-        assert completed[0].payload["rounds"] == 1
+        from horizonx.core.types import RunStatus, StrategyOutcome
+
+        outcome = next(e for e in events if isinstance(e, StrategyOutcome))
+        assert outcome.status == RunStatus.COMPLETED
+        assert outcome.details["rounds"] == 1

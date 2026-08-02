@@ -34,8 +34,10 @@ from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
 from horizonx.core.types import (
     Run,
+    RunStatus,
     SessionStatus,
     Step,
+    StrategyOutcome,
 )
 from horizonx.strategies._agent_builder import build_agent as _build_agent
 
@@ -88,7 +90,7 @@ class SelfCritique:
         self.critic_command: str | None = config.get("critic_command")  # for shell critic
         self.write_progress: bool = config.get("write_progress", True)
 
-    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event]:
+    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
         workspace = Workspace(path=run.workspace_path, env={})
         agent = _build_agent(run.task.agent)
         history: list[dict[str, Any]] = []
@@ -125,14 +127,15 @@ class SelfCritique:
             )
             if impl_result.agent_session_id:
                 impl_session.agent_session_id = impl_result.agent_session_id
+            rt.charge(impl_result)
             await rt.end_session(impl_session, impl_result.status or SessionStatus.COMPLETED)
 
-            if impl_result.status in {SessionStatus.ERRORED, SessionStatus.TIMEOUT}:
-                yield Event(type="run.failed", run_id=run.id, payload={
-                    "strategy": "self_critique",
-                    "round": round_n,
-                    "error": impl_result.error,
-                })
+            if impl_result.status != SessionStatus.COMPLETED:
+                yield StrategyOutcome(
+                    status=RunStatus.FAILED,
+                    reason="implementer_failed",
+                    details={"round": round_n, "error": impl_result.error},
+                )
                 return
 
             # ---- Critic session ----
@@ -157,24 +160,19 @@ class SelfCritique:
             })
 
             if verdict == "accept" or score >= self.accept_threshold:
-                # Run validators on final accepted state
-                await rt.run_validators(run, None, when="final")
-                yield Event(type="run.completed", run_id=run.id, payload={
-                    "strategy": "self_critique",
-                    "rounds": round_n + 1,
-                    "final_score": score,
-                })
+                yield StrategyOutcome(
+                    status=RunStatus.COMPLETED,
+                    details={"rounds": round_n + 1, "final_score": score},
+                )
                 return
 
         # Max rounds exhausted — emit final score as-is
         final_score = history[-1]["score"] if history else 0.0
-        await rt.run_validators(run, None, when="final")
-        yield Event(type="run.completed", run_id=run.id, payload={
-            "strategy": "self_critique",
-            "rounds": self.max_rounds,
-            "final_score": final_score,
-            "note": "max_rounds reached without accepting",
-        })
+        yield StrategyOutcome(
+            status=RunStatus.FAILED,
+            reason="critique_threshold_not_met",
+            details={"rounds": self.max_rounds, "final_score": final_score},
+        )
 
     async def _run_critic(
         self, run: Run, rt: Any, workspace: Workspace, round_n: int
@@ -253,12 +251,29 @@ class SelfCritique:
             step.session_id = s.id
             await rt.record_step(s, step)
 
-        await agent.run_session(
+        result = await agent.run_session(
             critic_prompt, workspace,
             on_step=on_critic_step,
             session_id=critic_session.id,
         )
-        await rt.end_session(critic_session, SessionStatus.COMPLETED)
+        rt.charge(result)
+        await rt.end_session(
+            critic_session, result.status or SessionStatus.COMPLETED
+        )
+        if result.status != SessionStatus.COMPLETED:
+            return {
+                "score": 0.0,
+                "verdict": "revise",
+                "issues": [
+                    {
+                        "severity": "critical",
+                        "description": f"critic ended with {result.status.value}",
+                        "location": "critic session",
+                    }
+                ],
+                "suggestions": [],
+                "summary": result.error or "critic session failed",
+            }
 
         if critique_out.exists():
             try:

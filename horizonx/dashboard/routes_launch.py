@@ -67,6 +67,10 @@ async def cancel_run(
         run = await store.load_run(run_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
-    run.status = RunStatus.ABORTED
-    await store.save_run(run)
-    return {"status": "aborted", "run_id": run_id}
+    transitioned = await store.transition_run(run.id, RunStatus.ABORTED)
+    if transitioned.status != RunStatus.ABORTED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"run is already terminal: {transitioned.status.value}",
+        )
+    return {"status": transitioned.status.value, "run_id": run_id}

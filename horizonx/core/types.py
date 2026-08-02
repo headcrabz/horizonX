@@ -55,6 +55,33 @@ class RunStatus(str, Enum):
     FAILED = "failed"
     ABORTED = "aborted"
     TIMED_OUT = "timed_out"
+    BUDGET_EXCEEDED = "budget_exceeded"
+
+
+TERMINAL_RUN_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.ABORTED,
+        RunStatus.TIMED_OUT,
+        RunStatus.BUDGET_EXCEEDED,
+    }
+)
+
+
+class StrategyOutcome(BaseModel):
+    """Typed, final result yielded exactly once by an execution strategy."""
+
+    status: RunStatus
+    reason: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("status")
+    @classmethod
+    def _status_must_be_terminal(cls, value: RunStatus) -> RunStatus:
+        if value not in TERMINAL_RUN_STATUSES:
+            raise ValueError(f"strategy outcome must be terminal, got {value.value}")
+        return value
 
 
 class SessionStatus(str, Enum):

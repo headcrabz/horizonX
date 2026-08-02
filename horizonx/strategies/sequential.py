@@ -24,7 +24,9 @@ from horizonx.core.types import (
     GoalNode,
     GoalStatus,
     Run,
+    RunStatus,
     SessionStatus,
+    StrategyOutcome,
     new_session_id,
 )
 
@@ -65,7 +67,7 @@ class SequentialSubgoals:
         self.target_subgoals = config.get("target_subgoals", [40, 80])
         self.git_commit_each_session = config.get("git_commit_each_session", True)
 
-    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event]:
+    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
         graph_path = run.workspace_path / "goals.json"
 
         # Phase 1 — Initializer (if no goal graph yet)
@@ -81,14 +83,26 @@ class SequentialSubgoals:
         await rt.store.ensure_goal_projection(run.id, graph_path)
 
         # Phase 2 — Iterate sub-goals
+        final_validated = False
         while True:
             goal = graph.next_pending_leaf()
             if goal is None:
                 break  # all done or all blocked
 
-            await self._run_goal_session(run, rt, graph, goal)
+            claimed, goal_final_validated, terminal_override = await self._run_goal_session(
+                run, rt, graph, goal
+            )
+            final_validated = final_validated or goal_final_validated
+            if not claimed:
+                yield StrategyOutcome(
+                    status=RunStatus.FAILED, reason="goal_claim_unavailable"
+                )
+                return
             await rt.store.create_graph(run.id, graph)
             await rt.store.ensure_goal_projection(run.id, graph_path)
+            if terminal_override is not None:
+                yield terminal_override
+                return
             yield Event(
                 type="goal.in_progress" if goal.status != GoalStatus.DONE else "goal.done",
                 run_id=run.id,
@@ -99,9 +113,14 @@ class SequentialSubgoals:
                 break
 
         if graph.is_complete():
-            yield Event(type="run.completed", run_id=run.id, payload={"strategy": "sequential"})
+            yield StrategyOutcome(
+                status=RunStatus.COMPLETED,
+                details={"_final_validated": final_validated},
+            )
         else:
-            yield Event(type="run.failed", run_id=run.id, payload={"reason": "goal_graph_incomplete"})
+            yield StrategyOutcome(
+                status=RunStatus.FAILED, reason="goal_graph_incomplete"
+            )
 
     # ------------------------------------------------------------------
     # Phase 1 — Initializer
@@ -129,6 +148,9 @@ class SequentialSubgoals:
         if result.agent_session_id:
             session.agent_session_id = result.agent_session_id
         rt.charge(result)
+        await rt.end_session(session, result.status or SessionStatus.COMPLETED)
+        if result.status != SessionStatus.COMPLETED:
+            raise RuntimeError(f"initializer ended with {result.status.value}")
 
         # Verify goals.json was created; if not, we cannot continue.
         graph_path = run.workspace_path / "goals.json"
@@ -136,8 +158,7 @@ class SequentialSubgoals:
             self._write_default_graph(run)
 
         # Initial git commit so subsequent sessions have a baseline
-        self._git_init_and_commit(run.workspace_path, message="initializer: scaffold")
-        await rt.end_session(session, result.status or SessionStatus.COMPLETED)
+        self._git_init_and_commit(run.workspace_path, message="Initialize task workspace")
 
     def _write_default_graph(self, run: Run) -> None:
         """Fallback: if the initializer didn't write goals.json, create one with the root only."""
@@ -162,14 +183,16 @@ class SequentialSubgoals:
     # Phase 2 — Per-goal session
     # ------------------------------------------------------------------
 
-    async def _run_goal_session(self, run: Run, rt: Any, graph: GoalGraph, goal: GoalNode) -> None:
+    async def _run_goal_session(
+        self, run: Run, rt: Any, graph: GoalGraph, goal: GoalNode
+    ) -> tuple[bool, bool, StrategyOutcome | None]:
         # Atomically claim in DB before mutating in-memory graph.
         # Returns False only if a concurrent agent already claimed this goal
         # (shouldn't happen in sequential strategy, but guards future parallel use).
         session_id = new_session_id()
         claimed = await rt.store.claim_goal(run.id, goal.id, session_id=session_id)
         if not claimed:
-            return  # another agent claimed it first; caller will pick next leaf
+            return False, False, None
 
         graph.mark_in_progress(goal.id, by_session=session_id)
         goal.assigned_to_session = session_id
@@ -212,10 +235,37 @@ class SequentialSubgoals:
         if result.agent_session_id:
             session.agent_session_id = result.agent_session_id
         rt.charge(result)
+        if result.status != SessionStatus.COMPLETED:
+            graph.mark_failed(goal.id, by_session=session.id)
+            goal.assigned_to_session = None
+            await rt.store.release_goal(run.id, goal.id)
+            append_task_board(
+                run.workspace_path,
+                event="failed",
+                goal_id=goal.id,
+                session_id=session.id,
+                agent_type=run.task.agent.type,
+            )
+            await rt.end_session(session, result.status)
+            return (
+                True,
+                False,
+                StrategyOutcome(
+                    status=(
+                        RunStatus.TIMED_OUT
+                        if result.status == SessionStatus.TIMEOUT
+                        else RunStatus.FAILED
+                    ),
+                    reason=f"agent_{result.status.value}",
+                    details={"goal_id": goal.id, "error": result.error},
+                ),
+            )
 
         # Auto git commit after session
         if self.git_commit_each_session:
-            self._git_init_and_commit(run.workspace_path, message=f"session: {goal.id}")
+            self._git_init_and_commit(
+                run.workspace_path, message=f"Complete session for {goal.id}"
+            )
 
         # Keep FTS5 decision index current for next session's context injection
         RunKnowledgeStore(run.workspace_path).index_decisions(
@@ -224,6 +274,13 @@ class SequentialSubgoals:
 
         # Run validators after session
         decisions = await rt.run_validators(run, session, when="after_every_session")
+        final_validated = False
+        if all(
+            leaf.id == goal.id or leaf.status == GoalStatus.DONE
+            for leaf in graph.leaves()
+        ):
+            decisions.extend(await rt.run_validators(run, session, when="final"))
+            final_validated = True
 
         # Decide goal outcome
         spin_cancelled = cancel_token.cancelled and "spin" in cancel_token.reason
@@ -238,7 +295,15 @@ class SequentialSubgoals:
             append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                               session_id=session.id, agent_type=run.task.agent.type)
             await rt.end_session(session, SessionStatus.ERRORED)
-            return
+            return (
+                True,
+                final_validated,
+                StrategyOutcome(
+                    status=RunStatus.ABORTED,
+                    reason="validator_aborted",
+                    details={"goal_id": goal.id},
+                ),
+            )
 
         if spin_cancelled or any_pause:
             ctx = {
@@ -254,7 +319,15 @@ class SequentialSubgoals:
                 append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                                   session_id=session.id, agent_type=run.task.agent.type)
                 await rt.end_session(session, SessionStatus.ERRORED)
-                return
+                return (
+                    True,
+                    final_validated,
+                    StrategyOutcome(
+                        status=RunStatus.ABORTED,
+                        reason="operator_aborted",
+                        details={"goal_id": goal.id},
+                    ),
+                )
             if decision.action == "modify":
                 graph.append_notes(goal.id, f"HITL guidance: {decision.instruction}", by_session=session.id)
             if decision.action == "re_decompose":
@@ -265,9 +338,19 @@ class SequentialSubgoals:
                     persisted = await rt.store.load_graph(run.id)
                     if persisted is not None:
                         graph._nodes = dict(persisted._nodes)
+                else:
+                    goal.status = GoalStatus.PENDING
+                    goal.assigned_to_session = None
+                    goal.version += 1
+                    await rt.store.release_goal(run.id, goal.id)
+            else:
+                goal.status = GoalStatus.PENDING
+                goal.assigned_to_session = None
+                goal.version += 1
+                await rt.store.release_goal(run.id, goal.id)
             # Continue the loop (do not mark done)
             await rt.end_session(session, result.status or SessionStatus.COMPLETED)
-            return
+            return True, final_validated, None
 
         if all_continue:
             graph.mark_done(goal.id, by_session=session.id)
@@ -282,8 +365,14 @@ class SequentialSubgoals:
                 await rt.store.release_goal(run.id, goal.id)
                 append_task_board(run.workspace_path, event="failed", goal_id=goal.id,
                                   session_id=session.id, agent_type=run.task.agent.type)
+            else:
+                goal.status = GoalStatus.PENDING
+                goal.assigned_to_session = None
+                goal.version += 1
+                await rt.store.release_goal(run.id, goal.id)
 
         await rt.end_session(session, result.status or SessionStatus.COMPLETED)
+        return True, final_validated, None
 
     # ------------------------------------------------------------------
     # HITL re-decomposition

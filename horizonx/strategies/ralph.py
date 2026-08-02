@@ -16,7 +16,7 @@ from typing import Any
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
-from horizonx.core.types import Run, SessionStatus
+from horizonx.core.types import Run, RunStatus, SessionStatus, StrategyOutcome
 from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 RALPH_PROMPT_TEMPLATE = """\
@@ -58,12 +58,17 @@ class RalphLoop:
         self.early_stop_window: int = config.get("early_stopping", {}).get("window", 10)
         self.early_stop_delta: float = config.get("early_stopping", {}).get("delta", 0.001)
 
-    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event]:
+    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
         workspace = run.workspace_path
         self._git_init(workspace)
 
         # Baseline
         baseline = await self._measure(workspace)
+        if baseline is None:
+            yield StrategyOutcome(
+                status=RunStatus.FAILED, reason="baseline_metric_unavailable"
+            )
+            return
         best = baseline
         history: list[float | None] = [baseline]
         yield Event(
@@ -74,6 +79,8 @@ class RalphLoop:
 
         start = time.monotonic()
         iter_index = 0
+        completed_iterations = 0
+        timed_out_iterations = 0
         while (time.monotonic() - start) < self.total_minutes * 60:
             iter_index += 1
             iters_left = int(
@@ -120,7 +127,29 @@ class RalphLoop:
                 cancel_token.cancel("iteration timeout")
                 result = None
 
-            await rt.end_session(session, SessionStatus.COMPLETED)
+            if result is None:
+                timed_out_iterations += 1
+                await rt.end_session(session, SessionStatus.TIMEOUT)
+                yield Event(
+                    type="retry.attempted",
+                    run_id=run.id,
+                    payload={"iter": iter_index, "reason": "iteration_timeout"},
+                )
+                continue
+            rt.charge(result)
+            await rt.end_session(session, result.status or SessionStatus.COMPLETED)
+            if result.status != SessionStatus.COMPLETED:
+                yield StrategyOutcome(
+                    status=(
+                        RunStatus.TIMED_OUT
+                        if result.status == SessionStatus.TIMEOUT
+                        else RunStatus.FAILED
+                    ),
+                    reason=f"agent_{result.status.value}",
+                    details={"iteration": iter_index, "error": result.error},
+                )
+                return
+            completed_iterations += 1
 
             # Verify only mutable paths were touched
             foreign_changes = self._verify_mutable_paths(workspace)
@@ -139,6 +168,13 @@ class RalphLoop:
 
             # Measure
             metric = await self._measure(workspace)
+            if metric is None:
+                yield StrategyOutcome(
+                    status=RunStatus.FAILED,
+                    reason="metric_unavailable",
+                    details={"iteration": iter_index, "best": best},
+                )
+                return
             history.append(metric)
             kept = self._improves(metric, best)
             if kept:
@@ -156,18 +192,25 @@ class RalphLoop:
 
             # Early stop
             if self._should_early_stop(history):
-                yield Event(
-                    type="run.completed",
-                    run_id=run.id,
-                    payload={"reason": "early_stop_plateau", "iterations": iter_index, "best": best},
+                yield StrategyOutcome(
+                    status=RunStatus.COMPLETED,
+                    reason="early_stop_plateau",
+                    details={"iterations": iter_index, "best": best},
                 )
                 return
 
-        yield Event(
-            type="run.completed",
-            run_id=run.id,
-            payload={"reason": "time_budget_exhausted", "iterations": iter_index, "best": best},
-        )
+        if timed_out_iterations and completed_iterations == 0:
+            yield StrategyOutcome(
+                status=RunStatus.TIMED_OUT,
+                reason="all_iterations_timed_out",
+                details={"iterations": iter_index, "best": best},
+            )
+        else:
+            yield StrategyOutcome(
+                status=RunStatus.COMPLETED,
+                reason="optimization_window_complete",
+                details={"iterations": iter_index, "best": best},
+            )
 
     # ------------------------------------------------------------------
     # Helpers

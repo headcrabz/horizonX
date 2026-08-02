@@ -72,9 +72,13 @@ class TestTreeOfTrials:
                 async for ev in tree.execute(run, rt):
                     events.append(ev)
 
-        types = [e.type for e in events]
+        from horizonx.core.event_bus import Event
+        from horizonx.core.types import RunStatus, StrategyOutcome
+
+        types = [e.type for e in events if isinstance(e, Event)]
         assert "run.started" in types
-        assert "run.completed" in types
+        outcome = next(e for e in events if isinstance(e, StrategyOutcome))
+        assert outcome.status == RunStatus.COMPLETED
 
     @pytest.mark.asyncio
     async def test_shell_score_parses_number(self, tmp_path: Path):

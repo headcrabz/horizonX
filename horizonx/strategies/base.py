@@ -12,7 +12,7 @@ from horizonx.core.event_bus import Event
 
 if TYPE_CHECKING:
     from horizonx.core.runtime import Runtime
-    from horizonx.core.types import Run
+    from horizonx.core.types import Run, StrategyOutcome
 
 
 class Strategy(Protocol):
@@ -22,6 +22,8 @@ class Strategy(Protocol):
 
     def __init__(self, config: dict[str, Any]): ...
 
-    async def execute(self, run: Run, rt: Runtime) -> AsyncIterator[Event]:
-        """Drive the run to completion or failure. Yields events for the bus."""
+    async def execute(
+        self, run: Run, rt: Runtime
+    ) -> AsyncIterator[Event | StrategyOutcome]:
+        """Yield progress events followed by exactly one terminal outcome."""
         ...

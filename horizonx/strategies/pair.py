@@ -24,7 +24,7 @@ from typing import Any
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
-from horizonx.core.types import Run, SessionStatus, Step
+from horizonx.core.types import Run, RunStatus, SessionStatus, Step, StrategyOutcome
 from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 NAVIGATOR_SYSTEM_TEMPLATE = """\
@@ -100,7 +100,7 @@ class PairProgramming:
         # Navigator can be the same agent type or a lighter model
         self.navigator_model: str | None = config.get("navigator_model")
 
-    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event]:
+    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
         yield Event(type="run.started", run_id=run.id, payload={"strategy": "pair"})
 
         driver_agent = _build_agent(run.task.agent)
@@ -136,12 +136,15 @@ class PairProgramming:
             )
             if driver_result.agent_session_id:
                 driver_session.agent_session_id = driver_result.agent_session_id
+            rt.charge(driver_result)
             await rt.end_session(driver_session, driver_result.status or SessionStatus.COMPLETED)
 
-            if driver_result.status in {SessionStatus.ERRORED, SessionStatus.TIMEOUT}:
-                yield Event(type="run.failed", run_id=run.id, payload={
-                    "strategy": "pair", "round": round_n, "error": driver_result.error,
-                })
+            if driver_result.status != SessionStatus.COMPLETED:
+                yield StrategyOutcome(
+                    status=RunStatus.FAILED,
+                    reason="driver_failed",
+                    details={"round": round_n, "error": driver_result.error},
+                )
                 return
 
             # ---- Navigator session ----
@@ -163,7 +166,15 @@ class PairProgramming:
             )
             if nav_result.agent_session_id:
                 nav_session.agent_session_id = nav_result.agent_session_id
+            rt.charge(nav_result)
             await rt.end_session(nav_session, nav_result.status or SessionStatus.COMPLETED)
+            if nav_result.status != SessionStatus.COMPLETED:
+                yield StrategyOutcome(
+                    status=RunStatus.FAILED,
+                    reason="navigator_failed",
+                    details={"round": round_n, "error": nav_result.error},
+                )
+                return
 
             # Read guidance.md written by navigator
             guidance_path = run.workspace_path / "guidance.md"
@@ -177,15 +188,15 @@ class PairProgramming:
             })
 
             if verdict == "accept" or score >= self.accept_threshold:
-                await rt.run_validators(run, None, when="final")
-                yield Event(type="run.completed", run_id=run.id, payload={
-                    "strategy": "pair", "rounds": round_n + 1, "final_score": score,
-                })
+                yield StrategyOutcome(
+                    status=RunStatus.COMPLETED,
+                    details={"rounds": round_n + 1, "final_score": score},
+                )
                 return
 
         final_score = history[-1]["score"] if history else 0.0
-        await rt.run_validators(run, None, when="final")
-        yield Event(type="run.completed", run_id=run.id, payload={
-            "strategy": "pair", "rounds": self.max_rounds,
-            "final_score": final_score, "note": "max_rounds reached",
-        })
+        yield StrategyOutcome(
+            status=RunStatus.FAILED,
+            reason="review_threshold_not_met",
+            details={"rounds": self.max_rounds, "final_score": final_score},
+        )

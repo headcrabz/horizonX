@@ -1133,7 +1133,7 @@ The `Composite` strategy runs each phase in sequence, passing run state forward.
 class MyStrategy(Strategy):
     kind = "my_strategy"
     def __init__(self, config: MyConfig): self.config = config
-    async def execute(self, run, rt) -> AsyncIterator[Event]:
+    async def execute(self, run, rt) -> AsyncIterator[Event | StrategyOutcome]:
         # Use rt primitives — get free observability, persistence,
         # spin detection, HITL, fork, retry, audit
         ...
@@ -1400,6 +1400,12 @@ class GateDecision(BaseModel):
     details: dict
     suggested_modification: str | None
 ```
+
+All built-in strategies use the same final policy. An empty applicable validator set is a
+vacuous pass. Otherwise every decision must be `continue`: `abort` produces an aborted run,
+`pause_for_hitl` prevents completion and requires operator handling, and `retry_with_mod` fails
+the current terminal attempt so retry orchestration can create a new attempt. A strategy cannot
+signal success merely by ending its iterator; it must yield exactly one typed terminal outcome.
 
 ### Built-in validators
 
@@ -2354,21 +2360,22 @@ support matrix is the concise public contract.
 | Runtime primitives, local SQLite store, and in-memory event bus | Experimental integration | SQLite now owns goal state with explicit migrations, contention handling, integrity operations, and a JSON projection; recovery and broader lifecycle invariants still need hardening. |
 | Claude Code, Codex, OpenHands, custom subprocess, and SDK drivers | Experimental | Driver modules and focused tests exist; structured transport and cross-provider capability parity are not verified. |
 | Eight strategy modules | Experimental | They do not yet share one executor, failure contract, validator mapping, budget path, or cleanup path. |
-| Goal graph and six validators | Experimental | Graph and validator components exist; terminal-state correctness and evidence-backed completion are not universal. |
+| Goal graph and six validators | Experimental | Goal and run completion now use typed outcomes and one final-validator policy; evaluator calibration and evidence independence are not yet universal. |
 | Seven spin-analysis components | Under hardening | The sequential strategy invokes the combined detector; universal strategy wiring and configured actions are incomplete. |
 | Resource governor, usage store, and deterministic policy engine | Under hardening | Enforcement and metrics are not uniform across every strategy and provider. |
 | FTS5 run/workspace knowledge and Markdown handoff modules | Components only | Cross-run sync, retrieval, and prompt injection are not connected to the normal execution lifecycle. |
 | Slack HITL and re-decomposition components | Under hardening | Durable waits, authenticated callbacks, idempotent decisions, and real cancellation are incomplete. |
 | Dashboard, pending-run records, and SSE | Experimental | SSE is in-memory; recovery can lose provider state or strand a run after a repeated crash. |
 | CLI | Implemented subset | Current commands include `run`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint`; broader operator commands are planned. |
-| CI and automated checks | Implemented | Audited baseline: 365 tests pass with one collection warning; Ruff and Mypy pass. This is not production certification. |
+| CI and automated checks | Implemented | Audited baseline: 382 tests pass with one collection warning; Ruff and Mypy pass. This is not production certification. |
 | Docker Compose | Development stub | A built image, correct binding, valid health check, install verification, and host smoke test are not yet provided. |
 
 ### Required before reliability claims
 
 - Extend the local durability kernel with append-only orchestration events, recovery leases, and a
   server-database backend for multi-worker deployments.
-- Define one terminal-state machine and one central attempt lifecycle used by every strategy.
+- Move the now-shared terminal outcome into one central attempt lifecycle for session cleanup,
+  retries, charging, cancellation, and recovery across every strategy.
 - Materialize a real repository in an isolated environment; wire and verify setup commands,
   mounts, secrets, timeouts, and process-tree cancellation.
 - Persist provider session IDs before a crash can lose them; add append-only events, attempts,

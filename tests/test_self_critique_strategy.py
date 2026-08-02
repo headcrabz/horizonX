@@ -91,7 +91,7 @@ class TestSelfCritiqueStrategy:
                 "summary": "Not there yet.",
             }
             run = await rt.run(task)
-            assert run.status == RunStatus.COMPLETED
+            assert run.status == RunStatus.FAILED
             assert mock_llm.call_count == 2
 
     @pytest.mark.asyncio

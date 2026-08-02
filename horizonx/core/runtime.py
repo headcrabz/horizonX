@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from horizonx.core.event_bus import Event, EventBus, InMemoryBus
-from horizonx.core.governor import ResourceGovernor
+from horizonx.core.governor import BudgetExceeded, ResourceGovernor
 from horizonx.core.recorder import TrajectoryRecorder
 from horizonx.core.spin_detector import CrossSessionSpinLayer, SpinDetector
 from horizonx.core.summarizer import Summarizer
@@ -25,6 +25,7 @@ from horizonx.core.types import (
     Session,
     SessionStatus,
     Step,
+    StrategyOutcome,
     Task,
     ValidatorConfig,
     new_session_id,
@@ -49,6 +50,7 @@ class Runtime:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.recorder = TrajectoryRecorder(store=store, bus=self.bus)
         self._governor_ref: Any = None  # set while a run is active
+        self._last_sessions: dict[str, Session] = {}
 
     async def __aenter__(self) -> Runtime:
         return self
@@ -64,7 +66,6 @@ class Runtime:
     async def run(self, task: Task, *, resume_from: str | None = None) -> Run:
         # Pre-flight workspace daily budget check
         if task.workspace and task.workspace.daily_budget_usd is not None:
-            from horizonx.core.governor import BudgetExceeded
             from horizonx.core.usage import UsageStore
             spent = await UsageStore(self.store).daily_usd(task.workspace.workspace_id)
             if spent >= task.workspace.daily_budget_usd:
@@ -83,12 +84,14 @@ class Runtime:
             report = DecompositionChecker().check_file(goals_path, task)
             run.decomposition_report = report.to_dict()
             if report.has_errors:
-                run.status = RunStatus.FAILED
-                await self.store.save_run(run)
-                await self.bus.publish(Event(
-                    type="run.failed", run_id=run.id,
-                    payload={"error": "decomposition_errors", "report": report.to_dict()},
-                ))
+                await self._finish_run(
+                    run,
+                    StrategyOutcome(
+                        status=RunStatus.FAILED,
+                        reason="decomposition_errors",
+                        details={"report": report.to_dict()},
+                    ),
+                )
                 return run
 
         strategy_cls = self._load_strategy(task.strategy.kind)
@@ -96,8 +99,16 @@ class Runtime:
 
         async with self._governor(run):
             try:
-                async for event in strategy.execute(run, self):
-                    await self.bus.publish(event)
+                outcome: StrategyOutcome | None = None
+                async for item in strategy.execute(run, self):
+                    if isinstance(item, StrategyOutcome):
+                        if outcome is not None:
+                            raise RuntimeError("strategy yielded more than one terminal outcome")
+                        outcome = item
+                        continue
+                    if outcome is not None:
+                        raise RuntimeError("strategy yielded an event after its terminal outcome")
+                    await self.bus.publish(item)
                     # Re-run decomposition check after graph is first written
                     if not goals_path.exists():
                         pass
@@ -105,17 +116,131 @@ class Runtime:
                         from horizonx.core.decomposition_checker import DecompositionChecker
                         rpt = DecompositionChecker().check_file(goals_path, task)
                         run.decomposition_report = rpt.to_dict()
-                run.status = RunStatus.COMPLETED
-                await self.bus.publish(Event(type="run.completed", run_id=run.id))
+                if outcome is None:
+                    outcome = StrategyOutcome(
+                        status=RunStatus.FAILED,
+                        reason="strategy_ended_without_terminal_outcome",
+                    )
+                if (
+                    outcome.status == RunStatus.COMPLETED
+                    and not outcome.details.get("_final_validated", False)
+                ):
+                    validation_result = await self._apply_final_validators(run, outcome)
+                    if isinstance(validation_result, RunStatus):
+                        if validation_result != RunStatus.PAUSED_HITL:
+                            raise RuntimeError(
+                                f"unexpected validator state: {validation_result.value}"
+                            )
+                        await self._pause_run(run)
+                        return run
+                    outcome = validation_result
+                await self._finish_run(run, outcome)
+            except BudgetExceeded as exc:
+                await self._finish_run(
+                    run,
+                    StrategyOutcome(
+                        status=RunStatus.BUDGET_EXCEEDED,
+                        reason="budget_exceeded",
+                        details={"error": str(exc)},
+                    ),
+                )
+                raise
+            except TimeoutError:
+                await self._finish_run(
+                    run,
+                    StrategyOutcome(
+                        status=RunStatus.TIMED_OUT, reason="runtime_timeout"
+                    ),
+                )
+                raise
             except Exception as exc:
-                run.status = RunStatus.FAILED
-                await self.bus.publish(
-                    Event(type="run.failed", run_id=run.id, payload={"error": str(exc)})
+                await self._finish_run(
+                    run,
+                    StrategyOutcome(
+                        status=RunStatus.FAILED,
+                        reason="runtime_error",
+                        details={"error": str(exc)},
+                    ),
                 )
                 raise
             finally:
                 await self.store.save_run(run)
         return run
+
+    async def _apply_final_validators(
+        self, run: Run, outcome: StrategyOutcome
+    ) -> StrategyOutcome | RunStatus:
+        """Apply one final-validator policy for every strategy.
+
+        No configured final validators is a vacuous pass. Otherwise every verdict must
+        continue; pause leaves the run paused, abort ends it as aborted, and a retry
+        request ends the current run as failed because a new attempt is required.
+        """
+        final_session = self._last_sessions.get(run.id)
+        if final_session is None and hasattr(self.store, "list_sessions"):
+            sessions = await self.store.list_sessions(run.id)
+            final_session = sessions[-1] if sessions else None
+        decisions = await self.run_validators(run, final_session, when="final")
+        if not decisions or all(d.decision == GateAction.CONTINUE for d in decisions):
+            return outcome
+        actions = {decision.decision for decision in decisions}
+        details = {"validator_actions": sorted(action.value for action in actions)}
+        if GateAction.ABORT in actions:
+            return StrategyOutcome(
+                status=RunStatus.ABORTED,
+                reason="final_validator_aborted",
+                details=details,
+            )
+        if GateAction.PAUSE_FOR_HITL in actions:
+            return RunStatus.PAUSED_HITL
+        return StrategyOutcome(
+            status=RunStatus.FAILED,
+            reason="final_validator_requested_retry",
+            details=details,
+        )
+
+    async def _pause_run(self, run: Run) -> None:
+        """Persist a resumable operator pause without assigning a completion time."""
+        run.status = RunStatus.PAUSED_HITL
+        run.completed_at = None
+        await self.store.save_run(run)
+        persisted = await self.store.load_run(run.id)
+        run.status = persisted.status
+        run.completed_at = persisted.completed_at
+        if run.status == RunStatus.PAUSED_HITL:
+            await self.bus.publish(
+                Event(
+                    type="run.paused_hitl",
+                    run_id=run.id,
+                    payload={
+                        "status": run.status.value,
+                        "reason": "final_validator_requires_operator",
+                    },
+                )
+            )
+
+    async def _finish_run(self, run: Run, outcome: StrategyOutcome) -> None:
+        persisted = await self.store.transition_run(run.id, outcome.status)
+        run.status = persisted.status
+        run.completed_at = persisted.completed_at
+        payload = {
+            "status": run.status.value,
+            "reason": outcome.reason,
+            **{
+                key: value
+                for key, value in outcome.details.items()
+                if not key.startswith("_")
+            },
+        }
+        if run.status == RunStatus.COMPLETED:
+            event = Event(type="run.completed", run_id=run.id, payload=payload)
+        else:
+            event = Event(
+                type="run.failed",
+                run_id=run.id,
+                payload=payload,
+            )
+        await self.bus.publish(event)
 
     # ---------------------------------------------------------------
     # Session primitives — called by strategies
@@ -136,6 +261,7 @@ class Runtime:
             target_goal_id=target_goal.id if target_goal else None,
             status=SessionStatus.RUNNING,
         )
+        self._last_sessions[run.id] = session
         run.current_session_id = session.id
         run.cumulative.sessions_count += 1
         await self.store.save_session(session)

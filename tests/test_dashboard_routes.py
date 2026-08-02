@@ -332,11 +332,18 @@ async def test_bus_delivers_events_with_predicate() -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_cancel_run(client: AsyncClient, seeded_run: Run) -> None:
-    r = await client.post(f"/api/runs/{seeded_run.id}/cancel")
+async def test_cancel_run(client: AsyncClient, app, seeded_run: Run) -> None:
+    running = seeded_run.model_copy(
+        update={"id": "run-cancellable", "status": RunStatus.RUNNING, "completed_at": None}
+    )
+    await app.state.store.save_run(running)
+
+    r = await client.post(f"/api/runs/{running.id}/cancel")
     assert r.status_code == 200
     assert r.json()["status"] == "aborted"
 
     # Verify status updated in DB
-    r2 = await client.get(f"/api/runs/{seeded_run.id}")
+    running.status = RunStatus.COMPLETED
+    await app.state.store.save_run(running)
+    r2 = await client.get(f"/api/runs/{running.id}")
     assert r2.json()["status"] == "aborted"

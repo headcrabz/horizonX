@@ -29,7 +29,7 @@ from typing import Any
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
-from horizonx.core.types import Run, SessionStatus, Step
+from horizonx.core.types import Run, RunStatus, SessionStatus, Step, StrategyOutcome
 from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 
@@ -48,7 +48,7 @@ class MonitorRespond:
             "The monitoring trigger fired. Take appropriate action.\n\n{base_prompt}"
         )
 
-    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event]:
+    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
         yield Event(type="run.started", run_id=run.id, payload={
             "strategy": "monitor",
             "poll_interval_seconds": self.poll_interval_seconds,
@@ -56,11 +56,13 @@ class MonitorRespond:
 
         triggers_fired = 0
         start = time.monotonic()
+        time_budget_exhausted = False
 
         while True:
             # Check resource budget
             elapsed_hours = (time.monotonic() - start) / 3600
             if run.task.resources.max_total_hours is not None and elapsed_hours >= run.task.resources.max_total_hours:
+                time_budget_exhausted = True
                 break
             if self.max_triggers is not None and triggers_fired >= self.max_triggers:
                 break
@@ -71,15 +73,21 @@ class MonitorRespond:
                 yield Event(type="goal.in_progress", run_id=run.id, payload={
                     "trigger_count": triggers_fired, "elapsed_hours": round(elapsed_hours, 2),
                 })
-                await self._run_responder(run, rt, triggers_fired)
+                responder_outcome = await self._run_responder(run, rt, triggers_fired)
+                if responder_outcome is not None:
+                    yield responder_outcome
+                    return
                 await rt.run_validators(run, None, when="after_every_session")
 
             await asyncio.sleep(self.poll_interval_seconds)
 
-        yield Event(type="run.completed", run_id=run.id, payload={
-            "strategy": "monitor",
-            "triggers_fired": triggers_fired,
-        })
+        yield StrategyOutcome(
+            status=(
+                RunStatus.TIMED_OUT if time_budget_exhausted else RunStatus.COMPLETED
+            ),
+            reason="monitor_time_budget_exhausted" if time_budget_exhausted else None,
+            details={"triggers_fired": triggers_fired},
+        )
 
     async def _check_trigger(self, workspace_path: Any) -> bool:
         if self.trigger_command:
@@ -119,7 +127,9 @@ class MonitorRespond:
             return value <= self.trigger_threshold
         return abs(value - self.trigger_threshold) < 1e-9
 
-    async def _run_responder(self, run: Run, rt: Any, trigger_count: int) -> None:
+    async def _run_responder(
+        self, run: Run, rt: Any, trigger_count: int
+    ) -> StrategyOutcome | None:
         session = await rt.start_session(run, target_goal=None)
         agent = _build_agent(run.task.agent)
         workspace = Workspace(path=run.workspace_path, env={})
@@ -140,4 +150,16 @@ class MonitorRespond:
         )
         if result.agent_session_id:
             session.agent_session_id = result.agent_session_id
+        rt.charge(result)
         await rt.end_session(session, result.status or SessionStatus.COMPLETED)
+        if result.status != SessionStatus.COMPLETED:
+            return StrategyOutcome(
+                status=(
+                    RunStatus.TIMED_OUT
+                    if result.status == SessionStatus.TIMEOUT
+                    else RunStatus.FAILED
+                ),
+                reason=f"responder_{result.status.value}",
+                details={"trigger_count": trigger_count, "error": result.error},
+            )
+        return None

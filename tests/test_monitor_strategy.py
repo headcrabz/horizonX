@@ -88,11 +88,13 @@ class TestMonitorRespond:
         run = _make_run(tmp_path)
         rt = _make_mock_rt(tmp_path)
 
-        with patch.object(m, "_run_responder", new=AsyncMock()):
+        with patch.object(m, "_run_responder", new=AsyncMock(return_value=None)):
             events = []
             async for ev in m.execute(run, rt):
                 events.append(ev)
 
-        completed = [e for e in events if e.type == "run.completed"]
-        assert len(completed) == 1
-        assert completed[0].payload["triggers_fired"] == 2
+        from horizonx.core.types import RunStatus, StrategyOutcome
+
+        outcome = next(e for e in events if isinstance(e, StrategyOutcome))
+        assert outcome.status == RunStatus.COMPLETED
+        assert outcome.details["triggers_fired"] == 2

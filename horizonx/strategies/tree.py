@@ -25,7 +25,7 @@ from typing import Any
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.event_bus import Event
-from horizonx.core.types import Run, SessionStatus, Step
+from horizonx.core.types import Run, RunStatus, SessionStatus, Step, StrategyOutcome
 from horizonx.strategies._agent_builder import build_agent as _build_agent
 
 
@@ -41,7 +41,7 @@ class TreeOfTrials:
         self.scorer_model: str = config.get("scorer_model", "claude-haiku-4-5")
         self.prune_below: float = config.get("prune_below", 0.0)
 
-    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event]:
+    async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
         yield Event(type="run.started", run_id=run.id, payload={
             "strategy": "tree", "width": self.width, "max_depth": self.max_depth,
         })
@@ -63,22 +63,35 @@ class TreeOfTrials:
 
             results = await asyncio.gather(*branch_tasks, return_exceptions=True)
 
+            if not results or all(isinstance(result, Exception) for result in results):
+                errors = [str(result) for result in results if isinstance(result, Exception)]
+                for branch_dir in branch_dirs:
+                    shutil.rmtree(branch_dir, ignore_errors=True)
+                yield StrategyOutcome(
+                    status=RunStatus.FAILED,
+                    reason="all_branches_failed",
+                    details={"depth": depth, "errors": errors},
+                )
+                return
+
             # Score all branches
             scores: list[float] = []
+            successful_branches: list[tuple[float, Path]] = []
             for i, (branch_dir, result) in enumerate(zip(branch_dirs, results, strict=False)):
                 if isinstance(result, Exception):
                     scores.append(0.0)
                     continue
                 score = await self._score_branch(branch_dir, run)
                 scores.append(score)
+                successful_branches.append((score, branch_dir))
                 yield Event(type="step.recorded", run_id=run.id, payload={
                     "depth": depth, "branch": i, "score": score,
                 })
 
             # Select winner (prune below threshold)
-            viable = [(s, d) for s, d in zip(scores, branch_dirs, strict=False) if s >= self.prune_below]
+            viable = [(s, d) for s, d in successful_branches if s >= self.prune_below]
             if not viable:
-                viable = [(scores[0], branch_dirs[0])]  # fallback: keep first
+                viable = successful_branches
             best_score, winner_dir = max(viable, key=lambda x: x[0])
 
             # Merge winner back into main workspace
@@ -97,11 +110,17 @@ class TreeOfTrials:
             if best_score >= self.accept_threshold:
                 break
 
-        await rt.run_validators(run, None, when="final")
-        yield Event(type="run.completed", run_id=run.id, payload={
-            "strategy": "tree", "depth": depth + 1,
-            "final_score": best_score, "width": self.width,
-        })
+        if best_score < self.accept_threshold:
+            yield StrategyOutcome(
+                status=RunStatus.FAILED,
+                reason="acceptance_threshold_not_met",
+                details={"final_score": best_score, "width": self.width},
+            )
+            return
+        yield StrategyOutcome(
+            status=RunStatus.COMPLETED,
+            details={"final_score": best_score, "width": self.width},
+        )
 
     async def _run_branch(
         self, run: Run, rt: Any, branch_dir: Path, branch_idx: int, depth: int
@@ -126,7 +145,10 @@ class TreeOfTrials:
         )
         if result.agent_session_id:
             session.agent_session_id = result.agent_session_id
+        rt.charge(result)
         await rt.end_session(session, result.status or SessionStatus.COMPLETED)
+        if result.status != SessionStatus.COMPLETED:
+            raise RuntimeError(f"tree branch ended with {result.status.value}")
 
     async def _score_branch(self, branch_dir: Path, run: Run) -> float:
         if self.scorer_type == "shell" and self.scorer_command:
