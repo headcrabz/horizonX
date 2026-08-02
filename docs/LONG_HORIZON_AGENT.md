@@ -285,6 +285,7 @@ class Task(BaseModel):
     estimated_duration_hours: tuple[float, float] | None
     strategy: StrategyConfig
     agent: AgentConfig
+    repository: RepositoryConfig | None
     environment: EnvironmentConfig
     milestone_validators: list[ValidatorConfig]
     handoff_files: list[str]
@@ -2359,15 +2360,16 @@ support matrix is the concise public contract.
 | Pydantic task/run/session/config models and registries | Implemented | Strategy names remain a fixed schema literal even though agent and validator registries accept extensions. |
 | Runtime primitives, local SQLite store, and in-memory event bus | Experimental integration | SQLite now owns goal state with explicit migrations, contention handling, integrity operations, and a JSON projection; recovery and broader lifecycle invariants still need hardening. |
 | Claude Code, Codex, OpenHands, custom subprocess, and SDK drivers | Experimental | Driver modules and focused tests exist; structured transport and cross-provider capability parity are not verified. |
-| Eight strategy modules | Experimental | They do not yet share one executor, failure contract, validator mapping, budget path, or cleanup path. |
+| Eight strategy modules | Experimental | They share typed terminal outcomes and a final-validator policy, but do not yet share one attempt, budget, cleanup, and recovery executor. |
 | Goal graph and six validators | Experimental | Goal and run completion now use typed outcomes and one final-validator policy; evaluator calibration and evidence independence are not yet universal. |
 | Seven spin-analysis components | Under hardening | The sequential strategy invokes the combined detector; universal strategy wiring and configured actions are incomplete. |
 | Resource governor, usage store, and deterministic policy engine | Under hardening | Enforcement and metrics are not uniform across every strategy and provider. |
 | FTS5 run/workspace knowledge and Markdown handoff modules | Components only | Cross-run sync, retrieval, and prompt injection are not connected to the normal execution lifecycle. |
 | Slack HITL and re-decomposition components | Under hardening | Durable waits, authenticated callbacks, idempotent decisions, and real cancellation are incomplete. |
 | Dashboard, pending-run records, and SSE | Experimental | SSE is in-memory; recovery can lose provider state or strand a run after a repeated crash. |
-| CLI | Implemented subset | Current commands include `run`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint`; broader operator commands are planned. |
-| CI and automated checks | Implemented | Audited baseline: 382 tests pass with one collection warning; Ruff and Mypy pass. This is not production certification. |
+| Local repository environment | Implemented, local-only | Local paths use contained Git worktrees; clone URLs, refs, branches, submodules, setup-once commands, metadata, and safe session-boundary resume are covered. Docker, Podman, E2B, secure mounts, and process containment are not implemented. |
+| CLI | Implemented subset | `run --repo/--ref/--branch`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint` are available; broader operator commands are planned. |
+| CI and automated checks | Implemented | The audited test count is published in the README; Ruff and Mypy pass. This is not production certification. |
 | Docker Compose | Development stub | A built image, correct binding, valid health check, install verification, and host smoke test are not yet provided. |
 
 ### Required before reliability claims
@@ -2376,8 +2378,8 @@ support matrix is the concise public contract.
   server-database backend for multi-worker deployments.
 - Move the now-shared terminal outcome into one central attempt lifecycle for session cleanup,
   retries, charging, cancellation, and recovery across every strategy.
-- Materialize a real repository in an isolated environment; wire and verify setup commands,
-  mounts, secrets, timeouts, and process-tree cancellation.
+- Extend the verified local worktree backend with secure mounts, secret injection, hard process-tree
+  cancellation, and isolated Docker/Podman/remote implementations.
 - Persist provider session IDs before a crash can lose them; add append-only events, attempts,
   leases, idempotent recovery, and durable operator commands.
 - Normalize Claude/Codex events before accounting and spin detection; reconcile tokens, cost,

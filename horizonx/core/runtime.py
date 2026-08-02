@@ -28,8 +28,11 @@ from horizonx.core.types import (
     StrategyOutcome,
     Task,
     ValidatorConfig,
+    new_run_id,
     new_session_id,
 )
+from horizonx.environments.base import PreparedWorkspace, SetupCommandError, WorkspaceError
+from horizonx.environments.git import GitWorktreeBackend
 
 
 class Runtime:
@@ -51,6 +54,7 @@ class Runtime:
         self.recorder = TrajectoryRecorder(store=store, bus=self.bus)
         self._governor_ref: Any = None  # set while a run is active
         self._last_sessions: dict[str, Session] = {}
+        self._prepared_workspaces: dict[str, PreparedWorkspace] = {}
 
     async def __aenter__(self) -> Runtime:
         return self
@@ -75,6 +79,22 @@ class Runtime:
                 )
         run = await self._load_or_create(task, resume_from)
         await self.store.save_run(run)
+        try:
+            await self.prepare_workspace(run, resume=resume_from is not None)
+        except WorkspaceError as exc:
+            await self._finish_run(
+                run,
+                StrategyOutcome(
+                    status=RunStatus.FAILED,
+                    reason=(
+                        "workspace_setup_failed"
+                        if isinstance(exc, SetupCommandError)
+                        else "workspace_preparation_failed"
+                    ),
+                    details={"error": str(exc)},
+                ),
+            )
+            raise
         await self.bus.publish(Event(type="run.started", run_id=run.id))
 
         # GE-01: decomposition quality pre-check (after goals.json exists)
@@ -438,7 +458,23 @@ class Runtime:
     def _workspace_for(self, run: Run) -> Any:
         from horizonx.environments.local import LocalWorkspace
 
-        return LocalWorkspace(run.workspace_path)
+        return LocalWorkspace(run.workspace_path, env=self.workspace_env(run))
+
+    def workspace_env(self, run: Run) -> dict[str, str]:
+        prepared = self._prepared_workspaces.get(run.id)
+        return dict(prepared.env) if prepared is not None else {}
+
+    async def prepare_workspace(self, run: Run, *, resume: bool) -> PreparedWorkspace:
+        backend = GitWorktreeBackend(self.workspace_root, run.task.environment)
+        prepared = (
+            await backend.resume(run.workspace_path)
+            if resume
+            else await backend.prepare(run.id, run.task.repository)
+        )
+        run.workspace_path = prepared.path
+        self._prepared_workspaces[run.id] = prepared
+        await self.store.save_run(run)
+        return prepared
 
     def charge(self, result: Any) -> None:
         """Charge the active governor for a completed session. Call after agent.run_session()."""
@@ -477,9 +513,14 @@ class Runtime:
             run = await self.store.load_run(resume_from)
             run.status = RunStatus.RUNNING
             return cast(Run, run)
-        workspace = self.workspace_root / f"{task.id}-{new_session_id()[:8]}"
-        workspace.mkdir(parents=True, exist_ok=True)
-        return Run(task=task, workspace_path=workspace, status=RunStatus.RUNNING)
+        run_id = new_run_id()
+        workspace = self.workspace_root / run_id
+        return Run(
+            id=run_id,
+            task=task,
+            workspace_path=workspace,
+            status=RunStatus.RUNNING,
+        )
 
     # ---------------------------------------------------------------
     # Fork / Merge

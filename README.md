@@ -14,7 +14,7 @@ hardened. It is suitable for local evaluation and development—not unattended o
 [![CI](https://github.com/headcrabz/horizonX/actions/workflows/ci.yml/badge.svg)](https://github.com/headcrabz/horizonX/actions)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Tests: 389 passing](https://img.shields.io/badge/tests-389%20passing-brightgreen.svg)](tests/)
+[![Tests: 405 passing](https://img.shields.io/badge/tests-405%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -70,10 +70,18 @@ horizonx list
 horizonx show <run-id>
 ```
 
-By default, orchestration state is written to `./horizonx.db` and run artifacts to
-`./horizonx-workspaces/`. Keep the database on a local filesystem and use one HorizonX process.
-To choose another local database, pass `--db path/to/horizonx.db` before the command or set
-`HORIZONX_DB`.
+To run against an existing Git repository, pass its local path. HorizonX checks out the requested
+ref into an isolated worktree and leaves the source checkout unchanged:
+
+```bash
+horizonx run path/to/task.yaml --repo . --ref HEAD
+```
+
+By default, orchestration state is written to `./horizonx.db`. From-scratch runs use
+`./horizonx-workspaces/`; local repository runs use a hidden sibling directory so the source tree
+does not become dirty. The CLI prints the exact run ID, status, and workspace path. Keep the
+database on a local filesystem and use one HorizonX process. To choose explicit locations, use
+`--db path/to/horizonx.db` before the command and `--workspace-root` after `run`.
 
 Optional operator views:
 
@@ -125,6 +133,21 @@ strategy:
 agent:
   type: claude_code
   model: claude-opus-4-8
+
+# Optional for tasks that operate on an existing repository.
+# Use `url` instead of `path` to clone a remote source.
+repository:
+  path: .
+  ref: HEAD
+  branch: horizonx/jwt-refactor
+  submodules: false
+
+environment:
+  type: local
+  setup_commands:
+    - python -m venv .venv
+    - .venv/bin/pip install -r requirements.txt
+  inherit_env: [PATH, HOME, ANTHROPIC_API_KEY]
 
 milestone_validators:
   - id: tests_pass
@@ -399,10 +422,10 @@ focused tests; it does not imply a verified production guarantee.
 | FTS5 knowledge store and handoff sync | Components only | The store and sync modules are not yet connected to the normal runtime/strategy lifecycle. Automatic cross-run memory is not claimed. |
 | Slack HITL and dashboard controls | Under hardening | Durable decisions, authenticated callbacks, restart-safe waits, and process-tree cancellation are not complete. |
 | SSE dashboard and JSONL trajectory | Experimental | SSE is in-memory and has no durable cursor/replay guarantee. |
-| Local workspace execution | Experimental | Runs currently materialize an empty local workspace; repository checkout and setup-command semantics need hardening. |
-| Docker, Podman, and E2B execution | Configuration only | Configuration models exist, but non-local environment execution is not wired into the runtime. |
+| Local workspace execution | Implemented, local-only | Local paths use contained Git worktrees; clone URLs, refs, optional branches/submodules, setup commands with an environment allowlist, metadata, and safe session-boundary resume are covered. Process containment and exact crash recovery still need hardening. |
+| Docker, Podman, and E2B execution | Not supported | Unimplemented backend values are rejected by configuration instead of being silently treated as local execution. |
 | Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |
-| Automated verification | Implemented | 389 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Automated verification | Implemented | 405 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
 | Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
 
 Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or

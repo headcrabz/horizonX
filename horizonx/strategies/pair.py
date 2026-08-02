@@ -109,7 +109,7 @@ class PairProgramming:
             nav_config = run.task.agent.model_copy(update={"model": self.navigator_model})
         navigator_agent = _build_agent(nav_config)
 
-        workspace = Workspace(path=run.workspace_path, env={})
+        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
         history: list[dict[str, Any]] = []
 
         for round_n in range(self.max_rounds):

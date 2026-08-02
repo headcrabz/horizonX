@@ -1,22 +1,17 @@
 """Local workspace — runs commands directly on the host filesystem.
 
-Useful for development and trusted tasks. For untrusted code, use Podman/Docker.
+Useful for development and trusted tasks. No isolated backend is supported yet.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
-@dataclass
-class CommandResult:
-    returncode: int
-    stdout: str
-    stderr: str
-    elapsed: float
+from horizonx.environments.base import CommandResult
 
 
 @dataclass
@@ -29,6 +24,7 @@ class LocalWorkspace:
         proc = await asyncio.create_subprocess_shell(
             cmd,
             cwd=str(self.path),
+            env={**os.environ, **self.env},
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

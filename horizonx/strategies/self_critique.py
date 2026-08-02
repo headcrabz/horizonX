@@ -91,7 +91,7 @@ class SelfCritique:
         self.write_progress: bool = config.get("write_progress", True)
 
     async def execute(self, run: Run, rt: Any) -> AsyncIterator[Event | StrategyOutcome]:
-        workspace = Workspace(path=run.workspace_path, env={})
+        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
         agent = _build_agent(run.task.agent)
         history: list[dict[str, Any]] = []
 

@@ -119,7 +119,7 @@ class DecompositionFirst:
             )
 
             agent = _build_agent(run.task.agent)
-            workspace = Workspace(path=run.workspace_path, env={})
+            workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
             cancel = CancelToken()
 
             prompt = (

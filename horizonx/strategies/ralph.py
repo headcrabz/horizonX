@@ -108,7 +108,7 @@ class RalphLoop:
                 step.session_id = _s.id
                 await rt.record_step(_s, step)
 
-            ws = Workspace(path=workspace, env={})
+            ws = Workspace(path=workspace, env=rt.workspace_env(run))
 
             try:
                 result = await asyncio.wait_for(

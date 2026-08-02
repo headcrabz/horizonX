@@ -28,7 +28,7 @@ class SingleSession:
             step.session_id = session.id
             await rt.record_step(session, step)
 
-        workspace = Workspace(path=run.workspace_path, env={})
+        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
         result = await agent.run_session(
             session_prompt=run.task.prompt,
             workspace=workspace,

@@ -14,7 +14,8 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
-from horizonx import Runtime, Task
+from horizonx import RepositoryConfig, Run, RunStatus, Runtime, Task
+from horizonx.environments.base import WorkspaceError
 from horizonx.storage import SqliteStore
 
 console = Console()
@@ -41,21 +42,81 @@ def _load_task_from_path(path: Path) -> Task:
             raise click.ClickException(f"no task.yaml in {path}")
         path = task_yaml
     data = yaml.safe_load(path.read_text())
-    return Task.model_validate(data)
+    task = Task.model_validate(data)
+    if task.repository is not None and task.repository.path is not None:
+        repository_path = task.repository.path
+        if not repository_path.is_absolute():
+            task.repository = task.repository.model_copy(
+                update={"path": (path.parent / repository_path).resolve()}
+            )
+    return task
 
 
 @main.command()
 @click.argument("task_path", type=click.Path(exists=True, path_type=Path))
 @click.option("--resume", default=None, help="Resume from existing run id")
-@click.option("--workspace-root", default="./horizonx-workspaces", type=Path)
+@click.option("--workspace-root", default=None, type=Path)
+@click.option("--repo", default=None, help="Local repository path or clone URL")
+@click.option("--ref", "base_ref", default="HEAD", show_default=True)
+@click.option("--branch", default=None, help="Create this branch in the isolated workspace")
+@click.option("--submodules/--no-submodules", default=False, show_default=True)
 @click.pass_context
-def run(ctx: click.Context, task_path: Path, resume: str | None, workspace_root: Path) -> None:
+def run(
+    ctx: click.Context,
+    task_path: Path,
+    resume: str | None,
+    workspace_root: Path | None,
+    repo: str | None,
+    base_ref: str,
+    branch: str | None,
+    submodules: bool,
+) -> None:
     """Run a task to completion (or pause/abort)."""
     task = _load_task_from_path(task_path)
+    if repo is not None:
+        local_path = Path(repo).expanduser()
+        is_url = "://" in repo or repo.startswith(("git@", "ssh:"))
+        task.repository = RepositoryConfig(
+            path=None if is_url else local_path.resolve(),
+            url=repo if is_url else None,
+            ref=base_ref,
+            branch=branch,
+            submodules=submodules,
+        )
+    elif branch is not None or base_ref != "HEAD" or submodules:
+        raise click.ClickException("--ref, --branch, and --submodules require --repo")
+    if workspace_root is None:
+        if task.repository is not None and task.repository.path is not None:
+            source = task.repository.path.resolve()
+            workspace_root = source.parent / f".{source.name}-horizonx-workspaces"
+        else:
+            workspace_root = Path("./horizonx-workspaces")
     store = SqliteStore(ctx.obj["db"])
     runtime = Runtime(store=store, workspace_root=workspace_root)
     console.print(f"[bold cyan]HorizonX[/]  starting run for task [yellow]{task.id}[/]")
-    asyncio.run(runtime.run(task, resume_from=resume))
+
+    async def _run_task() -> Run:
+        try:
+            return await runtime.run(task, resume_from=resume)
+        finally:
+            await store.close()
+
+    try:
+        completed_run = asyncio.run(_run_task())
+    except WorkspaceError as exc:
+        raise click.ClickException(str(exc)) from None
+    console.print(f"Run: [bold]{completed_run.id}[/bold]")
+    console.print(f"Status: {completed_run.status.value}")
+    console.print(f"Workspace: {completed_run.workspace_path}")
+    if completed_run.status in {
+        RunStatus.FAILED,
+        RunStatus.ABORTED,
+        RunStatus.TIMED_OUT,
+        RunStatus.BUDGET_EXCEEDED,
+    }:
+        raise click.ClickException(
+            f"run ended with status {completed_run.status.value}"
+        )
 
 
 @main.command()

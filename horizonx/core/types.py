@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # ID types — string newtypes for clarity at call sites
@@ -183,12 +183,50 @@ class StrategyConfig(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class RepositoryConfig(BaseModel):
+    """Repository source used to materialize an isolated run workspace."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: Path | None = None
+    url: str | None = Field(default=None, min_length=1)
+    ref: str = Field(default="HEAD", min_length=1)
+    branch: str | None = None
+    submodules: bool = False
+
+    @model_validator(mode="after")
+    def _one_source(self) -> RepositoryConfig:
+        if (self.path is None) == (self.url is None):
+            raise ValueError("repository requires exactly one of path or url")
+        return self
+
+
 class EnvironmentConfig(BaseModel):
-    type: Literal["podman", "docker", "local", "e2b"] = "local"
-    image: str | None = None
+    """Verified local execution settings.
+
+    Container and remote backends are intentionally rejected until their lifecycle and
+    containment contracts have end-to-end coverage.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["local"] = "local"
     setup_commands: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
-    mounts: list[dict[str, str]] = Field(default_factory=list)
+    inherit_env: list[str] = Field(
+        default_factory=lambda: [
+            "PATH",
+            "HOME",
+            "USER",
+            "SHELL",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ]
+    )
+    setup_timeout_seconds: float = Field(default=600.0, gt=0)
 
 
 class ValidatorConfig(BaseModel):
@@ -281,6 +319,7 @@ class Task(BaseModel):
 
     strategy: StrategyConfig
     agent: AgentConfig
+    repository: RepositoryConfig | None = None
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     milestone_validators: list[ValidatorConfig] = Field(default_factory=list)
     handoff_files: list[str] = Field(

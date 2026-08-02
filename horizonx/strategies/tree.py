@@ -127,7 +127,7 @@ class TreeOfTrials:
     ) -> None:
         session = await rt.start_session(run, target_goal=None)
         agent = _build_agent(run.task.agent)
-        workspace = Workspace(path=branch_dir, env={})
+        workspace = Workspace(path=branch_dir, env=rt.workspace_env(run))
         cancel = CancelToken()
 
         prompt = (

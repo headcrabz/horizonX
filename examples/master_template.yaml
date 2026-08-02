@@ -205,8 +205,24 @@ agent:
 
 
 # ---------------------------------------------------------------------------
+# Repository  (RepositoryConfig; optional for from-scratch tasks)
+# Exactly one of path or url. Relative paths resolve from this task file.
+# ---------------------------------------------------------------------------
+
+# repository:
+#   path: .                            # local Git repository
+#   ref: HEAD                          # commit, tag, or branch to materialize
+#   branch: null                       # optional new branch in the run worktree
+#   submodules: false
+
+# repository:
+#   url: https://github.com/org/repo.git
+#   ref: main
+
+
+# ---------------------------------------------------------------------------
 # Environment  (EnvironmentConfig)
-# type options: local | podman | docker | e2b
+# Only the verified local backend is accepted in this release.
 # ---------------------------------------------------------------------------
 
 environment:
@@ -216,25 +232,12 @@ environment:
     - "python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt"
 
   env: {}                              # dict[str, str]; extra env vars for agent
-
-  mounts: []                           # list[{src: str, dst: str}]; for container types
-
-# --- container environment (podman or docker) ---
-# environment:
-#   type: podman                       # or docker
-#   image: python:3.12-slim
-#   setup_commands:
-#     - "pip install -r requirements.txt"
-#   env:
-#     DATABASE_URL: "sqlite:///app.db"
-#   mounts:
-#     - {src: /host/data, dst: /workspace/data}
-
-# --- e2b sandbox ---
-# environment:
-#   type: e2b
-#   image: python                      # e2b template name
-#   setup_commands: []
+  inherit_env:                         # explicit parent-process allowlist
+    - PATH
+    - HOME
+    - ANTHROPIC_API_KEY
+    - OPENAI_API_KEY
+  setup_timeout_seconds: 600
 
 
 # ---------------------------------------------------------------------------

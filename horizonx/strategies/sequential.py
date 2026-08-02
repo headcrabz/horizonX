@@ -131,7 +131,7 @@ class SequentialSubgoals:
         sm = SessionManager(run)
         prompt = sm.compose_prompt(target_goal=None)
         agent = _build_agent(run.task.agent)
-        workspace = Workspace(path=run.workspace_path, env={})
+        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
 
         async def on_step(step: Any) -> None:
             step.session_id = session.id
@@ -211,7 +211,7 @@ class SequentialSubgoals:
         sm = SessionManager(run)
         prompt = sm.compose_prompt(target_goal=goal)
         agent = _build_agent(run.task.agent)
-        workspace = Workspace(path=run.workspace_path, env={})
+        workspace = Workspace(path=run.workspace_path, env=rt.workspace_env(run))
 
         cancel_token = CancelToken()
 

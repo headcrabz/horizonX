@@ -32,6 +32,8 @@ def _load_task_as_mock(yaml_path: Path) -> Task:
     }}
     # Remove validators that require real commands for mock testing
     data["milestone_validators"] = []
+    # Setup is covered by workspace materialization tests; mock E2E stays provider-free.
+    data["environment"] = {"type": "local"}
     # Override strategy to single for faster e2e
     data["strategy"] = {"kind": "single"}
     return Task(**data)
@@ -121,6 +123,7 @@ class TestE2EPipeline:
             data = yaml.safe_load(f)
         data["agent"] = {"type": "mock", "model": "mock"}
         data["strategy"] = {"kind": "single"}
+        data["environment"] = {"type": "local"}
         data["milestone_validators"] = [{
             "id": "progress_judge",
             "type": "llm_judge",
