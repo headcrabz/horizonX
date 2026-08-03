@@ -25,13 +25,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.types import AgentConfig, SessionRunResult, SessionStatus, Step, StepType
+from horizonx.security.environment_policy import build_child_environment, redact_secrets
+from horizonx.security.process import drain_stream, spawn_process, terminate_process_tree
 
 logger = logging.getLogger(__name__)
 
@@ -91,15 +92,13 @@ class OpenHandsAgent:
         if self.runtime:
             cmd += ["--runtime", self.runtime]
 
-        env = {**os.environ, **workspace.env}
+        env = build_child_environment(workspace.env)
 
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await spawn_process(
                 *cmd,
-                cwd=str(workspace.path),
+                cwd=workspace.path,
                 env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
             logger.warning("OpenHands CLI binary %r not found", self.cli_bin)
@@ -108,31 +107,46 @@ class OpenHandsAgent:
                 error=f"OpenHands CLI binary not found: {self.cli_bin}",
             )
 
+        stderr_task = asyncio.create_task(
+            drain_stream(proc.stderr), name=f"stderr-{proc.pid}"
+        )
         seq = 0
         assert proc.stdout is not None
-        while True:
-            if cancel_token and cancel_token.cancelled:
-                proc.terminate()
+        try:
+            while True:
+                if cancel_token and cancel_token.cancelled:
+                    await terminate_process_tree(proc)
+                    await stderr_task
+                    return SessionRunResult(status=SessionStatus.TIMEOUT)
+                if proc.returncode is not None:
+                    break
+
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
                 except TimeoutError:
-                    proc.kill()
-                return SessionRunResult(status=SessionStatus.TIMEOUT)
+                    continue
+                if not line:
+                    break
 
-            line = await proc.stdout.readline()
-            if not line:
-                break
+                text = line.decode(errors="replace").strip()
+                if not text:
+                    continue
 
-            text = line.decode(errors="replace").strip()
-            if not text:
-                continue
+                step = self._parse_cli_line(text, seq, session_id or "")
+                if step and on_step:
+                    step = step.model_copy(
+                        update={"content": redact_secrets(step.content, env)}
+                    )
+                    await on_step(step)
+                    seq += 1
 
-            step = self._parse_cli_line(text, seq, session_id or "")
-            if step and on_step:
-                await on_step(step)
-                seq += 1
-
-        await proc.wait()
+            await proc.wait()
+            await terminate_process_tree(proc)
+            await stderr_task
+        except asyncio.CancelledError:
+            await terminate_process_tree(proc)
+            await stderr_task
+            raise
         if proc.returncode == 0:
             return SessionRunResult(status=SessionStatus.COMPLETED)
         return SessionRunResult(

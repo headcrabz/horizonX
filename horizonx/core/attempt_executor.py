@@ -75,6 +75,15 @@ class AttemptExecutor:
             if hasattr(rt, "workspace_snapshot")
             else {}
         )
+        workspace_environment = rt.workspace_env(run)
+        from horizonx.security.environment_policy import trust_boundary_metadata
+
+        workspace_snapshot = (
+            dict(snapshot_value) if isinstance(snapshot_value, dict) else {}
+        )
+        workspace_snapshot["trust_boundary"] = trust_boundary_metadata(
+            workspace_environment, configured_agent
+        )
         attempt = AttemptRecord(
             lineage_id=(
                 recovery_context.get("lineage_id") if recovery_context else None
@@ -86,9 +95,7 @@ class AttemptExecutor:
             provider=configured_agent.type,
             model=configured_agent.model,
             workspace_path=workspace_path or run.workspace_path,
-            workspace_snapshot=(
-                snapshot_value if isinstance(snapshot_value, dict) else {}
-            ),
+            workspace_snapshot=workspace_snapshot,
             retry_cause=(
                 recovery_context.get("retry_cause") if recovery_context else None
             ),
@@ -119,6 +126,11 @@ class AttemptExecutor:
         async def on_step(step: Step) -> None:
             nonlocal spin_detected
             step.session_id = session.id
+            from horizonx.security.environment_policy import redact_secrets
+
+            redacted_content = redact_secrets(step.content, workspace_environment)
+            if isinstance(redacted_content, dict):
+                step.content = redacted_content
             if step.type == StepType.SESSION_ID:
                 provider_session_id = step.content.get("session_id")
                 if provider_session_id:

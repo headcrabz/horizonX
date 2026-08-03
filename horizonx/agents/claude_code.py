@@ -54,6 +54,7 @@ class ClaudeCodeConfig:
     extra_args: list[str] = field(default_factory=list)
     use_session_id: bool = True   # let HorizonX assign UUID for the session
     no_session_persistence: bool = False  # if True, sessions can't be resumed
+    allow_unsafe_permissions: bool = False
 
     @classmethod
     def from_agent_config(cls, ac: AgentConfig) -> ClaudeCodeConfig:
@@ -66,11 +67,14 @@ class ClaudeCodeConfig:
             system_prompt=ac.extra.get("system_prompt"),
             append_system_prompt=ac.extra.get("append_system_prompt"),
             max_budget_usd=ac.extra.get("max_budget_usd"),
-            permission_mode=ac.extra.get("permission_mode", "bypassPermissions"),
+            permission_mode=ac.extra.get("permission_mode", "default"),
             extra_args=ac.extra.get("extra_args", []),
             use_session_id=bool(ac.extra.get("use_session_id", True)),
             no_session_persistence=bool(
                 ac.extra.get("no_session_persistence", False)
+            ),
+            allow_unsafe_permissions=bool(
+                ac.extra.get("allow_unsafe_permissions", False)
             ),
         )
 
@@ -103,6 +107,13 @@ class ClaudeCodeAgent:
             if isinstance(config, ClaudeCodeConfig)
             else ClaudeCodeConfig.from_agent_config(config)
         )
+        if (
+            self.config.permission_mode == "bypassPermissions"
+            and not self.config.allow_unsafe_permissions
+        ):
+            raise ValueError(
+                "bypassPermissions requires extra.allow_unsafe_permissions=true"
+            )
         self._totals: dict[str, float] = {
             "input_tokens": 0,
             "output_tokens": 0,

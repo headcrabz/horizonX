@@ -41,13 +41,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import shlex
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.core.types import AgentConfig, SessionRunResult, SessionStatus, Step, StepType
+from horizonx.security.environment_policy import build_child_environment, redact_secrets
+from horizonx.security.process import drain_stream, spawn_process, terminate_process_tree
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,7 @@ class CustomAgent:
     ) -> SessionRunResult:
         sid = session_id or ""
 
-        env = {**os.environ, **workspace.env, **self._extra_env}
+        env = build_child_environment({**workspace.env, **self._extra_env})
         env["HORIZONX_WORKSPACE"] = str(workspace.path)
         env["HORIZONX_MODEL"] = self.config.model or ""
         env["HORIZONX_SESSION_ID"] = sid
@@ -120,13 +121,11 @@ class CustomAgent:
         cmd.extend(self._extra_args)
 
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await spawn_process(
                 *cmd,
-                cwd=str(workspace.path),
+                cwd=workspace.path,
                 env=env,
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
             logger.error("CustomAgent binary not found: %s", cmd[0])
@@ -135,6 +134,9 @@ class CustomAgent:
                 error=f"custom agent binary not found: {cmd[0]!r}",
             )
 
+        stderr_task = asyncio.create_task(
+            drain_stream(proc.stderr), name=f"stderr-{proc.pid}"
+        )
         if stdin_data is not None and proc.stdin:
             proc.stdin.write(stdin_data)
             await proc.stdin.drain()
@@ -146,7 +148,14 @@ class CustomAgent:
         async def _drain() -> None:
             nonlocal seq
             while True:
-                line = await proc.stdout.readline()  # type: ignore[union-attr]
+                if proc.returncode is not None:
+                    return
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=0.1  # type: ignore[union-attr]
+                    )
+                except TimeoutError:
+                    continue
                 if not line:
                     return
                 text = line.decode(errors="replace").strip()
@@ -154,6 +163,9 @@ class CustomAgent:
                     continue
                 step = self._parse_line(text, seq, sid)
                 if step is not None:
+                    step = step.model_copy(
+                        update={"content": redact_secrets(step.content, env)}
+                    )
                     if on_step:
                         await on_step(step)
                     seq += 1
@@ -173,27 +185,33 @@ class CustomAgent:
         except TimeoutError:
             drain_task.cancel()
             watcher.cancel()
-            proc.kill()
+            await terminate_process_tree(proc)
             await asyncio.gather(drain_task, watcher, return_exceptions=True)
+            await stderr_task
             return SessionRunResult(
                 status=SessionStatus.TIMEOUT,
                 error=f"custom agent exceeded timeout of {self._timeout}s",
             )
         except asyncio.CancelledError:
-            pass
+            if not (cancel_token and cancel_token.cancelled):
+                drain_task.cancel()
+                watcher.cancel()
+                await terminate_process_tree(proc)
+                await asyncio.gather(drain_task, watcher, return_exceptions=True)
+                await stderr_task
+                raise
         finally:
             watcher.cancel()
             await asyncio.gather(watcher, return_exceptions=True)
 
         if cancel_token and cancel_token.cancelled:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except TimeoutError:
-                proc.kill()
+            await terminate_process_tree(proc)
+            await stderr_task
             return SessionRunResult(status=SessionStatus.TIMEOUT, error=cancel_token.reason)
 
         await proc.wait()
+        await terminate_process_tree(proc)
+        await stderr_task
         if proc.returncode == 0:
             return SessionRunResult(status=SessionStatus.COMPLETED)
         return SessionRunResult(

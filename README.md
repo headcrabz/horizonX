@@ -14,7 +14,7 @@ hardened. It is suitable for local evaluation and development—not unattended o
 [![CI](https://github.com/headcrabz/horizonX/actions/workflows/ci.yml/badge.svg)](https://github.com/headcrabz/horizonX/actions)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Tests: 464 passing](https://img.shields.io/badge/tests-464%20passing-brightgreen.svg)](tests/)
+[![Tests: 478 passing](https://img.shields.io/badge/tests-478%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -292,9 +292,12 @@ agent:
   type: claude_code
   model: claude-opus-4-8        # or claude-sonnet-4-6, claude-haiku-4-5
   extra:
-    permission_mode: bypassPermissions   # acceptEdits | auto | bypassPermissions
+    permission_mode: default             # acceptEdits | default | dontAsk | plan
     max_budget_usd: 2.0                  # native claude budget cap (optional)
 ```
+
+`bypassPermissions` is rejected unless the same agent config explicitly sets
+`allow_unsafe_permissions: true`.
 
 ### Codex (OpenAI)
 ```bash
@@ -427,7 +430,7 @@ focused tests; it does not imply a verified production guarantee.
 | Python models, registries, and plugin entry points | Implemented | Third-party agent, validator, and strategy names are supported; plugins remain responsible for conforming to their public protocol. |
 | CLI execution, inspection, dashboard, and database maintenance | Implemented subset | `run`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint` are available; broader operator workflows are planned. |
 | SQLite orchestration persistence | Implemented, local-only | Run-scoped goals, attempt lineage, append-only events, expiring leases, migrations, bounded contention, integrity checks, backup, restore, and atomic transitions are implemented. Use one local HorizonX daemon and keep the database on a local filesystem. |
-| Claude Code, Codex, OpenHands, custom, and SDK drivers | Experimental | CLI transports exist; structured native transports, capability negotiation, and cross-provider parity are not verified. |
+| Claude Code, Codex, OpenHands, custom, and SDK drivers | Experimental | Local CLI children use an allowlisted environment, a dedicated process session, bounded stderr retention, and pre-persistence secret redaction. Structured native transports and cross-provider parity are not verified. |
 | Eight execution strategy modules | Experimental | Every built-in yields a typed terminal outcome and routes agent calls through one attempt executor; topology-specific retry and exact crash recovery still need hardening. |
 | Goal graph and six validator types | Experimental | SQLite is authoritative and `goals.json` is an atomic projection; completion rejection no longer reports a successful run, while evidence calibration still needs hardening. |
 | Resume and dashboard recovery | Under hardening | A recurring reconciler scans all non-terminal runs through versioned leases, persists provider IDs during streaming, and chooses provider resume versus a new attempt. It cannot reattach a lost process; topology-specific post-validator reconciliation still needs broader coverage. |
@@ -436,10 +439,10 @@ focused tests; it does not imply a verified production guarantee.
 | FTS5 knowledge store and handoff sync | Components only | The store and sync modules are not yet connected to the normal runtime/strategy lifecycle. Automatic cross-run memory is not claimed. |
 | Slack HITL and dashboard controls | Under hardening | Durable decisions, authenticated callbacks, restart-safe waits, and process-tree cancellation are not complete. |
 | SSE dashboard and JSONL trajectory | Experimental | Runtime events have a durable SQLite sequence, while the current SSE endpoint remains live/in-memory and does not yet expose cursor replay. |
-| Local workspace execution | Implemented, local-only | Local paths use contained Git worktrees; clone URLs, refs, optional branches/submodules, setup commands with an environment allowlist, metadata, and safe session-boundary resume are covered. Process containment and topology-specific post-validator recovery still need hardening. |
+| Local workspace execution | Implemented, local-only | Local paths use contained Git worktrees; setup and agent subprocess trees are terminated as one owned session. Attempt metadata records the boundary. Host network, CPU, memory, child-count, and workspace-disk isolation are not enforced. |
 | Docker, Podman, and E2B execution | Not supported | Unimplemented backend values are rejected by configuration instead of being silently treated as local execution. |
 | Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |
-| Automated verification | Implemented | 464 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Automated verification | Implemented | 478 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
 | Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
 
 Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or

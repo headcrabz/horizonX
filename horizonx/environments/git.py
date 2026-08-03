@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -21,6 +20,12 @@ from horizonx.environments.base import (
     WorkspaceContainmentError,
     WorkspaceMetadata,
     WorkspacePreparationError,
+)
+from horizonx.security.environment_policy import redact_secrets
+from horizonx.security.process import (
+    collect_process_output,
+    spawn_process,
+    spawn_shell,
 )
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -90,23 +95,28 @@ class GitWorktreeBackend:
     ) -> CommandResult:
         path = self._contained(workspace_path)
         start = time.monotonic()
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            cwd=str(path),
-            env=self._effective_env(path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        proc = await spawn_shell(
+            command, cwd=path, env=self._effective_env(path)
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
+        stdout, stderr, timed_out = await collect_process_output(
+            proc, timeout=timeout
+        )
+        if timed_out:
             return CommandResult(-1, "", "timeout", time.monotonic() - start)
         return CommandResult(
             proc.returncode or 0,
-            (stdout or b"").decode(errors="replace"),
-            (stderr or b"").decode(errors="replace"),
+            str(
+                redact_secrets(
+                    (stdout or b"").decode(errors="replace"),
+                    self._effective_env(path),
+                )
+            ),
+            str(
+                redact_secrets(
+                    (stderr or b"").decode(errors="replace"),
+                    self._effective_env(path),
+                )
+            ),
             time.monotonic() - start,
         )
 
@@ -313,18 +323,16 @@ class GitWorktreeBackend:
             )
         return result
 
-    @staticmethod
-    def _redact(value: str) -> str:
-        return re.sub(r"(://)[^/@]+@", r"\1<redacted>@", value)
+    def _redact(self, value: str) -> str:
+        uri_redacted = re.sub(r"(://)[^/@]+@", r"\1<redacted>@", value)
+        return str(redact_secrets(uri_redacted, self._effective_env()))
 
     async def _exec(self, *args: str) -> CommandResult:
         start = time.monotonic()
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        proc = await spawn_process(
+            *args, cwd=self.workspace_root, env=self._effective_env()
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr, _ = await collect_process_output(proc)
         return CommandResult(
             proc.returncode or 0,
             (stdout or b"").decode(errors="replace"),

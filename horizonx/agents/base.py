@@ -6,6 +6,7 @@ See docs/LONG_HORIZON_AGENT.md §24.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,20 +70,25 @@ async def stream_subprocess_jsonl(
     cancel_token: CancelToken | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Spawn a subprocess and yield parsed JSON events from its stdout."""
-    import json
-    import os
+    from horizonx.security.environment_policy import (
+        build_child_environment,
+        redact_secrets,
+    )
+    from horizonx.security.process import (
+        drain_stream,
+        spawn_process,
+        terminate_process_tree,
+    )
 
-    # Merge extra env on top of the parent's env so PATH, HOME, and auth
-    # credentials are always available to the child process.
-    effective_env = {**os.environ, **(env or {})}
-
-    proc = await asyncio.create_subprocess_exec(
+    effective_env = build_child_environment(env)
+    proc = await spawn_process(
         *cmd,
-        cwd=str(cwd),
+        cwd=cwd,
         env=effective_env,
         stdin=asyncio.subprocess.PIPE if stdin_data else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    )
+    stderr_task = asyncio.create_task(
+        drain_stream(proc.stderr), name=f"stderr-{proc.pid}"
     )
     if stdin_data and proc.stdin:
         proc.stdin.write(stdin_data.encode())
@@ -90,21 +96,25 @@ async def stream_subprocess_jsonl(
         proc.stdin.close()
 
     assert proc.stdout is not None
-    while True:
-        if cancel_token and cancel_token.cancelled:
-            proc.terminate()
+    try:
+        while True:
+            if cancel_token and cancel_token.cancelled:
+                await terminate_process_tree(proc)
+                return
+            if proc.returncode is not None:
+                break
             try:
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
             except TimeoutError:
-                proc.kill()
-            return
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            # Skip non-JSON lines (warnings, etc.)
-            continue
-    await proc.wait()
-    return
+                continue
+            if not line:
+                break
+            try:
+                event = json.loads(line)
+                yield redact_secrets(event, effective_env)
+            except json.JSONDecodeError:
+                continue
+        await proc.wait()
+    finally:
+        await terminate_process_tree(proc)
+        await stderr_task
