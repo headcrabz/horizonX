@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from horizonx.core.event_bus import Event, EventBus, InMemoryBus
+from horizonx.core.event_bus import DurableEventBus, Event, EventBus, InMemoryBus
 from horizonx.core.governor import BudgetExceeded, ResourceGovernor
 from horizonx.core.recorder import TrajectoryRecorder
 from horizonx.core.spin_detector import CrossSessionSpinLayer, SpinDetector
@@ -59,13 +59,19 @@ class Runtime:
         workspace_root: Path = Path("./horizonx-workspaces"),
     ) -> None:
         self.store = store
-        self.bus: EventBus = bus or InMemoryBus()
+        downstream = bus or InMemoryBus()
+        self.bus: EventBus = (
+            DurableEventBus(store, downstream)
+            if hasattr(store, "append_event")
+            else downstream
+        )
         self.workspace_root = workspace_root
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.recorder = TrajectoryRecorder(store=store, bus=self.bus)
         self._governor_ref: Any = None  # set while a run is active
         self._last_sessions: dict[str, Session] = {}
         self._prepared_workspaces: dict[str, PreparedWorkspace] = {}
+        self._recovery_contexts: dict[str, dict[str, str | None]] = {}
 
     async def __aenter__(self) -> Runtime:
         return self
@@ -78,7 +84,15 @@ class Runtime:
     # Top-level entry
     # ---------------------------------------------------------------
 
-    async def run(self, task: Task, *, resume_from: str | None = None) -> Run:
+    async def run(
+        self,
+        task: Task,
+        *,
+        resume_from: str | None = None,
+        resume_provider_session_id: str | None = None,
+        recovery_lineage_id: str | None = None,
+        retry_cause: str | None = None,
+    ) -> Run:
         # Pre-flight workspace daily budget check
         if task.workspace and task.workspace.daily_budget_usd is not None:
             from horizonx.core.usage import UsageStore
@@ -94,7 +108,11 @@ class Runtime:
         run = await self._load_or_create(task, resume_from)
         await self.store.save_run(run)
         try:
-            await self.prepare_workspace(run, resume=resume_from is not None)
+            workspace_metadata = run.workspace_path / ".horizonx" / "workspace.json"
+            await self.prepare_workspace(
+                run,
+                resume=resume_from is not None and workspace_metadata.is_file(),
+            )
         except WorkspaceError as exc:
             await self._finish_run(
                 run,
@@ -127,6 +145,13 @@ class Runtime:
                     ),
                 )
                 return run
+
+        if recovery_lineage_id or resume_provider_session_id or retry_cause:
+            self._recovery_contexts[run.id] = {
+                "provider_session_id": resume_provider_session_id,
+                "lineage_id": recovery_lineage_id,
+                "retry_cause": retry_cause,
+            }
 
         async with self._governor(run):
             try:
@@ -195,6 +220,7 @@ class Runtime:
                 )
                 raise
             finally:
+                self._recovery_contexts.pop(run.id, None)
                 await self.store.save_run(run)
         return run
 
@@ -474,6 +500,14 @@ class Runtime:
     def workspace_env(self, run: Run) -> dict[str, str]:
         prepared = self._prepared_workspaces.get(run.id)
         return dict(prepared.env) if prepared is not None else {}
+
+    def workspace_snapshot(self, run: Run) -> dict[str, Any]:
+        prepared = self._prepared_workspaces.get(run.id)
+        return prepared.metadata.to_dict() if prepared is not None else {}
+
+    def take_recovery_context(self, run_id: str) -> dict[str, str | None] | None:
+        """Consume recovery metadata once, for the first resumed agent attempt."""
+        return self._recovery_contexts.pop(run_id, None)
 
     async def prepare_workspace(self, run: Run, *, resume: bool) -> PreparedWorkspace:
         backend = GitWorktreeBackend(self.workspace_root, run.task.environment)

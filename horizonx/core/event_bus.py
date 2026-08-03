@@ -10,6 +10,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from typing import Any, Literal, Protocol
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -40,13 +41,21 @@ EventType = Literal[
     "retry.attempted",
     "goals.re_decomposed",
     "budget.velocity_alert",
+    "attempt.started",
+    "attempt.completed",
+    "attempt.failed",
+    "recovery.planned",
 ]
 
 
 class Event(BaseModel):
+    id: str = Field(default_factory=lambda: f"event-{uuid4().hex}")
+    sequence: int | None = None
     type: EventType
     run_id: str | None = None
+    attempt_id: str | None = None
     session_id: str | None = None
+    goal_id: str | None = None
     timestamp: datetime = Field(default_factory=utcnow)
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -90,3 +99,20 @@ class InMemoryBus:
         """Run a handler against every event until cancelled."""
         async for event in self.subscribe():
             await handler(event)
+
+
+class DurableEventBus:
+    """Persist each event before forwarding it to the live process-local bus."""
+
+    def __init__(self, store: Any, downstream: EventBus):
+        self.store = store
+        self.downstream = downstream
+
+    async def publish(self, event: Event) -> None:
+        persisted = await self.store.append_event(event)
+        await self.downstream.publish(persisted)
+
+    def subscribe(
+        self, predicate: Callable[[Event], bool] | None = None
+    ) -> AsyncIterator[Event]:
+        return self.downstream.subscribe(predicate)

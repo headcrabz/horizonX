@@ -68,6 +68,10 @@ class ClaudeCodeConfig:
             max_budget_usd=ac.extra.get("max_budget_usd"),
             permission_mode=ac.extra.get("permission_mode", "bypassPermissions"),
             extra_args=ac.extra.get("extra_args", []),
+            use_session_id=bool(ac.extra.get("use_session_id", True)),
+            no_session_persistence=bool(
+                ac.extra.get("no_session_persistence", False)
+            ),
         )
 
 

@@ -15,8 +15,10 @@ from horizonx.core.runtime import Runtime
 from horizonx.core.spin_detector import SpinReport
 from horizonx.core.types import (
     AgentConfig,
+    AttemptStatus,
     GateAction,
     GateDecision,
+    GoalNode,
     ResourceLimits,
     Run,
     RunStatus,
@@ -74,6 +76,7 @@ async def test_success_uses_one_persisted_lifecycle(tmp_path: Path) -> None:
         sessions = await store.list_sessions(run.id)
         steps = await store.recent_steps(result.session.id, 20)
         assert result.succeeded is True
+        assert result.attempt.status == AttemptStatus.COMPLETED
         assert result.decisions == [decision]
         assert len(sessions) == 1
         assert sessions[0].status == SessionStatus.COMPLETED
@@ -379,5 +382,31 @@ async def test_soft_spin_warning_does_not_mark_attempt_as_failed(tmp_path: Path)
 
         assert result.status == SessionStatus.COMPLETED
         assert result.spin_detected is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_attempt_uses_goal_retry_limit(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await store.save_run(run)
+    goal = GoalNode(
+        id="g.retry",
+        name="Retryable goal",
+        description="Carry its policy into durable state",
+        max_attempts=7,
+    )
+
+    try:
+        result = await AttemptExecutor(runtime).execute(
+            run,
+            prompt="complete the goal",
+            target_goal=goal,
+        )
+
+        assert result.attempt.max_attempts == 7
     finally:
         await store.close()

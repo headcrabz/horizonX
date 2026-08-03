@@ -6,14 +6,24 @@ See docs/LONG_HORIZON_AGENT.md for the full design.
 from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.attempt_result import AttemptResult
 from horizonx.core.event_bus import Event, EventBus, InMemoryBus
+from horizonx.core.leases import LeaseManager
+from horizonx.core.recovery import (
+    RecoveryAction,
+    RecoveryCoordinator,
+    RecoveryDecision,
+    RetryPolicy,
+)
 from horizonx.core.runtime import Runtime
 from horizonx.core.types import (
     AgentConfig,
+    AttemptRecord,
+    AttemptStatus,
     CumulativeMetrics,
     EnvironmentConfig,
     GoalNode,
     GoalStatus,
     HITLConfig,
+    LeaseRecord,
     RepositoryConfig,
     ResourceLimits,
     Run,
@@ -56,6 +66,14 @@ __all__ = [
     "Runtime",
     "AttemptExecutor",
     "AttemptResult",
+    "AttemptRecord",
+    "AttemptStatus",
+    "LeaseRecord",
+    "LeaseManager",
+    "RecoveryAction",
+    "RecoveryDecision",
+    "RecoveryCoordinator",
+    "RetryPolicy",
     "Event",
     "EventBus",
     "InMemoryBus",

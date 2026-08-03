@@ -65,6 +65,7 @@ def _runtime_double(store: object | None = None) -> MagicMock:
     rt.record_step = AsyncMock()
     rt.run_validators = AsyncMock(return_value=[])
     rt.request_hitl = AsyncMock()
+    rt.bus.publish = AsyncMock()
     rt.workspace_env.return_value = {}
     return rt
 

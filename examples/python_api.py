@@ -16,7 +16,6 @@ import asyncio
 from horizonx import Runtime, Task
 from horizonx.storage import SqliteStore
 
-
 task = Task(
     id="build-oauth-001",
     name="Implement OAuth 2.0 Authorization Code Flow with PKCE",

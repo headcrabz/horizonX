@@ -26,6 +26,10 @@ def new_session_id() -> str:
     return f"sess-{uuid4().hex[:12]}"
 
 
+def new_attempt_id() -> str:
+    return f"attempt-{uuid4().hex[:12]}"
+
+
 def new_step_id() -> str:
     return f"step-{uuid4().hex[:12]}"
 
@@ -91,6 +95,27 @@ class SessionStatus(str, Enum):
     OUT_OF_CONTEXT = "out_of_context"
     ERRORED = "errored"
     SPIN = "spin"
+
+
+class AttemptStatus(str, Enum):
+    CREATED = "created"
+    RUNNING = "running"
+    WAITING_RETRY = "waiting_retry"
+    PAUSED_HITL = "paused_hitl"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    ABORTED = "aborted"
+
+
+TERMINAL_ATTEMPT_STATUSES = frozenset(
+    {
+        AttemptStatus.COMPLETED,
+        AttemptStatus.FAILED,
+        AttemptStatus.INTERRUPTED,
+        AttemptStatus.ABORTED,
+    }
+)
 
 
 class GoalStatus(str, Enum):
@@ -365,6 +390,49 @@ class Session(BaseModel):
     tokens_used: int = 0
     agent_session_id: str | None = None  # Claude Code / Codex session for resume
     handoff_summary_path: Path | None = None
+
+
+class AttemptRecord(BaseModel):
+    """Durable identity and retry lineage for one bounded agent invocation."""
+
+    id: str = Field(default_factory=new_attempt_id)
+    lineage_id: str | None = None
+    run_id: str
+    goal_id: str | None = None
+    session_id: str
+    ordinal: int = 0
+    status: AttemptStatus = AttemptStatus.CREATED
+    provider: str
+    model: str
+    workspace_path: Path
+    workspace_snapshot: dict[str, Any] = Field(default_factory=dict)
+    provider_session_id: str | None = None
+    error: str | None = None
+    retry_cause: str | None = None
+    retry_count: int = 0
+    max_attempts: int = 3
+    next_eligible_at: datetime | None = None
+    started_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    completed_at: datetime | None = None
+    version: int = 0
+
+    @model_validator(mode="after")
+    def _default_lineage(self) -> AttemptRecord:
+        if self.lineage_id is None:
+            self.lineage_id = self.id
+        return self
+
+
+class LeaseRecord(BaseModel):
+    """Versioned ownership claim for a recoverable resource."""
+
+    resource_id: str
+    owner: str
+    acquired_at: datetime
+    heartbeat_at: datetime
+    expires_at: datetime
+    version: int
 
 
 class Step(BaseModel):

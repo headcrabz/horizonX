@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ValidationError
 
+from horizonx.core.leases import LeaseManager
 from horizonx.core.runtime import Runtime
-from horizonx.core.types import Run, RunStatus, new_session_id
+from horizonx.core.types import Run, RunStatus
 from horizonx.storage.sqlite import SqliteStore
 
 from .deps import get_runtime, get_store
@@ -33,19 +36,33 @@ async def launch_run(
         raise HTTPException(status_code=422, detail=str(exc)) from None
 
     # Pre-create the run record so we can return the run_id immediately
-    workspace = runtime.workspace_root / f"{task.id}-{new_session_id()[:8]}"
-    workspace.mkdir(parents=True, exist_ok=True)
-    run = Run(task=task, workspace_path=workspace, status=RunStatus.PENDING)
+    run = Run(
+        task=task,
+        workspace_path=runtime.workspace_root,
+        status=RunStatus.PENDING,
+    )
+    run.workspace_path = runtime.workspace_root / run.id
     await store.save_run(run)
 
     # Persist the pending run for crash recovery before firing the background task
     await store.save_pending_run(run.id, task.model_dump_json())
 
+    lease_ttl_seconds = 30.0
+    leases = LeaseManager(store)
+    lease = await leases.acquire(
+        f"run:{run.id}",
+        owner=f"dashboard-launch-{os.getpid()}-{uuid4().hex[:8]}",
+        ttl_seconds=lease_ttl_seconds,
+    )
+    if lease is None:  # pragma: no cover - a new run ID cannot already be leased
+        raise HTTPException(status_code=409, detail="run launch lease is unavailable")
+
     async def _run_and_cleanup(run_id: str) -> None:
-        try:
-            await runtime.run(task, resume_from=run_id)
-        finally:
-            await store.delete_pending_run(run_id)
+        async with leases.maintain(lease, ttl_seconds=lease_ttl_seconds):
+            try:
+                await runtime.run(task, resume_from=run_id)
+            finally:
+                await store.delete_pending_run(run_id)
 
     # Fire strategy execution in background; resume_from causes runtime to reload
     # the pre-created run from the store and start it

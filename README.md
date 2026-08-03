@@ -14,7 +14,7 @@ hardened. It is suitable for local evaluation and development—not unattended o
 [![CI](https://github.com/headcrabz/horizonX/actions/workflows/ci.yml/badge.svg)](https://github.com/headcrabz/horizonX/actions)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Tests: 436 passing](https://img.shields.io/badge/tests-436%20passing-brightgreen.svg)](tests/)
+[![Tests: 464 passing](https://img.shields.io/badge/tests-464%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -24,8 +24,9 @@ HorizonX is not an agent. It is an experimental runtime layer around existing ag
 
 The current alpha includes:
 
-- **Durable records** — SQLite stores runs, sessions, steps, validations, HITL records, and usage.
-  Goal persistence is authoritative and run-scoped; exact crash-point recovery is under hardening.
+- **Durable records** — SQLite stores runs, attempts, sessions, append-only events, leases,
+  validations, HITL records, and usage. Goal persistence is authoritative and run-scoped;
+  topology-specific exact crash recovery is still under hardening.
 - **Spin analysis** — seven detectors cover repetition, oscillation, plateaus, and cross-session
   stagnation. Every strategy uses the shared detector path; richer recovery actions are planned.
 - **Resource-policy components** — token, cost, time, and workspace-budget models exist. Uniform
@@ -95,7 +96,9 @@ pip install -e ".[dashboard]"
 horizonx serve
 ```
 
-Resume is experimental and currently operates at supported session boundaries:
+Resume is experimental and operates at supported attempt/session boundaries. Startup reconciliation
+can continue a captured provider thread when its adapter supports it; it cannot reattach a lost
+local process:
 `horizonx run task.yaml --resume <run-id>`.
 
 The checked-in Compose file is currently a development stub, not a supported quick start. Image
@@ -315,22 +318,22 @@ agent:
   model: claude-opus-4-8
 ```
 
-### Custom / SDK agent (no binary needed)
-```python
-from pathlib import Path
-from horizonx.core.types import Step, StepType
+### Custom subprocess
 
-async def my_agent(prompt: str, workspace_path: Path):
-    # yield Step objects as your agent works
-    yield Step(session_id="", sequence=0, type=StepType.THOUGHT,
-               content={"text": "Starting task..."})
-    # ... do work, yield more steps ...
+Point the built-in custom driver at any executable that reads a prompt and streams text or JSONL:
 
-# Register inline:
-task = Task(agent=AgentConfig(type="sdk", extra={"callable": my_agent}))
+```yaml
+agent:
+  type: custom
+  model: my-agent-v1
+  extra:
+    command: /opt/my-agent/run
+    prompt_mode: stdin
+    output_format: jsonl
 ```
 
-Or ship as a pip package with an entry-point (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+For an in-process Python callable, use the SDK driver below. Third-party packages can register
+agents through an entry point; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
@@ -353,11 +356,16 @@ my_gate = "my_package.validators:MyGate"
 For API-based agents (no subprocess needed):
 
 ```python
+from pathlib import Path
+
+from horizonx import AgentConfig
+from horizonx.core.types import Step, StepType
+
 async def my_agent_fn(prompt: str, workspace_path: Path):
     # yield Step objects as your agent works
     yield Step(session_id="", sequence=0, type=StepType.THOUGHT, content={"text": "..."})
 
-task = Task(agent=AgentConfig(type="sdk", extra={"callable": my_agent_fn}))
+agent = AgentConfig(type="sdk", model="my-api-agent", extra={"callable": my_agent_fn})
 ```
 
 A strategy plugin owns the loop topology but should route each agent invocation through the
@@ -368,8 +376,8 @@ recording, limits, charging, spin checks, validator callbacks, and cleanup behav
 
 ## Target architecture
 
-This diagram shows the current shared attempt path. Recovery, durable commands, and knowledge
-curation remain separate hardening work; the [support matrix](#project-status) is authoritative.
+This diagram shows the current shared attempt path. Recovery wraps this path through durable
+attempts and leases; durable commands and knowledge curation remain separate hardening work.
 
 ```
 Task (YAML / Python)
@@ -382,7 +390,8 @@ Task (YAML / Python)
         → SpinDetector           (7 layers, in-session + cross-session)
         → Runtime.run_validators (gates: continue / pause / abort)
         → ResourceGovernor       (charges tokens/cost, checks thresholds)
-    → EventBus                   (SSE → dashboard / CLI watch / Slack)
+    → Durable event ledger      (append-only SQLite sequence before live delivery)
+      → EventBus                (SSE → dashboard / CLI watch / Slack)
     → SqliteStore                (local durable state; recovery hardening in progress)
 ```
 
@@ -401,7 +410,7 @@ pytest
 ruff check horizonx/ tests/
 
 # Type check
-mypy horizonx/ --ignore-missing-imports
+mypy horizonx/
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how to write custom agents, strategies, and validators.
@@ -417,20 +426,20 @@ focused tests; it does not imply a verified production guarantee.
 |---|---|---|
 | Python models, registries, and plugin entry points | Implemented | Third-party agent, validator, and strategy names are supported; plugins remain responsible for conforming to their public protocol. |
 | CLI execution, inspection, dashboard, and database maintenance | Implemented subset | `run`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint` are available; broader operator workflows are planned. |
-| SQLite orchestration persistence | Implemented, local-only | Run-scoped goal identity, migrations, foreign keys, bounded contention, integrity checks, backup, restore, and atomic goal transitions are implemented. Use one local HorizonX daemon and keep the database on a local filesystem. |
+| SQLite orchestration persistence | Implemented, local-only | Run-scoped goals, attempt lineage, append-only events, expiring leases, migrations, bounded contention, integrity checks, backup, restore, and atomic transitions are implemented. Use one local HorizonX daemon and keep the database on a local filesystem. |
 | Claude Code, Codex, OpenHands, custom, and SDK drivers | Experimental | CLI transports exist; structured native transports, capability negotiation, and cross-provider parity are not verified. |
 | Eight execution strategy modules | Experimental | Every built-in yields a typed terminal outcome and routes agent calls through one attempt executor; topology-specific retry and exact crash recovery still need hardening. |
 | Goal graph and six validator types | Experimental | SQLite is authoritative and `goals.json` is an atomic projection; completion rejection no longer reports a successful run, while evidence calibration still needs hardening. |
-| Resume and dashboard pending-run recovery | Under hardening | Resume is session-boundary oriented; a crash can lose provider resume state or strand a pending run. Exact crash-point recovery is not claimed. |
+| Resume and dashboard recovery | Under hardening | A recurring reconciler scans all non-terminal runs through versioned leases, persists provider IDs during streaming, and chooses provider resume versus a new attempt. It cannot reattach a lost process; topology-specific post-validator reconciliation still needs broader coverage. |
 | Seven spin-detection components | Under hardening | All built-in strategy attempts use the combined detector path; durable retry, strategy-switch, and operator-response actions are not complete. |
 | Resource governor and usage store | Under hardening | All built-in strategy attempts share charging and per-session step/time limits; session-count enforcement, concurrency, and unknown provider cost still need hardening. |
 | FTS5 knowledge store and handoff sync | Components only | The store and sync modules are not yet connected to the normal runtime/strategy lifecycle. Automatic cross-run memory is not claimed. |
 | Slack HITL and dashboard controls | Under hardening | Durable decisions, authenticated callbacks, restart-safe waits, and process-tree cancellation are not complete. |
-| SSE dashboard and JSONL trajectory | Experimental | SSE is in-memory and has no durable cursor/replay guarantee. |
-| Local workspace execution | Implemented, local-only | Local paths use contained Git worktrees; clone URLs, refs, optional branches/submodules, setup commands with an environment allowlist, metadata, and safe session-boundary resume are covered. Process containment and exact crash recovery still need hardening. |
+| SSE dashboard and JSONL trajectory | Experimental | Runtime events have a durable SQLite sequence, while the current SSE endpoint remains live/in-memory and does not yet expose cursor replay. |
+| Local workspace execution | Implemented, local-only | Local paths use contained Git worktrees; clone URLs, refs, optional branches/submodules, setup commands with an environment allowlist, metadata, and safe session-boundary resume are covered. Process containment and topology-specific post-validator recovery still need hardening. |
 | Docker, Podman, and E2B execution | Not supported | Unimplemented backend values are rejected by configuration instead of being silently treated as local execution. |
 | Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |
-| Automated verification | Implemented | 436 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Automated verification | Implemented | 464 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
 | Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
 
 Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or

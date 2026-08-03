@@ -87,7 +87,7 @@ async def test_v01_goal_schema_migrates_without_losing_stored_fields(tmp_path: P
 
     store = SqliteStore(path)
     try:
-        assert await store.schema_version() == 2
+        assert await store.schema_version() == 3
 
         root = await store.load_goal("legacy-run", "g.root")
         child = await store.load_goal("legacy-run", "g.child")

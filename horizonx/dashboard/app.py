@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,9 +37,18 @@ def create_app(
             bus=app.state.bus,
             workspace_root=workspace_root,
         )
-        from horizonx.dashboard.recovery import recover_pending_runs
-        await recover_pending_runs(app.state.store, app.state.runtime)
-        yield
+        from horizonx.dashboard.recovery import reconcile_runs
+
+        recovery_task = asyncio.create_task(
+            reconcile_runs(app.state.store, app.state.runtime),
+            name="run-reconciliation",
+        )
+        try:
+            yield
+        finally:
+            recovery_task.cancel()
+            await asyncio.gather(recovery_task, return_exceptions=True)
+            await app.state.store.close()
 
     app = FastAPI(title="HorizonX Dashboard", version="0.1.0", lifespan=lifespan)
 

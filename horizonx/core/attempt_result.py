@@ -4,10 +4,17 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from horizonx.core.types import GateDecision, Session, SessionRunResult, SessionStatus
+from horizonx.core.types import (
+    AttemptRecord,
+    GateDecision,
+    Session,
+    SessionRunResult,
+    SessionStatus,
+)
 
 
 class AttemptResult(BaseModel):
+    attempt: AttemptRecord
     session: Session
     agent: SessionRunResult
     decisions: list[GateDecision] = Field(default_factory=list)

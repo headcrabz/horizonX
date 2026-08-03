@@ -151,6 +151,18 @@ class TestClaudeCodeEventParsing:
         assert steps[1].type == StepType.THOUGHT
         assert steps[2].type == StepType.TOOL_CALL
 
+    def test_agent_config_can_disable_session_persistence(self):
+        agent = ClaudeCodeAgent(
+            AgentConfig(
+                type="claude_code",
+                model="claude-test",
+                extra={"no_session_persistence": True},
+            )
+        )
+
+        assert agent.config.no_session_persistence is True
+        assert "--no-session-persistence" in agent._build_command(None, None)
+
 
 class TestClaudeCodeUsageAccumulation:
     def test_result_usage(self):

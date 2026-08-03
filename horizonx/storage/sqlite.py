@@ -15,14 +15,19 @@ import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from horizonx.core.types import (
+    TERMINAL_ATTEMPT_STATUSES,
     TERMINAL_RUN_STATUSES,
+    AttemptRecord,
+    AttemptStatus,
     GateDecision,
     GoalNode,
     GoalStatus,
+    LeaseRecord,
     Run,
     RunStatus,
     Session,
@@ -32,6 +37,7 @@ from horizonx.core.types import (
     utcnow,
 )
 from horizonx.storage.migrations import (
+    ensure_additive_schema,
     prepare_schema,
     read_schema_version,
     record_current_schema,
@@ -196,6 +202,58 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_run ON sessions(run_id, sequence_index);
 
+CREATE TABLE IF NOT EXISTS attempts (
+    id                  TEXT PRIMARY KEY,
+    lineage_id          TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    goal_id             TEXT,
+    session_id          TEXT NOT NULL,
+    ordinal             INTEGER NOT NULL,
+    status              TEXT NOT NULL,
+    provider            TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    workspace_path      TEXT NOT NULL,
+    workspace_snapshot  TEXT NOT NULL DEFAULT '{}',
+    provider_session_id TEXT,
+    error               TEXT,
+    retry_cause         TEXT,
+    retry_count         INTEGER NOT NULL DEFAULT 0,
+    max_attempts        INTEGER NOT NULL DEFAULT 3,
+    next_eligible_at    TEXT,
+    started_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    completed_at        TEXT,
+    version             INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (run_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_recovery
+    ON attempts(run_id, status, ordinal DESC);
+CREATE INDEX IF NOT EXISTS idx_attempts_session ON attempts(session_id);
+
+CREATE TABLE IF NOT EXISTS events (
+    sequence    INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          TEXT NOT NULL UNIQUE,
+    type        TEXT NOT NULL,
+    run_id      TEXT,
+    attempt_id  TEXT,
+    session_id  TEXT,
+    goal_id     TEXT,
+    timestamp   TEXT NOT NULL,
+    payload     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_events_run_sequence ON events(run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_events_attempt_sequence ON events(attempt_id, sequence);
+
+CREATE TABLE IF NOT EXISTS leases (
+    resource_id  TEXT PRIMARY KEY,
+    owner        TEXT NOT NULL,
+    acquired_at  TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    version      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_leases_expiry ON leases(expires_at);
+
 CREATE TABLE IF NOT EXISTS steps (
     id           TEXT PRIMARY KEY,
     session_id   TEXT NOT NULL,
@@ -252,7 +310,8 @@ CREATE TABLE IF NOT EXISTS validations (
     score        REAL,
     details      TEXT,
     started_at   TEXT NOT NULL,
-    duration_ms  INTEGER
+    duration_ms  INTEGER,
+    idempotency_key TEXT
 );
 
 CREATE TABLE IF NOT EXISTS hitl_events (
@@ -326,6 +385,7 @@ class SqliteStore:
         with self._conn() as c:
             prepare_schema(c)
             c.executescript(SCHEMA)
+            ensure_additive_schema(c)
             record_current_schema(c)
 
     async def _run_sync(self, fn: Callable[..., _T], *args: Any) -> _T:
@@ -436,6 +496,7 @@ class SqliteStore:
             target.commit()
             prepare_schema(target)
             target.executescript(SCHEMA)
+            ensure_additive_schema(target)
             record_current_schema(target)
             target.commit()
             target_result = target.execute("PRAGMA integrity_check").fetchall()
@@ -491,6 +552,7 @@ class SqliteStore:
                         WHEN runs.status IN ('completed', 'failed', 'aborted',
                                              'timed_out', 'budget_exceeded')
                         THEN runs.completed_at ELSE excluded.completed_at END,
+                    workspace_path=excluded.workspace_path,
                     current_session_id=excluded.current_session_id,
                     cumulative=excluded.cumulative
                 """,
@@ -594,6 +656,225 @@ class SqliteStore:
 
     async def save_session(self, s: Session) -> None:
         return await self._run_sync(self._sync_save_session, s)
+
+    # ------------------------------------------------------------------
+    # Attempts — durable execution identity and retry lineage
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _attempt_from_row(row: sqlite3.Row) -> AttemptRecord:
+        return AttemptRecord(
+            id=row["id"],
+            lineage_id=row["lineage_id"],
+            run_id=row["run_id"],
+            goal_id=row["goal_id"],
+            session_id=row["session_id"],
+            ordinal=row["ordinal"],
+            status=AttemptStatus(row["status"]),
+            provider=row["provider"],
+            model=row["model"],
+            workspace_path=Path(row["workspace_path"]),
+            workspace_snapshot=json.loads(row["workspace_snapshot"] or "{}"),
+            provider_session_id=row["provider_session_id"],
+            error=row["error"],
+            retry_cause=row["retry_cause"],
+            retry_count=row["retry_count"],
+            max_attempts=row["max_attempts"],
+            next_eligible_at=row["next_eligible_at"],
+            started_at=row["started_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+            version=row["version"],
+        )
+
+    def _sync_create_attempt(self, attempt: AttemptRecord) -> AttemptRecord:
+        conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000)
+        conn.row_factory = sqlite3.Row
+        _configure_connection(conn, self.busy_timeout_ms)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            ordinal = attempt.ordinal
+            if ordinal <= 0:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM attempts WHERE run_id=?",
+                    (attempt.run_id,),
+                ).fetchone()
+                ordinal = int(row[0])
+            retry_count = attempt.retry_count
+            max_attempts = attempt.max_attempts
+            if attempt.lineage_id != attempt.id and retry_count == 0:
+                retry_row = conn.execute(
+                    "SELECT COALESCE(MAX(retry_count), -1) + 1, "
+                    "COALESCE(MAX(max_attempts), ?) FROM attempts "
+                    "WHERE lineage_id=?",
+                    (attempt.max_attempts, attempt.lineage_id),
+                ).fetchone()
+                retry_count = int(retry_row[0])
+                max_attempts = int(retry_row[1])
+            conn.execute(
+                """
+                INSERT INTO attempts (
+                    id, lineage_id, run_id, goal_id, session_id, ordinal, status,
+                    provider, model, workspace_path, workspace_snapshot,
+                    provider_session_id, error, retry_cause, retry_count,
+                    max_attempts, next_eligible_at, started_at, updated_at,
+                    completed_at, version
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    attempt.id,
+                    attempt.lineage_id,
+                    attempt.run_id,
+                    attempt.goal_id,
+                    attempt.session_id,
+                    ordinal,
+                    attempt.status.value,
+                    attempt.provider,
+                    attempt.model,
+                    str(attempt.workspace_path),
+                    json.dumps(attempt.workspace_snapshot, default=str),
+                    attempt.provider_session_id,
+                    attempt.error,
+                    attempt.retry_cause,
+                    retry_count,
+                    max_attempts,
+                    attempt.next_eligible_at.isoformat()
+                    if attempt.next_eligible_at
+                    else None,
+                    attempt.started_at.isoformat(),
+                    attempt.updated_at.isoformat(),
+                    attempt.completed_at.isoformat() if attempt.completed_at else None,
+                    attempt.version,
+                ),
+            )
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if _is_busy_error(exc):
+                raise StoreBusyError(
+                    f"database remained busy for {self.busy_timeout_ms}ms"
+                ) from exc
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        created = self._sync_load_attempt(attempt.id)
+        if created is None:  # pragma: no cover - insert and read share one database
+            raise StoreError(f"attempt disappeared after insert: {attempt.id}")
+        return created
+
+    async def create_attempt(self, attempt: AttemptRecord) -> AttemptRecord:
+        return await self._run_sync(self._sync_create_attempt, attempt)
+
+    def _sync_load_attempt(self, attempt_id: str) -> AttemptRecord | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+        return self._attempt_from_row(row) if row else None
+
+    async def load_attempt(self, attempt_id: str) -> AttemptRecord | None:
+        return await self._run_sync(self._sync_load_attempt, attempt_id)
+
+    def _sync_list_attempts(self, run_id: str) -> list[AttemptRecord]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM attempts WHERE run_id=? ORDER BY ordinal", (run_id,)
+            ).fetchall()
+        return [self._attempt_from_row(row) for row in rows]
+
+    async def list_attempts(self, run_id: str) -> list[AttemptRecord]:
+        return await self._run_sync(self._sync_list_attempts, run_id)
+
+    def _sync_latest_attempt(self, run_id: str) -> AttemptRecord | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM attempts WHERE run_id=? ORDER BY ordinal DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return self._attempt_from_row(row) if row else None
+
+    async def latest_attempt(self, run_id: str) -> AttemptRecord | None:
+        return await self._run_sync(self._sync_latest_attempt, run_id)
+
+    def _sync_set_attempt_provider_session(
+        self, attempt_id: str, provider_session_id: str
+    ) -> AttemptRecord:
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE attempts SET provider_session_id=?, updated_at=?, version=version+1 "
+                "WHERE id=? AND status NOT IN ('completed','failed','interrupted','aborted')",
+                (provider_session_id, utcnow().isoformat(), attempt_id),
+            )
+            if cur.rowcount != 1:
+                raise StoreError(f"non-terminal attempt not found: {attempt_id}")
+        loaded = self._sync_load_attempt(attempt_id)
+        if loaded is None:  # pragma: no cover
+            raise StoreError(f"attempt disappeared after update: {attempt_id}")
+        return loaded
+
+    async def set_attempt_provider_session(
+        self, attempt_id: str, provider_session_id: str
+    ) -> AttemptRecord:
+        return await self._run_sync(
+            self._sync_set_attempt_provider_session, attempt_id, provider_session_id
+        )
+
+    def _sync_transition_attempt(
+        self,
+        attempt_id: str,
+        to_status: AttemptStatus,
+        error: str | None,
+        retry_cause: str | None,
+        next_eligible_at: Any,
+    ) -> AttemptRecord:
+        current = self._sync_load_attempt(attempt_id)
+        if current is None:
+            raise KeyError(f"attempt not found: {attempt_id}")
+        if current.status in TERMINAL_ATTEMPT_STATUSES:
+            return current
+        completed_at = (
+            utcnow().isoformat() if to_status in TERMINAL_ATTEMPT_STATUSES else None
+        )
+        with self._conn() as c:
+            c.execute(
+                "UPDATE attempts SET status=?, error=?, retry_cause=?, "
+                "next_eligible_at=?, updated_at=?, completed_at=?, version=version+1 "
+                "WHERE id=? AND status NOT IN ('completed','failed','interrupted','aborted')",
+                (
+                    to_status.value,
+                    error,
+                    retry_cause,
+                    next_eligible_at.isoformat() if next_eligible_at else None,
+                    utcnow().isoformat(),
+                    completed_at,
+                    attempt_id,
+                ),
+            )
+        loaded = self._sync_load_attempt(attempt_id)
+        if loaded is None:  # pragma: no cover
+            raise StoreError(f"attempt disappeared after transition: {attempt_id}")
+        return loaded
+
+    async def transition_attempt(
+        self,
+        attempt_id: str,
+        to_status: AttemptStatus,
+        *,
+        error: str | None = None,
+        retry_cause: str | None = None,
+        next_eligible_at: Any = None,
+    ) -> AttemptRecord:
+        return await self._run_sync(
+            self._sync_transition_attempt,
+            attempt_id,
+            to_status,
+            error,
+            retry_cause,
+            next_eligible_at,
+        )
 
     # ------------------------------------------------------------------
     # Steps
@@ -970,6 +1251,35 @@ class SqliteStore:
     async def release_goal(self, run_id: str, goal_id: str) -> None:
         return await self._run_sync(self._sync_release_goal, run_id, goal_id)
 
+    def _sync_recover_goal_claim(
+        self, run_id: str, goal_id: str, session_id: str
+    ) -> bool:
+        """Release only the exact orphaned assignment observed by recovery."""
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE goals SET status='pending', assigned_to_session=NULL, "
+                "version=version+1, last_updated_at=?, last_updated_by_session=? "
+                "WHERE run_id=? AND id=? AND status='in_progress' "
+                "AND assigned_to_session=?",
+                (
+                    utcnow().isoformat(),
+                    session_id,
+                    run_id,
+                    goal_id,
+                    session_id,
+                ),
+            )
+        return int(cur.rowcount) == 1
+
+    async def recover_goal_claim(
+        self, run_id: str, goal_id: str, session_id: str
+    ) -> bool:
+        return bool(
+            await self._run_sync(
+                self._sync_recover_goal_claim, run_id, goal_id, session_id
+            )
+        )
+
     def _sync_load_goal(self, run_id: str, goal_id: str) -> GoalNode | None:
         from horizonx.core.types import GoalStatus
 
@@ -1037,19 +1347,52 @@ class SqliteStore:
         from uuid import uuid4
 
         with self._conn() as c:
+            session_id = session.id if session else None
+            lineage_id: str | None = None
+            if session_id is not None:
+                attempt_row = c.execute(
+                    "SELECT lineage_id FROM attempts WHERE session_id=? "
+                    "ORDER BY ordinal DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if attempt_row is not None:
+                    lineage_id = str(attempt_row["lineage_id"])
+            identity = lineage_id or session_id or "run-final"
+            goal_id = session.target_goal_id if session else None
+            decision_payload = json.dumps(
+                {
+                    "decision": decision.decision.value,
+                    "reason": decision.reason,
+                    "score": decision.score,
+                    "details": decision.details,
+                },
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+            decision_digest = hashlib.sha256(
+                decision_payload.encode()
+            ).hexdigest()[:16]
+            idempotency_key = (
+                f"{identity}:{goal_id or '-'}:{decision.validator_name}:"
+                f"{decision_digest}"
+            )
             c.execute(
-                """INSERT INTO validations (id, run_id, session_id, validator, decision, reason, score, details, started_at, duration_ms)
-                   VALUES (?,?,?,?,?,?,?,?,datetime('now'),?)""",
+                """INSERT OR IGNORE INTO validations
+                   (id, run_id, session_id, validator, decision, reason, score,
+                    details, started_at, duration_ms, idempotency_key)
+                   VALUES (?,?,?,?,?,?,?,?,datetime('now'),?,?)""",
                 (
                     str(uuid4()),
                     run.id,
-                    session.id if session else None,
+                    session_id,
                     decision.validator_name,
                     decision.decision.value,
                     decision.reason,
                     decision.score,
                     json.dumps(decision.details, default=str),
                     decision.duration_ms,
+                    idempotency_key,
                 ),
             )
 
@@ -1085,6 +1428,20 @@ class SqliteStore:
 
     async def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         return await self._run_sync(self._sync_list_runs, limit)
+
+    def _sync_list_nonterminal_runs(self) -> list[Run]:
+        terminal = tuple(status.value for status in TERMINAL_RUN_STATUSES)
+        placeholders = ",".join("?" for _ in terminal)
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT id FROM runs WHERE status NOT IN ({placeholders}) "
+                "ORDER BY started_at",
+                terminal,
+            ).fetchall()
+        return [self._sync_load_run(row["id"]) for row in rows]
+
+    async def list_nonterminal_runs(self) -> list[Run]:
+        return await self._run_sync(self._sync_list_nonterminal_runs)
 
     def _sync_list_run_summaries(
         self, limit: int, status: str | None
@@ -1360,6 +1717,270 @@ class SqliteStore:
         return await self._run_sync(self._sync_list_spin_reports, run_id)
 
     # ------------------------------------------------------------------
+    # Append-only events
+    # ------------------------------------------------------------------
+
+    def _sync_append_event(self, event: Any) -> Any:
+        from horizonx.core.event_bus import Event
+
+        attempt_id = event.attempt_id
+        goal_id = event.goal_id
+        if attempt_id is None and event.session_id is not None:
+            with self._conn() as c:
+                attempt_row = c.execute(
+                    "SELECT id, goal_id FROM attempts WHERE session_id=? "
+                    "ORDER BY ordinal DESC LIMIT 1",
+                    (event.session_id,),
+                ).fetchone()
+            if attempt_row is not None:
+                attempt_id = attempt_row["id"]
+                goal_id = goal_id or attempt_row["goal_id"]
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO events "
+                "(id, type, run_id, attempt_id, session_id, goal_id, timestamp, payload) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    event.id,
+                    event.type,
+                    event.run_id,
+                    attempt_id,
+                    event.session_id,
+                    goal_id,
+                    event.timestamp.isoformat(),
+                    json.dumps(event.payload, default=str),
+                ),
+            )
+            row = c.execute("SELECT * FROM events WHERE id=?", (event.id,)).fetchone()
+        if row is None:  # pragma: no cover - insert or existing row must be visible
+            raise StoreError(f"event disappeared after append: {event.id}")
+        return Event(
+            id=row["id"],
+            sequence=row["sequence"],
+            type=row["type"],
+            run_id=row["run_id"],
+            attempt_id=row["attempt_id"],
+            session_id=row["session_id"],
+            goal_id=row["goal_id"],
+            timestamp=row["timestamp"],
+            payload=json.loads(row["payload"] or "{}"),
+        )
+
+    async def append_event(self, event: Any) -> Any:
+        return await self._run_sync(self._sync_append_event, event)
+
+    def _sync_list_events(
+        self,
+        run_id: str,
+        after_sequence: int | None,
+        limit: int,
+        event_type: str | None,
+    ) -> list[Any]:
+        from horizonx.core.event_bus import Event
+
+        clauses = ["run_id=?"]
+        values: list[Any] = [run_id]
+        if after_sequence is not None:
+            clauses.append("sequence>?")
+            values.append(after_sequence)
+        if event_type is not None:
+            clauses.append("type=?")
+            values.append(event_type)
+        values.append(limit)
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM events WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY sequence LIMIT ?",
+                values,
+            ).fetchall()
+        return [
+            Event(
+                id=row["id"],
+                sequence=row["sequence"],
+                type=row["type"],
+                run_id=row["run_id"],
+                attempt_id=row["attempt_id"],
+                session_id=row["session_id"],
+                goal_id=row["goal_id"],
+                timestamp=row["timestamp"],
+                payload=json.loads(row["payload"] or "{}"),
+            )
+            for row in rows
+        ]
+
+    async def list_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int | None = None,
+        limit: int = 1000,
+        event_type: str | None = None,
+    ) -> list[Any]:
+        return await self._run_sync(
+            self._sync_list_events,
+            run_id,
+            after_sequence,
+            limit,
+            event_type,
+        )
+
+    # ------------------------------------------------------------------
+    # Versioned expiring leases
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _lease_from_row(row: sqlite3.Row) -> LeaseRecord:
+        return LeaseRecord(
+            resource_id=row["resource_id"],
+            owner=row["owner"],
+            acquired_at=row["acquired_at"],
+            heartbeat_at=row["heartbeat_at"],
+            expires_at=row["expires_at"],
+            version=row["version"],
+        )
+
+    def _sync_acquire_lease(
+        self,
+        resource_id: str,
+        owner: str,
+        ttl_seconds: float,
+        now: datetime,
+    ) -> LeaseRecord | None:
+        conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000)
+        conn.row_factory = sqlite3.Row
+        _configure_connection(conn, self.busy_timeout_ms)
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM leases WHERE resource_id=?", (resource_id,)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO leases "
+                    "(resource_id, owner, acquired_at, heartbeat_at, expires_at, version) "
+                    "VALUES (?,?,?,?,?,1)",
+                    (
+                        resource_id,
+                        owner,
+                        now.isoformat(),
+                        now.isoformat(),
+                        expires_at.isoformat(),
+                    ),
+                )
+            elif datetime.fromisoformat(row["expires_at"]) <= now:
+                cur = conn.execute(
+                    "UPDATE leases SET owner=?, acquired_at=?, heartbeat_at=?, "
+                    "expires_at=?, version=version+1 WHERE resource_id=? AND version=?",
+                    (
+                        owner,
+                        now.isoformat(),
+                        now.isoformat(),
+                        expires_at.isoformat(),
+                        resource_id,
+                        row["version"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return None
+            else:
+                conn.rollback()
+                return None
+            conn.commit()
+            claimed = conn.execute(
+                "SELECT * FROM leases WHERE resource_id=?", (resource_id,)
+            ).fetchone()
+            return self._lease_from_row(claimed)
+        finally:
+            conn.close()
+
+    async def acquire_lease(
+        self,
+        resource_id: str,
+        owner: str,
+        ttl_seconds: float,
+        now: datetime,
+    ) -> LeaseRecord | None:
+        return await self._run_sync(
+            self._sync_acquire_lease, resource_id, owner, ttl_seconds, now
+        )
+
+    def _sync_get_lease(self, resource_id: str) -> LeaseRecord | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM leases WHERE resource_id=? AND owner<>''",
+                (resource_id,),
+            ).fetchone()
+        return self._lease_from_row(row) if row else None
+
+    async def get_lease(self, resource_id: str) -> LeaseRecord | None:
+        return await self._run_sync(self._sync_get_lease, resource_id)
+
+    def _sync_heartbeat_lease(
+        self,
+        resource_id: str,
+        owner: str,
+        version: int,
+        ttl_seconds: float,
+        now: datetime,
+    ) -> LeaseRecord | None:
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE leases SET heartbeat_at=?, expires_at=? "
+                "WHERE resource_id=? AND owner=? AND version=? AND expires_at>?",
+                (
+                    now.isoformat(),
+                    (now + timedelta(seconds=ttl_seconds)).isoformat(),
+                    resource_id,
+                    owner,
+                    version,
+                    now.isoformat(),
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+        return self._sync_get_lease(resource_id)
+
+    async def heartbeat_lease(
+        self,
+        resource_id: str,
+        owner: str,
+        version: int,
+        ttl_seconds: float,
+        now: datetime,
+    ) -> LeaseRecord | None:
+        return await self._run_sync(
+            self._sync_heartbeat_lease,
+            resource_id,
+            owner,
+            version,
+            ttl_seconds,
+            now,
+        )
+
+    def _sync_release_lease(
+        self, resource_id: str, owner: str, version: int
+    ) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE leases SET owner='', expires_at='1970-01-01T00:00:00+00:00' "
+                "WHERE resource_id=? AND owner=? AND version=?",
+                (resource_id, owner, version),
+            )
+        return int(cur.rowcount) == 1
+
+    async def release_lease(
+        self, resource_id: str, owner: str, version: int
+    ) -> bool:
+        return bool(
+            await self._run_sync(
+                self._sync_release_lease, resource_id, owner, version
+            )
+        )
+
+    # ------------------------------------------------------------------
     # Pending runs (crash recovery for dashboard-launched runs)
     # ------------------------------------------------------------------
 
@@ -1378,11 +1999,17 @@ class SqliteStore:
         with self._conn() as c:
             c.execute("DELETE FROM pending_runs WHERE run_id=?", (run_id,))
 
-    def _sync_list_pending_runs(self) -> list[dict[str, Any]]:
+    def _sync_list_pending_runs(self, include_started: bool) -> list[dict[str, Any]]:
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT run_id, task_json FROM pending_runs WHERE status='pending'"
-            ).fetchall()
+            if include_started:
+                rows = c.execute(
+                    "SELECT run_id, task_json FROM pending_runs "
+                    "WHERE status IN ('pending','started')"
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT run_id, task_json FROM pending_runs WHERE status='pending'"
+                ).fetchall()
         return [{"run_id": r["run_id"], "task_json": r["task_json"]} for r in rows]
 
     async def save_pending_run(self, run_id: str, task_json: str) -> None:
@@ -1394,8 +2021,10 @@ class SqliteStore:
     async def delete_pending_run(self, run_id: str) -> None:
         return await self._run_sync(self._sync_delete_pending_run, run_id)
 
-    async def list_pending_runs(self) -> list[dict[str, Any]]:
-        return await self._run_sync(self._sync_list_pending_runs)
+    async def list_pending_runs(
+        self, *, include_started: bool = False
+    ) -> list[dict[str, Any]]:
+        return await self._run_sync(self._sync_list_pending_runs, include_started)
 
     # ------------------------------------------------------------------
     # Workspace usage (cross-run daily budget tracking)

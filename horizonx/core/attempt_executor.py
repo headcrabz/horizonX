@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -10,9 +11,12 @@ from typing import TYPE_CHECKING
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.agents.registry import build_agent
 from horizonx.core.attempt_result import AttemptResult
+from horizonx.core.event_bus import Event
 from horizonx.core.governor import BudgetExceeded
 from horizonx.core.types import (
     AgentConfig,
+    AttemptRecord,
+    AttemptStatus,
     GateDecision,
     GoalNode,
     Run,
@@ -52,6 +56,61 @@ class AttemptExecutor:
         session = await rt.start_session(
             run, target_goal=target_goal, session_id=session_id
         )
+        recovery_value = (
+            rt.take_recovery_context(run.id)
+            if hasattr(rt, "take_recovery_context")
+            else None
+        )
+        recovery_context = (
+            recovery_value if isinstance(recovery_value, dict) else None
+        )
+        configured_agent = agent_config or run.task.agent
+        effective_resume_session_id = resume_session_id or (
+            recovery_context.get("provider_session_id")
+            if recovery_context
+            else None
+        )
+        snapshot_value = (
+            rt.workspace_snapshot(run)
+            if hasattr(rt, "workspace_snapshot")
+            else {}
+        )
+        attempt = AttemptRecord(
+            lineage_id=(
+                recovery_context.get("lineage_id") if recovery_context else None
+            ),
+            run_id=run.id,
+            goal_id=target_goal.id if target_goal else None,
+            session_id=session.id,
+            status=AttemptStatus.RUNNING,
+            provider=configured_agent.type,
+            model=configured_agent.model,
+            workspace_path=workspace_path or run.workspace_path,
+            workspace_snapshot=(
+                snapshot_value if isinstance(snapshot_value, dict) else {}
+            ),
+            retry_cause=(
+                recovery_context.get("retry_cause") if recovery_context else None
+            ),
+            max_attempts=target_goal.max_attempts if target_goal else 3,
+        )
+        create_result = rt.store.create_attempt(attempt)
+        if inspect.isawaitable(create_result):
+            attempt = await create_result
+            await rt.bus.publish(
+                Event(
+                    type="attempt.started",
+                    run_id=run.id,
+                    attempt_id=attempt.id,
+                    session_id=session.id,
+                    goal_id=attempt.goal_id,
+                    payload={
+                        "ordinal": attempt.ordinal,
+                        "provider": attempt.provider,
+                        "resuming_provider": bool(effective_resume_session_id),
+                    },
+                )
+            )
         cancel_token = CancelToken()
         decisions: list[GateDecision] = []
         spin_detected = False
@@ -65,6 +124,12 @@ class AttemptExecutor:
                 if provider_session_id:
                     session.agent_session_id = str(provider_session_id)
                     await rt.store.save_session(session)
+                    provider_update = rt.store.set_attempt_provider_session(
+                        attempt.id, str(provider_session_id)
+                    )
+                    if inspect.isawaitable(provider_update):
+                        attempt.provider_session_id = str(provider_session_id)
+                        await provider_update
             await rt.record_step(session, step)
             if (
                 session.steps_count > 0
@@ -80,7 +145,7 @@ class AttemptExecutor:
                 cancel_token.cancel(reason="session_step_limit")
 
         try:
-            agent = build_agent(agent_config or run.task.agent)
+            agent = build_agent(configured_agent)
             workspace = Workspace(
                 path=workspace_path or run.workspace_path,
                 env=rt.workspace_env(run),
@@ -88,7 +153,7 @@ class AttemptExecutor:
             invocation = agent.run_session(
                 session_prompt=prompt,
                 workspace=workspace,
-                resume_session_id=resume_session_id,
+                resume_session_id=effective_resume_session_id,
                 on_step=on_step,
                 cancel_token=cancel_token,
                 session_id=session.id,
@@ -128,6 +193,12 @@ class AttemptExecutor:
             if result.agent_session_id:
                 session.agent_session_id = result.agent_session_id
                 await rt.store.save_session(session)
+                provider_update = rt.store.set_attempt_provider_session(
+                    attempt.id, result.agent_session_id
+                )
+                if inspect.isawaitable(provider_update):
+                    attempt.provider_session_id = result.agent_session_id
+                    await provider_update
             rt.charge(result)
             if result.status == SessionStatus.COMPLETED:
                 for stage in validator_stages:
@@ -158,8 +229,46 @@ class AttemptExecutor:
                     }
                 )
             await rt.end_session(session, result.status)
+            attempt_status = (
+                AttemptStatus.COMPLETED
+                if result.status == SessionStatus.COMPLETED
+                else AttemptStatus.ABORTED
+                if result.status == SessionStatus.TIMEOUT
+                and result.error == "run_cancelled"
+                else AttemptStatus.FAILED
+            )
+            transition_result = rt.store.transition_attempt(
+                attempt.id,
+                attempt_status,
+                error=result.error,
+                retry_cause=(
+                    result.error
+                    if attempt_status == AttemptStatus.FAILED
+                    else attempt.retry_cause
+                ),
+            )
+            if inspect.isawaitable(transition_result):
+                attempt = await transition_result
+                await rt.bus.publish(
+                    Event(
+                        type=(
+                            "attempt.completed"
+                            if attempt_status == AttemptStatus.COMPLETED
+                            else "attempt.failed"
+                        ),
+                        run_id=run.id,
+                        attempt_id=attempt.id,
+                        session_id=session.id,
+                        goal_id=attempt.goal_id,
+                        payload={
+                            "status": attempt.status.value,
+                            "error": attempt.error,
+                        },
+                    )
+                )
 
         return AttemptResult(
+            attempt=attempt,
             session=session,
             agent=result,
             decisions=decisions,

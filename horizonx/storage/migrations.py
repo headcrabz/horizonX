@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 _REQUIRED_GOAL_COLUMNS = {
     "run_id",
@@ -31,6 +31,7 @@ _REQUIRED_GOAL_EDGE_COLUMNS = {
     "edge_type",
     "position",
 }
+_REQUIRED_DURABILITY_TABLES = {"attempts", "events", "leases"}
 
 
 class SchemaMigrationError(RuntimeError):
@@ -186,6 +187,20 @@ def prepare_schema(conn: sqlite3.Connection) -> None:
         raise SchemaMigrationError(f"failed to migrate SQLite schema: {exc}") from exc
 
 
+def ensure_additive_schema(conn: sqlite3.Connection) -> None:
+    """Add columns and indexes that SQLite can upgrade without table replacement."""
+    if _table_exists(conn, "validations"):
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(validations)")
+        }
+        if "idempotency_key" not in columns:
+            conn.execute("ALTER TABLE validations ADD COLUMN idempotency_key TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_validations_idempotency "
+            "ON validations(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+
+
 def record_current_schema(conn: sqlite3.Connection) -> None:
     goal_columns = {row[1] for row in conn.execute("PRAGMA table_info(goals)")}
     missing_goal_columns = _REQUIRED_GOAL_COLUMNS - goal_columns
@@ -212,6 +227,20 @@ def record_current_schema(conn: sqlite3.Connection) -> None:
     }
     if not required_foreign_keys.issubset(foreign_keys):
         raise SchemaMigrationError("current goal_edges schema is missing foreign keys")
+    missing_tables = {
+        table for table in _REQUIRED_DURABILITY_TABLES if not _table_exists(conn, table)
+    }
+    if missing_tables:
+        raise SchemaMigrationError(
+            f"current durability schema is missing tables: {sorted(missing_tables)}"
+        )
+    validation_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(validations)")
+    }
+    if "idempotency_key" not in validation_columns:
+        raise SchemaMigrationError(
+            "current validations schema is missing idempotency_key"
+        )
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
         (CURRENT_SCHEMA_VERSION,),
