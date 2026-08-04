@@ -78,6 +78,42 @@ async def test_strategy_failure_remains_failed_after_runtime_teardown(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_terminal_run_cannot_be_resumed(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    task = _task()
+    try:
+        completed = await runtime.run(task)
+        attempts_before = await store.list_attempts(completed.id)
+
+        with pytest.raises(ValueError, match="cannot resume terminal run"):
+            await runtime.run(task, resume_from=completed.id)
+
+        attempts_after = await store.list_attempts(completed.id)
+        assert attempts_after == attempts_before
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_a_different_task_snapshot(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    persisted = Run(
+        task=_task(),
+        status=RunStatus.RUNNING,
+        workspace_path=tmp_path / "workspace",
+    )
+    await store.save_run(persisted)
+    changed = _task().model_copy(update={"prompt": "Different work"})
+    try:
+        with pytest.raises(ValueError, match="task snapshot does not match"):
+            await runtime.run(changed, resume_from=persisted.id)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_stale_runtime_save_cannot_overwrite_cancellation(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "horizonx.db")
     run = Run(

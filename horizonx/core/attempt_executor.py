@@ -6,7 +6,7 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.agents.registry import build_agent
@@ -162,13 +162,21 @@ class AttemptExecutor:
                 path=workspace_path or run.workspace_path,
                 env=rt.workspace_env(run),
             )
+            invocation_kwargs: dict[str, Any] = {
+                "resume_session_id": effective_resume_session_id,
+                "on_step": on_step,
+                "cancel_token": cancel_token,
+            }
+            parameters = inspect.signature(agent.run_session).parameters
+            if "session_id" in parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                invocation_kwargs["session_id"] = session.id
             invocation = agent.run_session(
                 session_prompt=prompt,
                 workspace=workspace,
-                resume_session_id=effective_resume_session_id,
-                on_step=on_step,
-                cancel_token=cancel_token,
-                session_id=session.id,
+                **invocation_kwargs,
             )
             timeout = timeout_seconds
             if timeout is None:

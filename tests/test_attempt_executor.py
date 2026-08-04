@@ -119,6 +119,25 @@ class _SessionIdAgent:
         return SessionRunResult(status=SessionStatus.COMPLETED)
 
 
+class _LegacyProtocolAgent:
+    """External agent written against the protocol before session_id was added."""
+
+    def __init__(self) -> None:
+        self.called = False
+
+    async def run_session(
+        self,
+        session_prompt,  # type: ignore[no-untyped-def]
+        workspace,  # type: ignore[no-untyped-def]
+        *,
+        resume_session_id=None,  # type: ignore[no-untyped-def]
+        on_step=None,  # type: ignore[no-untyped-def]
+        cancel_token=None,  # type: ignore[no-untyped-def]
+    ) -> SessionRunResult:
+        self.called = True
+        return SessionRunResult(status=SessionStatus.COMPLETED)
+
+
 @pytest.mark.asyncio
 async def test_exception_becomes_errored_and_always_cleans_up(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "horizonx.db")
@@ -236,6 +255,28 @@ async def test_provider_session_id_is_persisted_during_stream(tmp_path: Path) ->
         assert result.succeeded is True
         assert agent.persisted_during_stream is True
         assert result.session.agent_session_id == "provider-session-live"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_external_agent_without_session_id_keyword_remains_compatible(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await store.save_run(run)
+    agent = _LegacyProtocolAgent()
+    try:
+        with patch(
+            "horizonx.core.attempt_executor.build_agent", return_value=agent
+        ):
+            result = await AttemptExecutor(runtime).execute(run, prompt="Do the work")
+
+        assert agent.called is True
+        assert result.succeeded is True
     finally:
         await store.close()
 

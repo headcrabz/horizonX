@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import os
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from horizonx.core.types import GoalNode
 from horizonx.storage.migrations import SchemaMigrationError
-from horizonx.storage.sqlite import SqliteStore
+from horizonx.storage.sqlite import SqliteStore, StoreBusyError
 
 LEGACY_GOALS_SCHEMA = """
 CREATE TABLE goals (
@@ -167,3 +170,121 @@ def test_incomplete_composite_schema_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(SchemaMigrationError, match="missing columns"):
         SqliteStore(path)
+
+
+@pytest.mark.asyncio
+async def test_rejected_restore_preserves_live_database(tmp_path: Path) -> None:
+    live_path = tmp_path / "live.db"
+    future_path = tmp_path / "future.db"
+    live = SqliteStore(live_path)
+    future = SqliteStore(future_path)
+    try:
+        await live.save_goal(
+            "live-run",
+            GoalNode(id="g.root", name="Keep me", description="live state"),
+        )
+        await future.save_goal(
+            "future-run",
+            GoalNode(id="g.root", name="Reject me", description="future state"),
+        )
+    finally:
+        await future.close()
+
+    with sqlite3.connect(future_path) as conn:
+        conn.execute("INSERT INTO schema_migrations(version) VALUES (999)")
+
+    try:
+        with pytest.raises(SchemaMigrationError, match="newer schema version"):
+            await live.restore(future_path)
+
+        preserved = await live.load_goal("live-run", "g.root")
+        assert preserved is not None
+        assert preserved.name == "Keep me"
+        assert await live.load_goal("future-run", "g.root") is None
+    finally:
+        await live.close()
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_a_busy_live_database_without_replacing_it(
+    tmp_path: Path,
+) -> None:
+    live_path = tmp_path / "live.db"
+    source_path = tmp_path / "source.db"
+    live = SqliteStore(live_path, busy_timeout_ms=25)
+    source = SqliteStore(source_path)
+    try:
+        await live.save_goal(
+            "live-run", GoalNode(id="g.root", name="Live", description="keep")
+        )
+        await source.save_goal(
+            "source-run", GoalNode(id="g.root", name="Source", description="new")
+        )
+    finally:
+        await source.close()
+
+    blocker = sqlite3.connect(live_path)
+    blocker.execute("BEGIN")
+    blocker.execute("SELECT * FROM goals").fetchall()
+    try:
+        with pytest.raises(StoreBusyError, match="restore requires exclusive"):
+            await live.restore(source_path)
+    finally:
+        blocker.close()
+
+    try:
+        preserved = await live.load_goal("live-run", "g.root")
+        assert preserved is not None
+        assert preserved.name == "Live"
+        assert await live.load_goal("source-run", "g.root") is None
+    finally:
+        await live.close()
+
+
+@pytest.mark.asyncio
+async def test_restore_syncs_database_and_directory_before_success(
+    tmp_path: Path,
+) -> None:
+    live_path = tmp_path / "live.db"
+    source_path = tmp_path / "source.db"
+    live = SqliteStore(live_path)
+    source = SqliteStore(source_path)
+    await source.close()
+    try:
+        with patch("horizonx.storage.sqlite.os.fsync") as fsync:
+            await live.restore(source_path)
+
+        assert fsync.call_count == 2
+    finally:
+        await live.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX lock assertion")
+@pytest.mark.asyncio
+async def test_restore_holds_maintenance_lock_through_atomic_replace(
+    tmp_path: Path,
+) -> None:
+    live_path = tmp_path / "live.db"
+    source_path = tmp_path / "source.db"
+    live = SqliteStore(live_path)
+    source = SqliteStore(source_path)
+    await source.close()
+    real_replace = os.replace
+    fcntl = importlib.import_module("fcntl")
+
+    def replace_while_locked(source: str | Path, destination: str | Path) -> None:
+        lock_fd = os.open(f"{live_path}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(lock_fd)
+        real_replace(source, destination)
+
+    try:
+        with patch(
+            "horizonx.storage.sqlite.os.replace", side_effect=replace_while_locked
+        ):
+            await live.restore(source_path)
+    finally:
+        await live.close()

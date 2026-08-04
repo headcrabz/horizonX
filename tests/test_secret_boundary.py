@@ -156,6 +156,7 @@ async def test_attempt_snapshot_records_active_trust_boundary(tmp_path: Path) ->
         assert boundary["process"] == "new_session"
         assert boundary["network"] == "host_unrestricted"
         assert boundary["workspace"] == "read_write"
+        assert boundary["mounts"] == "host_unrestricted"
         assert "environment_keys" in boundary
         assert not any("secret" in value.lower() for value in boundary.values() if isinstance(value, str))
     finally:

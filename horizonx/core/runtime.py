@@ -17,6 +17,7 @@ from horizonx.core.recorder import TrajectoryRecorder
 from horizonx.core.spin_detector import CrossSessionSpinLayer, SpinDetector
 from horizonx.core.summarizer import Summarizer
 from horizonx.core.types import (
+    TERMINAL_RUN_STATUSES,
     GateAction,
     GoalNode,
     HITLDecision,
@@ -558,6 +559,16 @@ class Runtime:
     async def _load_or_create(self, task: Task, resume_from: str | None) -> Run:
         if resume_from:
             run = await self.store.load_run(resume_from)
+            if run.status in TERMINAL_RUN_STATUSES:
+                raise ValueError(
+                    f"cannot resume terminal run {run.id} with status {run.status.value}; "
+                    "fork it to start new work"
+                )
+            if task != run.task:
+                raise ValueError(
+                    f"resume task snapshot does not match persisted run {run.id}; "
+                    "fork it to change task configuration"
+                )
             run.status = RunStatus.RUNNING
             return cast(Run, run)
         run_id = new_run_id()

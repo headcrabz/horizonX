@@ -64,7 +64,7 @@ def trust_boundary_metadata(
         "process": "new_session",
         "workspace": "read_write",
         "network": "host_unrestricted",
-        "mounts": "managed_workspace_only",
+        "mounts": "host_unrestricted",
         "permission_mode": permission_mode or "provider_default",
         "unsafe_permissions": permission_mode == "bypassPermissions",
         "resource_limits": {

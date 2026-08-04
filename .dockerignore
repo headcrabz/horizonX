@@ -16,6 +16,7 @@ horizonx-workspaces
 *.db
 *.db-shm
 *.db-wal
+*.db.lock
 .env
 .env.*
 secrets

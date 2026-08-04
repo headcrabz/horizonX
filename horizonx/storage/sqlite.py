@@ -7,14 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import platform
 import sqlite3
 import subprocess
-from collections.abc import Callable
+import tempfile
+import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -170,6 +173,57 @@ def _assert_local_database_path(db_path: str | Path) -> None:
             "SQLite database must be on a local filesystem; "
             f"detected {filesystem}"
         )
+
+
+@contextmanager
+def _database_maintenance_lock(
+    path: Path, *, exclusive: bool, timeout_ms: int
+) -> Iterator[None]:
+    """Coordinate normal DB access with destructive maintenance across processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + timeout_ms / 1000
+    locked = False
+    backend: Any = None
+    try:
+        if os.name == "posix":
+            backend = importlib.import_module("fcntl")
+            operation = backend.LOCK_EX if exclusive else backend.LOCK_SH
+            while True:
+                try:
+                    backend.flock(descriptor, operation | backend.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise StoreBusyError(
+                            f"database maintenance lock remained busy for {timeout_ms}ms"
+                        ) from None
+                    time.sleep(0.01)
+        elif os.name == "nt":  # pragma: no cover - exercised on Windows
+            backend = importlib.import_module("msvcrt")
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            while True:
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    backend.locking(descriptor, backend.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise StoreBusyError(
+                            f"database maintenance lock remained busy for {timeout_ms}ms"
+                        ) from None
+                    time.sleep(0.01)
+        yield
+    finally:
+        if locked and os.name == "posix":
+            backend.flock(descriptor, backend.LOCK_UN)
+        elif locked and os.name == "nt":  # pragma: no cover
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            backend.locking(descriptor, backend.LK_UNLCK, 1)
+        os.close(descriptor)
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS runs (
@@ -377,9 +431,15 @@ class SqliteStore:
         _assert_local_database_path(db_path)
         self.db_path = str(db_path)
         self.busy_timeout_ms = busy_timeout_ms
+        self._maintenance_lock_path = Path(f"{self.db_path}.lock")
         # Single worker — SQLite serialises writes; more workers add contention
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sqlite")
-        self._sync_init_schema()
+        with _database_maintenance_lock(
+            self._maintenance_lock_path,
+            exclusive=False,
+            timeout_ms=self.busy_timeout_ms,
+        ):
+            self._sync_init_schema()
 
     def _sync_init_schema(self) -> None:
         with self._conn() as c:
@@ -390,7 +450,29 @@ class SqliteStore:
 
     async def _run_sync(self, fn: Callable[..., _T], *args: Any) -> _T:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, fn, *args)
+
+        def invoke() -> _T:
+            with _database_maintenance_lock(
+                self._maintenance_lock_path,
+                exclusive=False,
+                timeout_ms=self.busy_timeout_ms,
+            ):
+                return fn(*args)
+
+        return await loop.run_in_executor(self._executor, invoke)
+
+    async def _run_sync_exclusive(self, fn: Callable[..., _T], *args: Any) -> _T:
+        loop = asyncio.get_running_loop()
+
+        def invoke() -> _T:
+            with _database_maintenance_lock(
+                self._maintenance_lock_path,
+                exclusive=True,
+                timeout_ms=self.busy_timeout_ms,
+            ):
+                return fn(*args)
+
+        return await loop.run_in_executor(self._executor, invoke)
 
     async def close(self) -> None:
         self._executor.shutdown(wait=True)
@@ -480,34 +562,97 @@ class SqliteStore:
         return path
 
     def _sync_restore(self, source_path: Path) -> None:
-        if source_path.resolve(strict=False) == Path(self.db_path).resolve(strict=False):
+        target_path = Path(self.db_path)
+        if source_path.resolve(strict=False) == target_path.resolve(strict=False):
             raise StoreError("restore source must be a different path")
         if not source_path.is_file():
             raise FileNotFoundError(source_path)
-        source = sqlite3.connect(source_path)
-        target = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_file = tempfile.NamedTemporaryFile(
+            prefix=f".{target_path.name}.restore-",
+            suffix=".db",
+            dir=target_path.parent,
+            delete=False,
+        )
+        staged_path = Path(staged_file.name)
+        staged_file.close()
         try:
-            _configure_connection(source, self.busy_timeout_ms)
-            _configure_connection(target, self.busy_timeout_ms)
-            source_result = source.execute("PRAGMA integrity_check").fetchall()
-            if [str(row[0]) for row in source_result] != ["ok"]:
-                raise StoreError(f"restore source integrity check failed: {source_result}")
-            source.backup(target)
-            target.commit()
-            prepare_schema(target)
-            target.executescript(SCHEMA)
-            ensure_additive_schema(target)
-            record_current_schema(target)
-            target.commit()
-            target_result = target.execute("PRAGMA integrity_check").fetchall()
-            if [str(row[0]) for row in target_result] != ["ok"]:
-                raise StoreError(f"restored database integrity check failed: {target_result}")
+            with (
+                closing(sqlite3.connect(source_path)) as source,
+                closing(sqlite3.connect(staged_path)) as staged,
+            ):
+                source.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+                _configure_connection(staged, self.busy_timeout_ms)
+                source_result = source.execute("PRAGMA integrity_check").fetchall()
+                if [str(row[0]) for row in source_result] != ["ok"]:
+                    raise StoreError(
+                        f"restore source integrity check failed: {source_result}"
+                    )
+                source.backup(staged)
+                staged.commit()
+                prepare_schema(staged)
+                staged.executescript(SCHEMA)
+                ensure_additive_schema(staged)
+                record_current_schema(staged)
+                staged.commit()
+                staged_result = staged.execute("PRAGMA integrity_check").fetchall()
+                if [str(row[0]) for row in staged_result] != ["ok"]:
+                    raise StoreError(
+                        f"restored database integrity check failed: {staged_result}"
+                    )
+                staged.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                staged.execute("PRAGMA journal_mode=DELETE")
+                staged.commit()
+
+            with staged_path.open("rb") as staged_file_handle:
+                os.fsync(staged_file_handle.fileno())
+            if target_path.exists():
+                try:
+                    with sqlite3.connect(
+                        target_path, timeout=self.busy_timeout_ms / 1000
+                    ) as target:
+                        _configure_connection(target, self.busy_timeout_ms)
+                        checkpoint = target.execute(
+                            "PRAGMA wal_checkpoint(TRUNCATE)"
+                        ).fetchone()
+                        if checkpoint is None or int(checkpoint[0]) != 0:
+                            raise StoreBusyError(
+                                "restore requires exclusive database access; "
+                                "close active readers and writers before retrying"
+                            )
+                        journal_mode = target.execute(
+                            "PRAGMA journal_mode=DELETE"
+                        ).fetchone()
+                        if journal_mode is None or journal_mode[0] != "delete":
+                            raise StoreBusyError(
+                                "restore requires exclusive database access; "
+                                "close active readers and writers before retrying"
+                            )
+                except sqlite3.OperationalError as exc:
+                    if not _is_busy_error(exc):
+                        raise
+                    raise StoreBusyError(
+                        "restore requires exclusive database access; "
+                        "close active readers and writers before retrying"
+                    ) from exc
+                os.chmod(staged_path, target_path.stat().st_mode & 0o7777)
+            for suffix in ("-wal", "-shm"):
+                Path(f"{target_path}{suffix}").unlink(missing_ok=True)
+            os.replace(staged_path, target_path)
+            if os.name == "posix":
+                directory_fd = os.open(
+                    target_path.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
-            target.close()
-            source.close()
+            staged_path.unlink(missing_ok=True)
 
     async def restore(self, source: str | Path) -> None:
-        await self._run_sync(self._sync_restore, Path(source))
+        await self._run_sync_exclusive(self._sync_restore, Path(source))
 
     @contextmanager
     def _conn(self):  # type: ignore[no-untyped-def]

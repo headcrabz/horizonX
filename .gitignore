@@ -34,6 +34,7 @@ horizonx-workspaces/
 horizonx.db
 *.db-shm
 *.db-wal
+*.db.lock
 *.jsonl.bak
 
 # IDE

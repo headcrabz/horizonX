@@ -98,7 +98,7 @@ horizonx serve
 
 Resume is experimental and operates at supported attempt/session boundaries. Startup reconciliation
 can continue a captured provider thread when its adapter supports it; it cannot reattach a lost
-local process:
+local process. Terminal runs cannot be resumed; fork them to begin new work:
 `horizonx run task.yaml --resume <run-id>`.
 
 The checked-in Compose file is currently a development stub, not a supported quick start. Image
@@ -429,20 +429,20 @@ focused tests; it does not imply a verified production guarantee.
 |---|---|---|
 | Python models, registries, and plugin entry points | Implemented | Third-party agent, validator, and strategy names are supported; plugins remain responsible for conforming to their public protocol. |
 | CLI execution, inspection, dashboard, and database maintenance | Implemented subset | `run`, `show`, `list`, `watch`, `fork`, `export`, `serve`, `doctor`, `backup`, `restore`, and `checkpoint` are available; broader operator workflows are planned. |
-| SQLite orchestration persistence | Implemented, local-only | Run-scoped goals, attempt lineage, append-only events, expiring leases, migrations, bounded contention, integrity checks, backup, restore, and atomic transitions are implemented. Use one local HorizonX daemon and keep the database on a local filesystem. |
+| SQLite orchestration persistence | Implemented, local-only | Run-scoped goals, attempt lineage, append-only events, expiring leases, migrations, bounded contention, integrity checks, backup, staged restore, and atomic transitions are implemented. Use one local HorizonX daemon and keep the database on a local filesystem. |
 | Claude Code, Codex, OpenHands, custom, and SDK drivers | Experimental | Local CLI children use an allowlisted environment, a dedicated process session, bounded stderr retention, and pre-persistence secret redaction. Structured native transports and cross-provider parity are not verified. |
 | Eight execution strategy modules | Experimental | Every built-in yields a typed terminal outcome and routes agent calls through one attempt executor; topology-specific retry and exact crash recovery still need hardening. |
 | Goal graph and six validator types | Experimental | SQLite is authoritative and `goals.json` is an atomic projection; completion rejection no longer reports a successful run, while evidence calibration still needs hardening. |
-| Resume and dashboard recovery | Under hardening | A recurring reconciler scans all non-terminal runs through versioned leases, persists provider IDs during streaming, and chooses provider resume versus a new attempt. It cannot reattach a lost process; topology-specific post-validator reconciliation still needs broader coverage. |
+| Resume and dashboard recovery | Under hardening | A recurring reconciler scans non-terminal runs through versioned leases, persists provider IDs during streaming, and chooses provider resume versus a new attempt. Ambiguous completed-attempt gaps pause for operator reconciliation instead of replaying work. |
 | Seven spin-detection components | Under hardening | All built-in strategy attempts use the combined detector path; durable retry, strategy-switch, and operator-response actions are not complete. |
 | Resource governor and usage store | Under hardening | All built-in strategy attempts share charging and per-session step/time limits; session-count enforcement, concurrency, and unknown provider cost still need hardening. |
 | FTS5 knowledge store and handoff sync | Components only | The store and sync modules are not yet connected to the normal runtime/strategy lifecycle. Automatic cross-run memory is not claimed. |
 | Slack HITL and dashboard controls | Under hardening | Durable decisions, authenticated callbacks, restart-safe waits, and process-tree cancellation are not complete. |
 | SSE dashboard and JSONL trajectory | Experimental | Runtime events have a durable SQLite sequence, while the current SSE endpoint remains live/in-memory and does not yet expose cursor replay. |
-| Local workspace execution | Implemented, local-only | Local paths use contained Git worktrees; setup and agent subprocess trees are terminated as one owned session. Attempt metadata records the boundary. Host network, CPU, memory, child-count, and workspace-disk isolation are not enforced. |
+| Local workspace execution | Implemented, local-only | Local paths use isolated Git worktrees; setup and agent subprocess trees are terminated as one owned session. Attempt metadata records the boundary. Host filesystem, network, CPU, memory, child-count, and workspace-disk isolation are not enforced. |
 | Docker, Podman, and E2B execution | Not supported | Unimplemented backend values are rejected by configuration instead of being silently treated as local execution. |
 | Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |
-| Automated verification | Implemented | 478 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Automated verification | Implemented | 489 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
 | Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
 
 Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or

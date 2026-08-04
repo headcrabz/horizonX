@@ -104,9 +104,44 @@ class RecoveryCoordinator:
 
             lease_handed_off = False
             try:
+                if latest is not None and latest.status == AttemptStatus.COMPLETED:
+                    run.status = RunStatus.PAUSED_HITL
+                    run.completed_at = None
+                    await self.store.save_run(run)
+                    await self.store.append_event(
+                        Event(
+                            id=f"recovery-{run.id}-{lease.version}",
+                            type="recovery.planned",
+                            run_id=run.id,
+                            attempt_id=latest.id,
+                            payload={
+                                "action": "pause_for_reconciliation",
+                                "reason": "completed_attempt_without_terminal_run",
+                                "lease_owner": lease.owner,
+                                "lease_version": lease.version,
+                            },
+                        )
+                    )
+                    continue
+                if latest is not None and latest.status == AttemptStatus.ABORTED:
+                    await self.store.transition_run(run.id, RunStatus.ABORTED)
+                    await self.store.append_event(
+                        Event(
+                            id=f"recovery-{run.id}-{lease.version}",
+                            type="recovery.planned",
+                            run_id=run.id,
+                            attempt_id=latest.id,
+                            payload={
+                                "action": "abort_run",
+                                "reason": "attempt_was_aborted",
+                                "lease_owner": lease.owner,
+                                "lease_version": lease.version,
+                            },
+                        )
+                    )
+                    continue
                 if (
                     latest is not None
-                    and latest.status not in TERMINAL_ATTEMPT_STATUSES
                     and latest.retry_count + 1 >= latest.max_attempts
                 ):
                     await self.store.transition_attempt(
@@ -171,14 +206,22 @@ class RecoveryCoordinator:
                 lease=lease,
             )
 
-        can_resume = bool(latest.provider_session_id) and adapter_supports_resume(run)
+        can_resume = (
+            latest.status != AttemptStatus.FAILED
+            and bool(latest.provider_session_id)
+            and adapter_supports_resume(run)
+        )
         reason = (
-            "provider_session_available"
-            if can_resume
+            "attempt_failed"
+            if latest.status == AttemptStatus.FAILED
             else (
-                "adapter_cannot_resume"
-                if latest.provider_session_id
-                else "provider_session_unavailable"
+                "provider_session_available"
+                if can_resume
+                else (
+                    "adapter_cannot_resume"
+                    if latest.provider_session_id
+                    else "provider_session_unavailable"
+                )
             )
         )
         if latest.goal_id is not None:

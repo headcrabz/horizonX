@@ -58,6 +58,8 @@ async def _attempt(
     status: AttemptStatus = AttemptStatus.RUNNING,
     provider_session_id: str | None = None,
     goal_id: str | None = None,
+    retry_count: int = 0,
+    max_attempts: int = 3,
 ) -> AttemptRecord:
     session = Session(
         id="sess-recovery",
@@ -76,6 +78,8 @@ async def _attempt(
             model=run.task.agent.model,
             workspace_path=run.workspace_path,
             provider_session_id=provider_session_id,
+            retry_count=retry_count,
+            max_attempts=max_attempts,
         )
     )
 
@@ -485,6 +489,94 @@ async def test_retry_limit_terminates_orphan_instead_of_relaunching(
         assert await store.get_lease(f"run:{run.id}") is None
         events = await store.list_events(run.id, event_type="recovery.planned")
         assert events[-1].payload["reason"] == "retry_limit_exhausted"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_attempt_requires_reconciliation_instead_of_reexecution(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    completed = await _attempt(
+        store,
+        run,
+        status=AttemptStatus.COMPLETED,
+        provider_session_id="already-finished-provider-session",
+    )
+    try:
+        decisions = await RecoveryCoordinator(store).plan(owner="recovery-worker")
+
+        assert decisions == []
+        assert (await store.load_run(run.id)).status == RunStatus.PAUSED_HITL
+        assert await store.get_lease(f"run:{run.id}") is None
+        events = await store.list_events(run.id, event_type="recovery.planned")
+        assert events[-1].attempt_id == completed.id
+        assert events[-1].payload["action"] == "pause_for_reconciliation"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_failed_attempt_still_enforces_retry_limit(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    await _attempt(
+        store,
+        run,
+        status=AttemptStatus.FAILED,
+        provider_session_id="failed-provider-session",
+        max_attempts=1,
+    )
+    try:
+        decisions = await RecoveryCoordinator(store).plan(owner="recovery-worker")
+
+        assert decisions == []
+        assert (await store.load_run(run.id)).status == RunStatus.FAILED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_attempt_retries_without_resuming_failed_provider_session(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    await _attempt(
+        store,
+        run,
+        status=AttemptStatus.FAILED,
+        provider_session_id="failed-provider-session",
+    )
+    try:
+        decisions = await RecoveryCoordinator(store).plan(owner="recovery-worker")
+
+        assert decisions[0].action == RecoveryAction.NEW_ATTEMPT
+        assert decisions[0].provider_session_id is None
+        assert decisions[0].reason == "attempt_failed"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_aborted_attempt_is_not_relaunched(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    await _attempt(store, run, status=AttemptStatus.ABORTED)
+    try:
+        decisions = await RecoveryCoordinator(store).plan(owner="recovery-worker")
+
+        assert decisions == []
+        assert (await store.load_run(run.id)).status == RunStatus.ABORTED
+        assert await store.get_lease(f"run:{run.id}") is None
     finally:
         await store.close()
 
