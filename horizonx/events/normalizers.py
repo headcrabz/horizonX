@@ -76,9 +76,11 @@ def normalize_step(step: Step) -> CanonicalEvent:
     return CanonicalEvent(
         kind=step.type.value,
         provider_kind=str(content.get("provider_kind") or step.type.value),
+        correlation_id=content.get("tool_use_id") or content.get("item_id"),
         tool_name=_canonical_tool_name(tool_name, category),
         category=category,  # type: ignore[arg-type]
         arguments=args,
+        command=args.get("command") or content.get("command"),
         target=str(target) if target is not None else None,
         result_digest=_digest(result),
         exit_status=content.get("exit_code"),
@@ -87,6 +89,8 @@ def normalize_step(step: Step) -> CanonicalEvent:
         provider_session_id=content.get("session_id"),
         tokens_in=usage.get("input_tokens"),
         tokens_out=usage.get("output_tokens"),
+        usage_delta={} if content.get("usage_mode") == "cumulative" else {k: int(usage[k]) for k in ("input_tokens", "output_tokens", "cached_input_tokens") if usage.get(k) is not None},
+        usage_cumulative={k: int(usage[k]) for k in ("input_tokens", "output_tokens", "cached_input_tokens") if usage.get(k) is not None} if content.get("usage_mode") == "cumulative" else {},
         cost_usd=content.get("total_cost_usd"),
         cumulative=content.get("usage_mode") == "cumulative",
     )

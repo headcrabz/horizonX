@@ -212,14 +212,23 @@ class ToolThrashingLayer:
     async def check(self, session: Session, store: Any) -> SpinReport:
         steps = await store.recent_steps(session.id, self.window)
         events = [(step, _event(step)) for step in steps]
+        results = {
+            event.correlation_id: event.result_digest
+            for _, event in events
+            if event and event.correlation_id and event.result_digest
+        }
 
         # Idempotent: same tool + same result hash → no progress (reading same thing repeatedly)
         idempotent = [
-            step for step, event in events
+            (step, event) for step, event in events
             if event and event.kind == StepType.TOOL_CALL.value and event.category in {"read", "search"}
+            and (event.result_digest or results.get(event.correlation_id or ""))
         ]
         if idempotent:
-            result_hashes = Counter(_result_hash(s) for s in idempotent if s.content)
+            result_hashes = Counter(
+                event.result_digest or results.get(event.correlation_id or "")
+                for _, event in idempotent
+            )
             if result_hashes:
                 top_count = result_hashes.most_common(1)[0][1]
                 if top_count >= self.no_progress_threshold:

@@ -16,9 +16,11 @@ class CanonicalEvent(BaseModel):
 
     kind: str
     provider_kind: str | None = None
+    correlation_id: str | None = None
     tool_name: str | None = None
     category: Literal["read", "search", "edit", "execute", "network", "delegate", "other"] = "other"
     arguments: dict[str, Any] = Field(default_factory=dict)
+    command: str | None = None
     target: str | None = None
     result_digest: str | None = None
     exit_status: int | None = None
@@ -27,5 +29,7 @@ class CanonicalEvent(BaseModel):
     provider_session_id: str | None = None
     tokens_in: int | None = None
     tokens_out: int | None = None
+    usage_delta: dict[str, int] = Field(default_factory=dict)
+    usage_cumulative: dict[str, int] = Field(default_factory=dict)
     cost_usd: float | None = None
     cumulative: bool = False
