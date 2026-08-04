@@ -38,7 +38,7 @@ class TestGovernor:
         bus = InMemoryBus()
         gov = ResourceGovernor(run.task.resources, run, bus)
         async with gov:
-            gov.charge(tokens_in=100, tokens_out=50)
+            await gov.charge(tokens_in=100, tokens_out=50)
             assert run.cumulative.tokens_in == 100
             assert run.cumulative.tokens_out == 50
 
@@ -49,7 +49,7 @@ class TestGovernor:
         gov = ResourceGovernor(run.task.resources, run, bus)
         async with gov:
             with pytest.raises(BudgetExceeded):
-                gov.charge(tokens_in=60, tokens_out=60)
+                await gov.charge(tokens_in=60, tokens_out=60)
 
     @pytest.mark.asyncio
     async def test_usd_budget(self):
@@ -57,10 +57,10 @@ class TestGovernor:
         bus = InMemoryBus()
         gov = ResourceGovernor(run.task.resources, run, bus)
         async with gov:
-            gov.charge(usd=0.5)
+            await gov.charge(usd=0.5)
             assert run.cumulative.usd == 0.5
             with pytest.raises(BudgetExceeded):
-                gov.charge(usd=0.6)
+                await gov.charge(usd=0.6)
 
     @pytest.mark.asyncio
     async def test_accumulates_multiple_charges(self):
@@ -68,10 +68,21 @@ class TestGovernor:
         bus = InMemoryBus()
         gov = ResourceGovernor(run.task.resources, run, bus)
         async with gov:
-            gov.charge(tokens_in=100, tokens_out=50)
-            gov.charge(tokens_in=200, tokens_out=100)
+            await gov.charge(tokens_in=100, tokens_out=50)
+            await gov.charge(tokens_in=200, tokens_out=100)
             assert run.cumulative.tokens_in == 300
             assert run.cumulative.tokens_out == 150
+
+    @pytest.mark.asyncio
+    async def test_resume_preserves_previously_persisted_wall_time(self):
+        run = _make_run(ResourceLimits(max_total_tokens=1_000_000))
+        run.cumulative.wall_seconds = 120.0
+        gov = ResourceGovernor(run.task.resources, run, InMemoryBus())
+
+        async with gov:
+            await gov.charge(tokens_in=1)
+
+        assert run.cumulative.wall_seconds >= 120.0
 
     @pytest.mark.asyncio
     async def test_runtime_releases_governor_reference_after_exception(
@@ -86,4 +97,4 @@ class TestGovernor:
             async with runtime._governor(run):
                 raise RuntimeError("strategy failed")
 
-        assert runtime._governor_ref is None
+        assert run.id not in runtime._governors

@@ -21,6 +21,12 @@ async def test_workspace_daily_usd_zero_for_unknown(store):
 
 
 @pytest.mark.asyncio
+async def test_workspace_daily_usd_is_unavailable_after_unknown_cost(store):
+    await store.record_workspace_usage("ws-unknown", "run-codex", 100, 50, None)
+    assert await store.workspace_daily_usd("ws-unknown") is None
+
+
+@pytest.mark.asyncio
 async def test_usage_store_wraps_sqlite(store):
     us = UsageStore(store)
     await us.record("ws-2", "run-3", 50, 25, 0.10)

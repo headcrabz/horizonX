@@ -193,6 +193,39 @@ class TestClaudeCodeUsageAccumulation:
         })
         assert agent._totals["input_tokens"] == 500
 
+    def test_assistant_usage_is_emitted_for_live_budget_enforcement(self):
+        agent = ClaudeCodeAgent(ClaudeCodeConfig())
+        steps = agent._event_to_steps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "working"}],
+                    "usage": {"input_tokens": 500, "output_tokens": 100},
+                },
+            },
+            0,
+            "s1",
+        )
+
+        assert [step.type for step in steps] == [StepType.THOUGHT, StepType.USAGE]
+        assert steps[-1].content["usage"]["input_tokens"] == 500
+
+    def test_result_totals_replace_provisional_assistant_usage(self):
+        agent = ClaudeCodeAgent(ClaudeCodeConfig())
+        agent._accumulate_usage({
+            "type": "assistant",
+            "message": {"usage": {"input_tokens": 500, "output_tokens": 100}},
+        })
+        agent._accumulate_usage({
+            "type": "result",
+            "total_cost_usd": 0.03,
+            "usage": {"input_tokens": 500, "output_tokens": 100},
+        })
+
+        assert agent._totals["input_tokens"] == 500
+        assert agent._totals["output_tokens"] == 100
+        assert agent._totals["total_cost_usd"] == 0.03
+
 
 class TestCodexEventParsing:
     def setup_method(self):

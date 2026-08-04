@@ -90,7 +90,7 @@ async def test_v01_goal_schema_migrates_without_losing_stored_fields(tmp_path: P
 
     store = SqliteStore(path)
     try:
-        assert await store.schema_version() == 3
+        assert await store.schema_version() == 4
 
         root = await store.load_goal("legacy-run", "g.root")
         child = await store.load_goal("legacy-run", "g.child")
@@ -123,6 +123,41 @@ async def test_v01_goal_schema_migrates_without_losing_stored_fields(tmp_path: P
         ]
         assert pk_columns == ["run_id", "id"]
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_legacy_zero_cost_usage_migrates_as_unknown(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-usage.db"
+    initial = SqliteStore(path)
+    await initial.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE workspace_usage RENAME TO workspace_usage_v3")
+        conn.execute(
+            """
+            CREATE TABLE workspace_usage (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                tokens_in INTEGER NOT NULL DEFAULT 0,
+                tokens_out INTEGER NOT NULL DEFAULT 0,
+                usd REAL NOT NULL DEFAULT 0.0,
+                recorded_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO workspace_usage VALUES "
+            "('usage-legacy', 'workspace-legacy', 'run-codex', date('now'), "
+            "100, 50, 0.0, datetime('now'))"
+        )
+        conn.execute("DROP TABLE workspace_usage_v3")
+
+    migrated = SqliteStore(path)
+    try:
+        assert await migrated.workspace_daily_usd("workspace-legacy") is None
+    finally:
+        await migrated.close()
 
 
 def test_malformed_legacy_schema_fails_explicitly(tmp_path: Path) -> None:

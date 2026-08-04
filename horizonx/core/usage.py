@@ -18,15 +18,16 @@ class UsageStore:
         self._store = store
 
     async def record(self, workspace_id: str, run_id: str,
-                     tokens_in: int, tokens_out: int, usd: float) -> None:
+                     tokens_in: int, tokens_out: int, usd: float | None) -> None:
         await self._store.record_workspace_usage(workspace_id, run_id, tokens_in, tokens_out, usd)
 
-    async def daily_usd(self, workspace_id: str) -> float:
-        return float(await self._store.workspace_daily_usd(workspace_id))
+    async def daily_usd(self, workspace_id: str) -> float | None:
+        value = await self._store.workspace_daily_usd(workspace_id)
+        return float(value) if value is not None else None
 
     async def over_budget(self, workspace_id: str, daily_budget_usd: float) -> bool:
         spent = await self.daily_usd(workspace_id)
-        return spent >= daily_budget_usd
+        return spent is not None and spent >= daily_budget_usd
 
 
 @dataclass

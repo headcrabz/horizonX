@@ -39,7 +39,7 @@ function duration(start, end) {
   return `${Math.floor(sec/3600)}h ${Math.floor((sec%3600)/60)}m`;
 }
 
-const fmtUSD = n => n != null ? `$${Number(n).toFixed(3)}` : '$0.000';
+const fmtUSD = n => n != null ? `$${Number(n).toFixed(3)}` : 'unavailable';
 const fmtTok = n => n ? (n>=1e6 ? `${(n/1e6).toFixed(2)}M` : n>=1000 ? `${(n/1000).toFixed(1)}K` : String(n)) : '0';
 
 async function api(path, opts = {}) {
@@ -284,7 +284,7 @@ function renderRunHeader(run) {
   $('run-metrics-row').innerHTML = chips.join('');
 
   // Budget gauge
-  const spent = cm.usd || 0;
+  const spent = cm.usd;
   const limit = run.task?.resources?.max_total_usd;
   $('cost-spent').textContent = fmtUSD(spent);
   $('cost-limit').textContent = limit ? `$${limit} limit` : 'no limit set';

@@ -60,7 +60,7 @@ async def test_success_uses_one_persisted_lifecycle(tmp_path: Path) -> None:
         validator_name="contract-check",
     )
     runtime.run_validators = AsyncMock(return_value=[decision])  # type: ignore[method-assign]
-    runtime.charge = MagicMock()  # type: ignore[method-assign]
+    runtime.charge = AsyncMock()  # type: ignore[method-assign]
     cleanup = AsyncMock()
     try:
         with patch(
@@ -81,7 +81,7 @@ async def test_success_uses_one_persisted_lifecycle(tmp_path: Path) -> None:
         assert len(sessions) == 1
         assert sessions[0].status == SessionStatus.COMPLETED
         assert len(steps) == 3
-        runtime.charge.assert_called_once()
+        runtime.charge.assert_awaited_once()
         cleanup.assert_awaited_once()
     finally:
         await store.close()
@@ -95,6 +95,16 @@ class _RaisingAgent:
 class _CancelledAgent:
     async def run_session(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         raise asyncio.CancelledError
+
+
+class _BlockingAgent:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def run_session(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        self.started.set()
+        await asyncio.sleep(60)
+        return SessionRunResult(status=SessionStatus.COMPLETED)
 
 
 class _SessionIdAgent:
@@ -182,6 +192,38 @@ async def test_task_cancellation_propagates_after_cleanup(tmp_path: Path) -> Non
 
         assert (await store.list_sessions(run.id))[0].status == SessionStatus.ERRORED
         cleanup.assert_awaited_once()
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_is_not_reclassified_as_a_stall(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await store.save_run(run)
+    cleanup = AsyncMock()
+    agent = _BlockingAgent()
+    try:
+        with patch(
+            "horizonx.core.attempt_executor.build_agent",
+            return_value=agent,
+        ):
+            execution = asyncio.create_task(
+                AttemptExecutor(runtime).execute(
+                    run, prompt="block", cleanup=(cleanup,)
+                )
+            )
+            await agent.started.wait()
+            execution.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(execution, timeout=0.2)
+
+        cleanup.assert_awaited_once()
+        assert (await store.list_sessions(run.id))[0].status == SessionStatus.ERRORED
     finally:
         await store.close()
 

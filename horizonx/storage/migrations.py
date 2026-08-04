@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 _REQUIRED_GOAL_COLUMNS = {
     "run_id",
@@ -199,6 +199,18 @@ def ensure_additive_schema(conn: sqlite3.Connection) -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_validations_idempotency "
             "ON validations(idempotency_key) WHERE idempotency_key IS NOT NULL"
         )
+    if _table_exists(conn, "workspace_usage"):
+        usage_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(workspace_usage)")
+        }
+        if "usd_known" not in usage_columns:
+            conn.execute(
+                "ALTER TABLE workspace_usage "
+                "ADD COLUMN usd_known INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "UPDATE workspace_usage SET usd_known=1 WHERE usd != 0.0"
+            )
 
 
 def record_current_schema(conn: sqlite3.Connection) -> None:
@@ -240,6 +252,13 @@ def record_current_schema(conn: sqlite3.Connection) -> None:
     if "idempotency_key" not in validation_columns:
         raise SchemaMigrationError(
             "current validations schema is missing idempotency_key"
+        )
+    usage_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(workspace_usage)")
+    }
+    if "usd_known" not in usage_columns:
+        raise SchemaMigrationError(
+            "current workspace_usage schema is missing usd_known"
         )
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",

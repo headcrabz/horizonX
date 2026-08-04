@@ -5,6 +5,7 @@ See docs/LONG_HORIZON_AGENT.md §11.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -26,6 +27,7 @@ from horizonx.core.types import (
     Session,
     SessionStatus,
     Step,
+    StepType,
     StrategyOutcome,
     Task,
     ValidatorConfig,
@@ -69,7 +71,9 @@ class Runtime:
         self.workspace_root = workspace_root
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.recorder = TrajectoryRecorder(store=store, bus=self.bus)
-        self._governor_ref: Any = None  # set while a run is active
+        self._governors: dict[str, ResourceGovernor] = {}
+        self._workspace_run_counts: dict[str, int] = {}
+        self._workspace_run_lock = asyncio.Lock()
         self._last_sessions: dict[str, Session] = {}
         self._prepared_workspaces: dict[str, PreparedWorkspace] = {}
         self._recovery_contexts: dict[str, dict[str, str | None]] = {}
@@ -94,11 +98,29 @@ class Runtime:
         recovery_lineage_id: str | None = None,
         retry_cause: str | None = None,
     ) -> Run:
+        async with self._workspace_run_slot(task):
+            return await self._run_with_resources(
+                task,
+                resume_from=resume_from,
+                resume_provider_session_id=resume_provider_session_id,
+                recovery_lineage_id=recovery_lineage_id,
+                retry_cause=retry_cause,
+            )
+
+    async def _run_with_resources(
+        self,
+        task: Task,
+        *,
+        resume_from: str | None = None,
+        resume_provider_session_id: str | None = None,
+        recovery_lineage_id: str | None = None,
+        retry_cause: str | None = None,
+    ) -> Run:
         # Pre-flight workspace daily budget check
         if task.workspace and task.workspace.daily_budget_usd is not None:
             from horizonx.core.usage import UsageStore
             spent = await UsageStore(self.store).daily_usd(task.workspace.workspace_id)
-            if spent >= task.workspace.daily_budget_usd:
+            if spent is not None and spent >= task.workspace.daily_budget_usd:
                 raise BudgetExceeded(
                     f"workspace {task.workspace.workspace_id!r} daily budget "
                     f"${task.workspace.daily_budget_usd:.2f} already spent (${spent:.2f} today)"
@@ -311,6 +333,14 @@ class Runtime:
         *,
         session_id: str | None = None,
     ) -> Session:
+        max_sessions = run.task.resources.max_sessions
+        if (
+            max_sessions is not None
+            and run.cumulative.sessions_count >= max_sessions
+        ):
+            raise BudgetExceeded(
+                f"session limit reached: {run.cumulative.sessions_count}/{max_sessions}"
+            )
         sequence = run.cumulative.sessions_count
         session = Session(
             id=session_id or new_session_id(),
@@ -356,6 +386,11 @@ class Runtime:
         else:
             session.steps_count += 1
         await self.recorder.record(session, step)
+        await self.store.save_session(session)
+        governor = self._governors.get(session.run_id)
+        if governor is not None:
+            governor.checkpoint_wall_time()
+            await self.store.save_run(governor.run)
 
     # ---------------------------------------------------------------
     # Validators
@@ -493,6 +528,31 @@ class Runtime:
     # Workspace + governor
     # ---------------------------------------------------------------
 
+    @asynccontextmanager
+    async def _workspace_run_slot(self, task: Task) -> AsyncIterator[None]:
+        workspace = task.workspace
+        if workspace is None:
+            yield
+            return
+        workspace_id = workspace.workspace_id
+        async with self._workspace_run_lock:
+            active = self._workspace_run_counts.get(workspace_id, 0)
+            if active >= workspace.max_concurrent_runs:
+                raise BudgetExceeded(
+                    f"workspace {workspace_id!r} concurrent run limit reached: "
+                    f"{active}/{workspace.max_concurrent_runs}"
+                )
+            self._workspace_run_counts[workspace_id] = active + 1
+        try:
+            yield
+        finally:
+            async with self._workspace_run_lock:
+                remaining = self._workspace_run_counts[workspace_id] - 1
+                if remaining:
+                    self._workspace_run_counts[workspace_id] = remaining
+                else:
+                    self._workspace_run_counts.pop(workspace_id, None)
+
     def _workspace_for(self, run: Run) -> Any:
         from horizonx.environments.local import LocalWorkspace
 
@@ -522,14 +582,56 @@ class Runtime:
         await self.store.save_run(run)
         return prepared
 
-    def charge(self, result: Any) -> None:
-        """Charge the active governor for a completed session. Call after agent.run_session()."""
-        if self._governor_ref is not None and result is not None:
-            self._governor_ref.charge(
-                tokens_in=getattr(result, "tokens_in", 0),
-                tokens_out=getattr(result, "tokens_out", 0),
-                usd=getattr(result, "cost_usd", 0.0),
-            )
+    async def checkpoint_resources(self, run: Run) -> None:
+        governor = self._governors.get(run.id)
+        if governor is not None:
+            governor.checkpoint_wall_time()
+            await self.store.save_run(run)
+
+    async def charge(
+        self,
+        run: Run,
+        result: Any,
+        *,
+        attempt_id: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        """Charge the governor belonging to *run* for one completed session."""
+        governor = self._governors.get(run.id)
+        if governor is not None and result is not None:
+            try:
+                await governor.charge(
+                    tokens_in=getattr(result, "tokens_in", 0),
+                    tokens_out=getattr(result, "tokens_out", 0),
+                    cache_creation_tokens=getattr(
+                        result, "cache_creation_tokens", 0
+                    ),
+                    cache_read_tokens=getattr(result, "cache_read_tokens", 0),
+                    usd=getattr(result, "cost_usd", None),
+                )
+            finally:
+                await self.bus.publish(
+                    Event(
+                        type="usage.charged",
+                        run_id=run.id,
+                        attempt_id=attempt_id,
+                        session_id=session_id,
+                        payload={
+                            "tokens_in": getattr(result, "tokens_in", 0),
+                            "tokens_out": getattr(result, "tokens_out", 0),
+                            "cache_creation_tokens": getattr(
+                                result, "cache_creation_tokens", 0
+                            ),
+                            "cache_read_tokens": getattr(
+                                result, "cache_read_tokens", 0
+                            ),
+                            "usd": getattr(result, "cost_usd", None),
+                            "usd_known": getattr(result, "cost_usd", None)
+                            is not None,
+                        },
+                    )
+                )
+                await self.store.save_run(run)
 
     @asynccontextmanager
     async def _governor(self, run: Run) -> AsyncIterator[None]:
@@ -545,12 +647,14 @@ class Runtime:
             usage_store=usage_store,
             velocity_monitor=velocity_monitor,
         )
-        self._governor_ref = gov
+        if run.id in self._governors:
+            raise RuntimeError(f"resource governor already active for run {run.id}")
+        self._governors[run.id] = gov
         try:
             async with gov:
                 yield
         finally:
-            self._governor_ref = None
+            self._governors.pop(run.id, None)
 
     # ---------------------------------------------------------------
     # Loading
@@ -569,6 +673,7 @@ class Runtime:
                     f"resume task snapshot does not match persisted run {run.id}; "
                     "fork it to change task configuration"
                 )
+            await self._reconcile_cumulative(run)
             run.status = RunStatus.RUNNING
             return cast(Run, run)
         run_id = new_run_id()
@@ -579,6 +684,134 @@ class Runtime:
             workspace_path=workspace,
             status=RunStatus.RUNNING,
         )
+
+    async def _reconcile_cumulative(self, run: Run) -> None:
+        """Repair aggregate counters from durable session and attempt records."""
+        sessions: list[Session] = []
+        if hasattr(self.store, "list_sessions"):
+            sessions = await self.store.list_sessions(run.id)
+            run.cumulative.sessions_count = len(sessions)
+            run.cumulative.steps_count = sum(s.steps_count for s in sessions)
+            run.cumulative.housekeeping_steps = sum(
+                s.housekeeping_steps for s in sessions
+            )
+        if hasattr(self.store, "list_attempts"):
+            attempts = await self.store.list_attempts(run.id)
+            run.cumulative.attempts_count = len(attempts)
+        if hasattr(self.store, "list_events"):
+            usage_events = await self.store.list_events(
+                run.id, limit=100_000, event_type="usage.charged"
+            )
+            if usage_events:
+                run.cumulative.tokens_in = sum(
+                    int(event.payload.get("tokens_in") or 0)
+                    for event in usage_events
+                )
+                run.cumulative.tokens_out = sum(
+                    int(event.payload.get("tokens_out") or 0)
+                    for event in usage_events
+                )
+                run.cumulative.cache_creation_tokens = sum(
+                    int(event.payload.get("cache_creation_tokens") or 0)
+                    for event in usage_events
+                )
+                run.cumulative.cache_read_tokens = sum(
+                    int(event.payload.get("cache_read_tokens") or 0)
+                    for event in usage_events
+                )
+                run.cumulative.cost_known = all(
+                    bool(event.payload.get("usd_known"))
+                    for event in usage_events
+                )
+                run.cumulative.usd = (
+                    sum(float(event.payload.get("usd") or 0.0) for event in usage_events)
+                    if run.cumulative.cost_known
+                    else None
+                )
+                cache_eligible = (
+                    run.cumulative.tokens_in
+                    + run.cumulative.cache_read_tokens
+                )
+                run.cumulative.cache_hit_rate = (
+                    run.cumulative.cache_read_tokens / cache_eligible
+                    if cache_eligible
+                    else 0.0
+                )
+            charged_sessions = {
+                event.session_id for event in usage_events if event.session_id
+            }
+            partial_tokens_in = 0
+            partial_tokens_out = 0
+            partial_cache_creation = 0
+            partial_cache_read = 0
+            active_wall_seconds = 0.0
+            for session in sessions:
+                steps = await self.store.recent_steps(session.id, 100_000)
+                if session.completed_at is not None:
+                    active_wall_seconds += max(
+                        0.0,
+                        (session.completed_at - session.started_at).total_seconds(),
+                    )
+                elif steps:
+                    active_wall_seconds += max(
+                        0.0,
+                        (steps[-1].timestamp - session.started_at).total_seconds(),
+                    )
+                if session.id in charged_sessions:
+                    continue
+                session_tokens_in = 0
+                session_tokens_out = 0
+                session_cache_creation = 0
+                session_cache_read = 0
+                for step in steps:
+                    if step.type != StepType.USAGE:
+                        continue
+                    usage = step.content.get("usage") or step.content
+                    if not isinstance(usage, dict):
+                        continue
+                    observed_tokens_in = int(usage.get("input_tokens") or 0)
+                    observed_tokens_out = int(usage.get("output_tokens") or 0)
+                    observed_cache_creation = int(
+                        usage.get("cache_creation_input_tokens") or 0
+                    )
+                    observed_cache_read = int(
+                        usage.get("cache_read_input_tokens")
+                        or usage.get("cached_input_tokens")
+                        or 0
+                    )
+                    if step.content.get("usage_mode") == "cumulative":
+                        session_tokens_in = observed_tokens_in
+                        session_tokens_out = observed_tokens_out
+                        session_cache_creation = observed_cache_creation
+                        session_cache_read = observed_cache_read
+                    else:
+                        session_tokens_in += observed_tokens_in
+                        session_tokens_out += observed_tokens_out
+                        session_cache_creation += observed_cache_creation
+                        session_cache_read += observed_cache_read
+                partial_tokens_in += session_tokens_in
+                partial_tokens_out += session_tokens_out
+                partial_cache_creation += session_cache_creation
+                partial_cache_read += session_cache_read
+            run.cumulative.tokens_in += partial_tokens_in
+            run.cumulative.tokens_out += partial_tokens_out
+            run.cumulative.cache_creation_tokens += partial_cache_creation
+            run.cumulative.cache_read_tokens += partial_cache_read
+            if partial_tokens_in or partial_tokens_out:
+                run.cumulative.cost_known = False
+                run.cumulative.usd = None
+            cache_eligible = (
+                run.cumulative.tokens_in + run.cumulative.cache_read_tokens
+            )
+            run.cumulative.cache_hit_rate = (
+                run.cumulative.cache_read_tokens / cache_eligible
+                if cache_eligible
+                else 0.0
+            )
+            run.cumulative.wall_seconds = max(
+                run.cumulative.wall_seconds, active_wall_seconds
+            )
+        await self.store.save_run(run)
 
     # ---------------------------------------------------------------
     # Fork / Merge

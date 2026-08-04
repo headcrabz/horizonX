@@ -404,6 +404,7 @@ CREATE TABLE IF NOT EXISTS workspace_usage (
     tokens_in    INTEGER NOT NULL DEFAULT 0,
     tokens_out   INTEGER NOT NULL DEFAULT 0,
     usd          REAL NOT NULL DEFAULT 0.0,
+    usd_known    INTEGER NOT NULL DEFAULT 1,
     recorded_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_workspace_usage ON workspace_usage(workspace_id, date);
@@ -1658,6 +1659,7 @@ class SqliteStore:
                     started_at=row["started_at"],
                     completed_at=row["completed_at"],
                     steps_count=row["steps_count"],
+                    housekeeping_steps=row["housekeeping_steps"],
                     tokens_used=row["tokens_used"],
                     agent_session_id=row["agent_session_id"],
                     handoff_summary_path=row["handoff_summary_path"],
@@ -2177,37 +2179,40 @@ class SqliteStore:
 
     def _sync_record_workspace_usage(
         self, workspace_id: str, run_id: str,
-        tokens_in: int, tokens_out: int, usd: float,
+        tokens_in: int, tokens_out: int, usd: float | None,
     ) -> None:
         import uuid
         from datetime import date
         with self._conn() as c:
             c.execute(
                 "INSERT INTO workspace_usage "
-                "(id, workspace_id, run_id, date, tokens_in, tokens_out, usd, recorded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+                "(id, workspace_id, run_id, date, tokens_in, tokens_out, usd, usd_known, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
                 (str(uuid.uuid4()), workspace_id, run_id, str(date.today()),
-                 tokens_in, tokens_out, usd),
+                 tokens_in, tokens_out, usd or 0.0, int(usd is not None)),
             )
 
-    def _sync_workspace_daily_usd(self, workspace_id: str) -> float:
+    def _sync_workspace_daily_usd(self, workspace_id: str) -> float | None:
         from datetime import date
         with self._conn() as c:
             row = c.execute(
-                "SELECT COALESCE(SUM(usd), 0.0) FROM workspace_usage "
+                "SELECT COALESCE(SUM(usd), 0.0), COALESCE(MIN(usd_known), 1) "
+                "FROM workspace_usage "
                 "WHERE workspace_id=? AND date=?",
                 (workspace_id, str(date.today())),
             ).fetchone()
+        if row and not bool(row[1]):
+            return None
         return float(row[0]) if row else 0.0
 
     async def record_workspace_usage(
         self, workspace_id: str, run_id: str,
-        tokens_in: int, tokens_out: int, usd: float,
+        tokens_in: int, tokens_out: int, usd: float | None,
     ) -> None:
         return await self._run_sync(
             self._sync_record_workspace_usage,
             workspace_id, run_id, tokens_in, tokens_out, usd,
         )
 
-    async def workspace_daily_usd(self, workspace_id: str) -> float:
+    async def workspace_daily_usd(self, workspace_id: str) -> float | None:
         return await self._run_sync(self._sync_workspace_daily_usd, workspace_id)

@@ -246,10 +246,13 @@ workspace:
   daily_budget_usd: 25.0       # across all runs today
 ```
 
-- Charges are tracked from real token counts in agent stream events
-- Slack alert fires at 75% via `asyncio.create_task` (non-blocking)
-- Cost velocity detector fires when $/min rate doubles twice in succession
-- Pre-flight check blocks new runs when workspace daily budget is exhausted
+- Every built-in attempt charges its run-scoped governor; usage writes and threshold events are awaited
+- Per-session token, step, and time caps plus total token, known-cost, wall-time, and session caps are enforced at attempt and streamed-usage boundaries
+- `workspace.max_concurrent_runs` limits overlapping runs within one local HorizonX daemon
+- The configured HITL path is invoked at the 75% threshold
+- Cost velocity detection monitors accelerating known dollar spend
+- Pre-flight checks block new runs when known workspace spend exhausts the daily budget
+- Codex does not report direct dollar cost, so HorizonX displays cost as `unavailable` instead of `$0`; configure token limits when using providers without cost data
 
 ---
 
@@ -435,14 +438,14 @@ focused tests; it does not imply a verified production guarantee.
 | Goal graph and six validator types | Experimental | SQLite is authoritative and `goals.json` is an atomic projection; completion rejection no longer reports a successful run, while evidence calibration still needs hardening. |
 | Resume and dashboard recovery | Under hardening | A recurring reconciler scans non-terminal runs through versioned leases, persists provider IDs during streaming, and chooses provider resume versus a new attempt. Ambiguous completed-attempt gaps pause for operator reconciliation instead of replaying work. |
 | Seven spin-detection components | Under hardening | All built-in strategy attempts use the combined detector path; durable retry, strategy-switch, and operator-response actions are not complete. |
-| Resource governor and usage store | Under hardening | All built-in strategy attempts share charging and per-session step/time limits; session-count enforcement, concurrency, and unknown provider cost still need hardening. |
+| Resource governor and usage store | Implemented, local-only | Every built-in attempt uses run-scoped token, session, step, time, and known-cost limits. Workspace concurrency is enforced within one daemon. Unknown provider cost is shown as unavailable and requires token limits. |
 | FTS5 knowledge store and handoff sync | Components only | The store and sync modules are not yet connected to the normal runtime/strategy lifecycle. Automatic cross-run memory is not claimed. |
 | Slack HITL and dashboard controls | Under hardening | Durable decisions, authenticated callbacks, restart-safe waits, and process-tree cancellation are not complete. |
 | SSE dashboard and JSONL trajectory | Experimental | Runtime events have a durable SQLite sequence, while the current SSE endpoint remains live/in-memory and does not yet expose cursor replay. |
 | Local workspace execution | Implemented, local-only | Local paths use isolated Git worktrees; setup and agent subprocess trees are terminated as one owned session. Attempt metadata records the boundary. Host filesystem, network, CPU, memory, child-count, and workspace-disk isolation are not enforced. |
 | Docker, Podman, and E2B execution | Not supported | Unimplemented backend values are rejected by configuration instead of being silently treated as local execution. |
 | Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |
-| Automated verification | Implemented | 489 tests pass on the audited baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Automated verification | Implemented | 511 tests pass on the current baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
 | Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
 
 Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or

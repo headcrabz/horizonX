@@ -187,8 +187,10 @@ class ClaudeCodeAgent:
             agent_session_id=captured_session_id,
             status=status,
             error=last_error,
-            tokens_in=int(totals.get("input_tokens", 0) + totals.get("cache_creation_input_tokens", 0)),
+            tokens_in=int(totals.get("input_tokens", 0)),
             tokens_out=int(totals.get("output_tokens", 0)),
+            cache_creation_tokens=int(totals.get("cache_creation_input_tokens", 0)),
+            cache_read_tokens=int(totals.get("cache_read_input_tokens", 0)),
             cost_usd=totals.get("total_cost_usd", 0.0),
         )
 
@@ -245,13 +247,15 @@ class ClaudeCodeAgent:
         if event.get("type") == "result":
             usage = event.get("usage")
             if event.get("total_cost_usd") is not None:
-                self._totals["total_cost_usd"] += float(event["total_cost_usd"])
+                self._totals["total_cost_usd"] = float(event["total_cost_usd"])
         elif event.get("type") == "assistant":
             usage = (event.get("message") or {}).get("usage")
         if not usage:
             return
         for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
-            if usage.get(k):
+            if event.get("type") == "result":
+                self._totals[k] = int(usage.get(k, 0))
+            elif usage.get(k):
                 self._totals[k] += int(usage[k])
 
     def _event_to_steps(self, event: dict[str, Any], sequence_start: int, session_id: str) -> list[Step]:
@@ -320,6 +324,20 @@ class ClaudeCodeAgent:
                         content={"raw_block": block},
                     ))
                     seq += 1
+            usage = msg.get("usage")
+            if usage:
+                out.append(
+                    Step(
+                        session_id=session_id,
+                        sequence=seq,
+                        type=StepType.USAGE,
+                        content={
+                            "usage": usage,
+                            "source": "assistant",
+                            "usage_mode": "delta",
+                        },
+                    )
+                )
             return out
 
         if et == "user":
@@ -349,6 +367,7 @@ class ClaudeCodeAgent:
                     "num_turns": event.get("num_turns"),
                     "total_cost_usd": event.get("total_cost_usd"),
                     "usage": event.get("usage"),
+                    "usage_mode": "cumulative",
                     "result": event.get("result"),
                     "stop_reason": event.get("stop_reason"),
                     "terminal_reason": event.get("terminal_reason"),

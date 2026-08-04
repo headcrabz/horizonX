@@ -176,10 +176,13 @@ class CumulativeMetrics(BaseModel):
     tokens_out: int = 0
     cache_creation_tokens: int = 0   # cache write
     cache_read_tokens: int = 0       # cache hit (cheap)
-    usd: float = 0.0
+    usd: float | None = None
+    cost_known: bool = True
     wall_seconds: float = 0.0
     sessions_count: int = 0
     steps_count: int = 0
+    housekeeping_steps: int = 0
+    attempts_count: int = 0
     cache_hit_rate: float = 0.0      # derived
 
 
@@ -497,7 +500,9 @@ class SessionRunResult(BaseModel):
     error: str | None = None
     tokens_in: int = 0
     tokens_out: int = 0
-    cost_usd: float = 0.0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float | None = None
 
 
 class SpinReport(BaseModel):

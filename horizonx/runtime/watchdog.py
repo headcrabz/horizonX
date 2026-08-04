@@ -2,8 +2,8 @@
 
 Runs as an asyncio background task alongside an agent session.
 
-  - At soft_seconds of silence: fires on_nudge callback (injects a
-    continuation prompt into the agent) and records a soft-nudge event.
+  - At soft_seconds of silence: fires an on_nudge callback so the runtime can
+    emit a diagnostic/steering request without assuming transport support.
   - At hard_seconds of silence: cancels the session task and returns
     StallOutcome.HARD_ABORT so the runtime can pause for HITL.
 
@@ -19,7 +19,7 @@ Typical usage inside a strategy:
     )
 
     async def _nudge(reason: str) -> None:
-        # write a synthetic step / stdin nudge to the agent
+        # publish a diagnostic action for an operator or steer-capable adapter
         await runtime.bus.publish(Event(type="session.stall_nudge", ...))
 
     session_task = asyncio.create_task(agent.run_session(..., on_step=on_step_cb))
@@ -66,6 +66,7 @@ class StallWatchdog:
         session_task: asyncio.Task[object],
         *,
         on_nudge: Callable[[str], Awaitable[None]] | None = None,
+        on_tick: Callable[[], Awaitable[None]] | None = None,
     ) -> StallOutcome:
         """Monitor *session_task* until it finishes or a stall is detected.
 
@@ -77,7 +78,13 @@ class StallWatchdog:
         outcome = StallOutcome.OK
 
         while not session_task.done():
-            await asyncio.sleep(self.poll_interval)
+            done, _ = await asyncio.wait(
+                {session_task}, timeout=self.poll_interval
+            )
+            if done:
+                break
+            if on_tick is not None:
+                await on_tick()
             idle = time.monotonic() - self._last_activity
 
             if idle >= self.hard_seconds:

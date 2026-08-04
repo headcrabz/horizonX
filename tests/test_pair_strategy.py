@@ -35,9 +35,11 @@ async def _make_session(*args: Any, **kwargs: Any) -> Any:
 
 def _make_mock_rt(tmp_path: Path) -> Any:
     rt = MagicMock()
+    rt.store.save_session = AsyncMock()
     rt.start_session = AsyncMock(side_effect=_make_session)
     rt.end_session = AsyncMock()
     rt.record_step = AsyncMock()
+    rt.charge = AsyncMock()
     rt.run_validators = AsyncMock(return_value=[])
     rt.request_hitl = AsyncMock()
     return rt

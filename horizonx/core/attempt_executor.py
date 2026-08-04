@@ -25,6 +25,7 @@ from horizonx.core.types import (
     Step,
     StepType,
 )
+from horizonx.runtime.watchdog import StallOutcome, StallWatchdog
 
 if TYPE_CHECKING:
     from horizonx.core.runtime import Runtime
@@ -53,6 +54,13 @@ class AttemptExecutor:
         cleanup: tuple[CleanupCallback, ...] = (),
     ) -> AttemptResult:
         rt = self.runtime
+        total_hours = run.task.resources.max_total_hours
+        remaining_total_seconds: float | None = None
+        if total_hours is not None:
+            elapsed = run.cumulative.wall_seconds
+            remaining_total_seconds = total_hours * 3600 - elapsed
+            if remaining_total_seconds <= 0:
+                raise BudgetExceeded("total run time limit reached")
         session = await rt.start_session(
             run, target_goal=target_goal, session_id=session_id
         )
@@ -104,6 +112,8 @@ class AttemptExecutor:
         create_result = rt.store.create_attempt(attempt)
         if inspect.isawaitable(create_result):
             attempt = await create_result
+            run.cumulative.attempts_count += 1
+            await rt.store.save_run(run)
             await rt.bus.publish(
                 Event(
                     type="attempt.started",
@@ -121,10 +131,28 @@ class AttemptExecutor:
         cancel_token = CancelToken()
         decisions: list[GateDecision] = []
         spin_detected = False
+        streamed_tokens = 0
         result: SessionRunResult | None = None
+        limits = run.task.resources
+        watchdog: StallWatchdog | None = None
+        if limits.stall_soft_seconds > 0 and limits.stall_hard_seconds > 0:
+            watchdog = StallWatchdog(
+                soft_seconds=limits.stall_soft_seconds,
+                hard_seconds=limits.stall_hard_seconds,
+                poll_interval=max(
+                    0.001,
+                    min(
+                        1.0,
+                        limits.stall_soft_seconds / 4,
+                        limits.stall_hard_seconds / 4,
+                    ),
+                ),
+            )
 
         async def on_step(step: Step) -> None:
-            nonlocal spin_detected
+            nonlocal spin_detected, streamed_tokens
+            if watchdog is not None:
+                watchdog.notify_activity()
             step.session_id = session.id
             from horizonx.security.environment_policy import redact_secrets
 
@@ -143,6 +171,41 @@ class AttemptExecutor:
                         attempt.provider_session_id = str(provider_session_id)
                         await provider_update
             await rt.record_step(session, step)
+            if step.type == StepType.USAGE:
+                usage = step.content.get("usage") or step.content
+                if isinstance(usage, dict):
+                    observed_tokens = sum(
+                        int(usage.get(key) or 0)
+                        for key in (
+                            "input_tokens",
+                            "output_tokens",
+                            "cached_input_tokens",
+                            "cache_creation_input_tokens",
+                            "cache_read_input_tokens",
+                        )
+                    )
+                    if step.content.get("usage_mode") == "cumulative":
+                        streamed_tokens = observed_tokens
+                    else:
+                        streamed_tokens += observed_tokens
+                session_token_limit = run.task.resources.max_tokens_per_session
+                if (
+                    session_token_limit is not None
+                    and streamed_tokens >= session_token_limit
+                ):
+                    cancel_token.cancel(reason="session_token_limit")
+                total_token_limit = run.task.resources.max_total_tokens
+                cumulative_tokens = (
+                    run.cumulative.tokens_in
+                    + run.cumulative.tokens_out
+                    + run.cumulative.cache_creation_tokens
+                    + run.cumulative.cache_read_tokens
+                )
+                if (
+                    total_token_limit is not None
+                    and cumulative_tokens + streamed_tokens >= total_token_limit
+                ):
+                    cancel_token.cancel(reason="total_token_limit")
             if (
                 session.steps_count > 0
                 and session.steps_count % 5 == 0
@@ -178,13 +241,82 @@ class AttemptExecutor:
                 workspace=workspace,
                 **invocation_kwargs,
             )
+            session_task = asyncio.create_task(invocation)
+
+            async def on_stall_nudge(reason: str) -> None:
+                await rt.bus.publish(
+                    Event(
+                        type="session.stall_nudge",
+                        run_id=run.id,
+                        attempt_id=attempt.id,
+                        session_id=session.id,
+                        goal_id=attempt.goal_id,
+                        payload={"reason": reason},
+                    )
+                )
+
+            async def on_watchdog_tick() -> None:
+                await rt.checkpoint_resources(run)
+
+            watchdog_task = (
+                asyncio.create_task(
+                    watchdog.run(
+                        session_task,
+                        on_nudge=on_stall_nudge,
+                        on_tick=on_watchdog_tick,
+                    )
+                )
+                if watchdog is not None
+                else None
+            )
             timeout = timeout_seconds
             if timeout is None:
                 timeout = run.task.resources.max_minutes_per_session * 60
+            if remaining_total_seconds is not None:
+                timeout = min(timeout, remaining_total_seconds)
             try:
-                result = await asyncio.wait_for(invocation, timeout=timeout)
+                result = await asyncio.wait_for(
+                    asyncio.shield(session_task), timeout=timeout
+                )
+                if watchdog_task is not None:
+                    await watchdog_task
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    cancel_token.cancel("run_cancelled")
+                    session_task.cancel()
+                    if watchdog_task is not None:
+                        watchdog_task.cancel()
+                    await asyncio.gather(
+                        session_task,
+                        *([watchdog_task] if watchdog_task is not None else []),
+                        return_exceptions=True,
+                    )
+                    raise
+                watchdog_outcome = (
+                    await watchdog_task if watchdog_task is not None else None
+                )
+                if watchdog_outcome != StallOutcome.HARD_ABORT:
+                    raise
+                cancel_token.cancel("stall_hard_timeout")
+                await rt.bus.publish(
+                    Event(
+                        type="session.stall_abort",
+                        run_id=run.id,
+                        attempt_id=attempt.id,
+                        session_id=session.id,
+                        goal_id=attempt.goal_id,
+                        payload={"reason": cancel_token.reason},
+                    )
+                )
+                result = SessionRunResult(
+                    status=SessionStatus.TIMEOUT,
+                    error=cancel_token.reason,
+                )
             except TimeoutError:
                 cancel_token.cancel("attempt_timeout")
+                session_task.cancel()
+                await asyncio.gather(session_task, return_exceptions=True)
                 result = SessionRunResult(
                     status=SessionStatus.TIMEOUT,
                     error=f"attempt exceeded {timeout:g} seconds",
@@ -194,6 +326,10 @@ class AttemptExecutor:
                     status=SessionStatus.ERRORED,
                     error=str(exc),
                 )
+            finally:
+                if watchdog_task is not None and not watchdog_task.done():
+                    watchdog_task.cancel()
+                    await asyncio.gather(watchdog_task, return_exceptions=True)
 
             assert result is not None
             if cancel_token.cancelled and result.status in {
@@ -219,7 +355,30 @@ class AttemptExecutor:
                 if inspect.isawaitable(provider_update):
                     attempt.provider_session_id = result.agent_session_id
                     await provider_update
-            rt.charge(result)
+            session.tokens_used = (
+                result.tokens_in
+                + result.tokens_out
+                + result.cache_creation_tokens
+                + result.cache_read_tokens
+            )
+            run.cumulative.steps_count += session.steps_count
+            run.cumulative.housekeeping_steps += session.housekeeping_steps
+            await rt.store.save_session(session)
+            await rt.charge(
+                run,
+                result,
+                attempt_id=attempt.id,
+                session_id=session.id,
+            )
+            max_session_tokens = run.task.resources.max_tokens_per_session
+            if (
+                max_session_tokens is not None
+                and session.tokens_used >= max_session_tokens
+            ):
+                raise BudgetExceeded(
+                    f"session token limit reached: "
+                    f"{session.tokens_used}/{max_session_tokens}"
+                )
             if result.status == SessionStatus.COMPLETED:
                 for stage in validator_stages:
                     decisions.extend(

@@ -150,9 +150,10 @@ class CodexAgent:
             agent_session_id=captured_session_id,
             status=status,
             error=last_error,
-            tokens_in=totals.get("input_tokens", 0) + totals.get("cached_input_tokens", 0),
+            tokens_in=totals.get("input_tokens", 0),
             tokens_out=totals.get("output_tokens", 0),
-            cost_usd=0.0,  # codex doesn't report cost directly
+            cache_read_tokens=totals.get("cached_input_tokens", 0),
+            cost_usd=None,  # Codex does not report direct dollar cost.
         )
 
     # ---------------------------------------------------------------

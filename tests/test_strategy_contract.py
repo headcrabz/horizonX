@@ -63,6 +63,7 @@ def _runtime_double(store: object | None = None) -> MagicMock:
     )
     rt.end_session = AsyncMock()
     rt.record_step = AsyncMock()
+    rt.charge = AsyncMock()
     rt.run_validators = AsyncMock(return_value=[])
     rt.request_hitl = AsyncMock()
     rt.bus.publish = AsyncMock()
@@ -89,7 +90,7 @@ async def test_single_agent_error_is_a_failed_outcome(tmp_path: Path) -> None:
     assert outcome.status == RunStatus.FAILED
     assert outcome.reason == "agent_errored"
     rt.end_session.assert_awaited_once()
-    rt.charge.assert_called_once()
+    rt.charge.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -115,7 +116,7 @@ async def test_decomposition_agent_error_cannot_complete_goal(tmp_path: Path) ->
         rt.end_session.assert_awaited_once_with(
             rt.start_session.return_value, SessionStatus.ERRORED
         )
-        rt.charge.assert_called_once()
+        rt.charge.assert_awaited_once()
     finally:
         await store.close()
 
@@ -367,7 +368,7 @@ async def test_ralph_all_iteration_timeouts_are_not_completion(tmp_path: Path) -
     strategy = RalphLoop({"total_minutes": 1, "fixed_minutes_per_iter": 1})
 
     async def timeout_once(awaitable, *, timeout):  # type: ignore[no-untyped-def]
-        awaitable.close()
+        awaitable.cancel()
         strategy.total_minutes = 0
         raise TimeoutError
 

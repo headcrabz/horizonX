@@ -26,6 +26,19 @@ class TestStallWatchdog:
         assert outcome == StallOutcome.OK
 
     @pytest.mark.asyncio
+    async def test_completed_task_does_not_wait_for_poll_interval(self):
+        watchdog = StallWatchdog(
+            soft_seconds=10,
+            hard_seconds=20,
+            poll_interval=5,
+        )
+
+        task = asyncio.create_task(asyncio.sleep(0))
+        outcome = await asyncio.wait_for(watchdog.run(task), timeout=0.1)
+
+        assert outcome == StallOutcome.OK
+
+    @pytest.mark.asyncio
     async def test_soft_nudge_fires_before_hard(self):
         watchdog = self._fast_watchdog(soft=0.04, hard=0.20)
         nudge_calls: list[str] = []
