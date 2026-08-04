@@ -157,6 +157,7 @@ class ClaudeCodeAgent:
                 # Translate to one or more Steps
                 for step in self._event_to_steps(event, sequence_start=sequence, session_id=session_id or ""):
                     sequence = step.sequence + 1
+                    step.content.setdefault("provider", self.name)
                     if step.type == StepType.SESSION_ID:
                         captured_session_id = step.content.get("session_id") or captured_session_id
                     if step.type == StepType.ERROR:

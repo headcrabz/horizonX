@@ -213,7 +213,18 @@ class AttemptExecutor:
             ):
                 report = await rt.check_spin(session, run)
                 if report and report.detected:
-                    if report.action != "warn_and_inject_diagnostic":
+                    if report.action == "warn_and_inject_diagnostic":
+                        await rt.bus.publish(
+                            Event(
+                                type="session.spin_nudge",
+                                run_id=run.id,
+                                attempt_id=attempt.id,
+                                session_id=session.id,
+                                goal_id=attempt.goal_id,
+                                payload={"layer": report.layer, "detail": report.detail},
+                            )
+                        )
+                    else:
                         spin_detected = True
                         cancel_token.cancel(reason=f"spin:{report.layer}")
             if session.steps_count >= run.task.resources.max_steps_per_session:

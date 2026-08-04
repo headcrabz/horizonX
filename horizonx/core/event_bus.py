@@ -26,6 +26,7 @@ EventType = Literal[
     "session.timeout",
     "session.stall_nudge",
     "session.stall_abort",
+    "session.spin_nudge",
     "step.recorded",
     "goal.in_progress",
     "goal.done",

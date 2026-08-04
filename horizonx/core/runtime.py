@@ -463,6 +463,13 @@ class Runtime:
         # Cross-session layer (goal-graph progress check across multiple sessions)
         if not report.detected:
             report = await CrossSessionSpinLayer().check_cross_session(run.id, self.store)
+        if report.detected and report.action != "warn_and_inject_diagnostic":
+            action_map: dict[str, Any] = {
+                "terminate_and_retry": "terminate_session_and_retry",
+                "terminate_and_hitl": "terminate_and_hitl",
+                "switch_strategy": "switch_strategy",
+            }
+            report.action = action_map[run.task.spin_detection.on_spin]
         if report.detected:
             await self.store.save_spin_report(session, report)
             await self.bus.publish(

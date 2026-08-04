@@ -1037,7 +1037,9 @@ class SqliteStore:
                     step.sequence,
                     step.type.value,
                     step.tool_name,
-                    json.dumps(step.content, default=str),
+                    json.dumps(
+                        {**step.content, "__horizonx_canonical": step.canonical}, default=str
+                    ),
                     step.timestamp.isoformat(),
                     step.duration_ms,
                 ),
@@ -1056,6 +1058,7 @@ class SqliteStore:
             ).fetchall()
         out = []
         for row in reversed(rows):
+            content = json.loads(row["content"])
             out.append(
                 Step(
                     id=row["id"],
@@ -1063,7 +1066,8 @@ class SqliteStore:
                     sequence=row["sequence"],
                     type=StepType(row["type"]),
                     tool_name=row["tool_name"],
-                    content=json.loads(row["content"]),
+                    content={k: v for k, v in content.items() if k != "__horizonx_canonical"},
+                    canonical=content.get("__horizonx_canonical"),
                     timestamp=row["timestamp"],
                     duration_ms=row["duration_ms"],
                 )
@@ -1697,7 +1701,8 @@ class SqliteStore:
                 sequence=row["sequence"],
                 type=StepType(row["type"]),
                 tool_name=row["tool_name"],
-                content=json.loads(row["content"]),
+                content={k: v for k, v in json.loads(row["content"]).items() if k != "__horizonx_canonical"},
+                canonical=json.loads(row["content"]).get("__horizonx_canonical"),
                 timestamp=row["timestamp"],
                 duration_ms=row["duration_ms"],
             )

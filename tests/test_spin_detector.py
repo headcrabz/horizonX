@@ -17,16 +17,19 @@ from horizonx.core.spin_detector import (
     ToolThrashingLayer,
 )
 from horizonx.core.types import Session, SpinDetectionConfig, Step, StepType
+from horizonx.events.normalizers import normalize_step
 
 
 def _tool_step(seq: int, tool: str = "Bash", content: dict | None = None) -> Step:
-    return Step(
+    step = Step(
         session_id="s1",
         sequence=seq,
         type=StepType.TOOL_CALL,
         tool_name=tool,
         content=content or {"command": f"echo {seq}"},
     )
+    step.canonical = normalize_step(step).model_dump(mode="json")
+    return step
 
 
 class TestExactLoopLayer:
@@ -101,12 +104,7 @@ class TestEditRevertLayer:
         store = MagicMock()
         edit_a = {"file_path": "a.py", "old": "x", "new": "y"}
         edit_b = {"file_path": "a.py", "old": "y", "new": "x"}
-        steps = [
-            Step(session_id="s1", sequence=0, type=StepType.TOOL_CALL, tool_name="Edit", content=edit_a),
-            Step(session_id="s1", sequence=1, type=StepType.TOOL_CALL, tool_name="Edit", content=edit_b),
-            Step(session_id="s1", sequence=2, type=StepType.TOOL_CALL, tool_name="Edit", content=edit_a),
-            Step(session_id="s1", sequence=3, type=StepType.TOOL_CALL, tool_name="Edit", content=edit_b),
-        ]
+        steps = [_tool_step(i, tool="Edit", content=edit) for i, edit in enumerate((edit_a, edit_b, edit_a, edit_b))]
         store.recent_steps = AsyncMock(return_value=steps)
         layer = EditRevertLayer()
         session = Session(run_id="r1", sequence_index=0)

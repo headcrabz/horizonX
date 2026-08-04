@@ -445,6 +445,7 @@ class Step(BaseModel):
     type: StepType
     tool_name: str | None = None
     content: dict[str, Any] = Field(default_factory=dict)
+    canonical: dict[str, Any] | None = None
     timestamp: datetime = Field(default_factory=utcnow)
     duration_ms: int | None = None
 

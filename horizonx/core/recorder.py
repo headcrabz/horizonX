@@ -12,6 +12,7 @@ from typing import Any
 
 from horizonx.core.event_bus import Event, EventBus
 from horizonx.core.types import Session, Step
+from horizonx.events.normalizers import normalize_step
 
 
 class TrajectoryRecorder:
@@ -20,6 +21,7 @@ class TrajectoryRecorder:
         self.bus = bus
 
     async def record(self, session: Session, step: Step) -> None:
+        step.canonical = normalize_step(step).model_dump(mode="json")
         await self._append_jsonl(session, step)
         await self.store.save_step(step)
         await self.bus.publish(

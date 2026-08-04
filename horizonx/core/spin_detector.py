@@ -11,6 +11,7 @@ from collections import Counter
 from typing import Any, Protocol
 
 from horizonx.core.types import Session, SpinDetectionConfig, SpinReport, Step, StepType
+from horizonx.events.model import CanonicalEvent
 
 
 class SpinLayer(Protocol):
@@ -19,12 +20,20 @@ class SpinLayer(Protocol):
     async def check(self, session: Session, store: Any) -> SpinReport: ...
 
 
+def _event(step: Step) -> CanonicalEvent | None:
+    raw = step.canonical
+    if not isinstance(raw, dict):
+        return None
+    return CanonicalEvent.model_validate(raw)
+
+
 def _hash_step(step: Step) -> str:
-    """Canonical hash for a tool call (tool_name + sorted args)."""
-    if step.type != StepType.TOOL_CALL or step.tool_name is None:
+    """Canonical hash for a tool call (tool name + structured arguments)."""
+    event = _event(step)
+    if event is None or event.kind != StepType.TOOL_CALL.value or event.tool_name is None:
         return ""
-    norm = json.dumps(step.content, sort_keys=True, default=str)
-    return hashlib.sha256(f"{step.tool_name}::{norm}".encode()).hexdigest()[:16]
+    norm = json.dumps(event.arguments, sort_keys=True, default=str)
+    return hashlib.sha256(f"{event.tool_name}::{norm}".encode()).hexdigest()[:16]
 
 
 class ExactLoopLayer:
@@ -90,9 +99,10 @@ class BucketedHashLayer:
         self.window = window
 
     def _bucket(self, step: Step) -> str:
-        if step.type != StepType.TOOL_CALL or step.tool_name is None:
+        event = _event(step)
+        if event is None or event.kind != StepType.TOOL_CALL.value or event.tool_name is None:
             return ""
-        norm = f"{step.tool_name}::{step.content.get('command', step.content.get('input', ''))}"
+        norm = f"{event.tool_name}::{event.target or event.arguments}"
         return hashlib.sha256(norm.encode()).hexdigest()[:4]
 
     async def check(self, session: Session, store: Any) -> SpinReport:
@@ -127,14 +137,14 @@ class EditRevertLayer:
         # Look at file_edit tool calls and detect A→B→A→B pattern
         edits: dict[str, list[str]] = {}
         for s in steps:
-            if s.type != StepType.TOOL_CALL or s.tool_name not in ("Edit", "Write", "edit"):
+            event = _event(s)
+            if event is None or event.category != "edit" or not event.target:
                 continue
-            path = s.content.get("file_path") or s.content.get("path")
-            if not path:
+            if not event.changed_file_digest:
                 continue
-            edits.setdefault(path, []).append(_hash_step(s))
+            edits.setdefault(event.target, []).append(event.changed_file_digest)
         for path, hist in edits.items():
-            if len(hist) >= 4 and hist[-1] == hist[-3] and hist[-2] == hist[-4] and hist[-1] != hist[-2]:
+            if len(hist) >= 3 and hist[-1] == hist[-3] and hist[-1] != hist[-2]:
                 return SpinReport(
                     detected=True,
                     layer=self.name,
@@ -182,8 +192,8 @@ MUTATING_TOOL_NAMES = frozenset({
 
 def _result_hash(step: Step) -> str:
     """Hash of what the tool returned — for no-progress detection on idempotent reads."""
-    result = step.content.get("output") or step.content.get("result") or step.content.get("stdout") or ""
-    return hashlib.sha256(str(result)[:2000].encode()).hexdigest()[:16]
+    event = _event(step)
+    return event.result_digest if event and event.result_digest else ""
 
 
 class ToolThrashingLayer:
@@ -201,10 +211,13 @@ class ToolThrashingLayer:
 
     async def check(self, session: Session, store: Any) -> SpinReport:
         steps = await store.recent_steps(session.id, self.window)
-        tool_steps = [s for s in steps if s.type == StepType.TOOL_CALL]
+        events = [(step, _event(step)) for step in steps]
 
         # Idempotent: same tool + same result hash → no progress (reading same thing repeatedly)
-        idempotent = [s for s in tool_steps if s.tool_name in IDEMPOTENT_TOOL_NAMES]
+        idempotent = [
+            step for step, event in events
+            if event and event.kind == StepType.TOOL_CALL.value and event.category in {"read", "search"}
+        ]
         if idempotent:
             result_hashes = Counter(_result_hash(s) for s in idempotent if s.content)
             if result_hashes:
@@ -219,7 +232,10 @@ class ToolThrashingLayer:
                     )
 
         # Mutating: same tool + same args hash → stuck loop
-        mutating = [s for s in tool_steps if s.tool_name in MUTATING_TOOL_NAMES]
+        mutating = [
+            step for step, event in events
+            if event and event.kind == StepType.TOOL_CALL.value and event.category in {"edit", "execute"}
+        ]
         if mutating:
             arg_hashes = Counter(_hash_step(s) for s in mutating if s.content)
             if arg_hashes:
