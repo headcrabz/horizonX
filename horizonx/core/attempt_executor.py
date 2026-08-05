@@ -131,6 +131,7 @@ class AttemptExecutor:
                 )
             )
         cancel_token = CancelToken()
+        rt.register_cancel_token(run.id, cancel_token)
         decisions: list[GateDecision] = []
         spin_detected = False
         spin_action: str | None = None
@@ -463,6 +464,7 @@ class AttemptExecutor:
         except Exception as exc:
             result = SessionRunResult(status=SessionStatus.ERRORED, error=str(exc))
         finally:
+            rt.unregister_cancel_token(run.id, cancel_token)
             cleanup_errors: list[str] = []
             for callback in cleanup:
                 try:

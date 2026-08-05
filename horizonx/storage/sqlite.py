@@ -1947,21 +1947,54 @@ class SqliteStore:
         reason: str,
         instruction: str,
         idempotency_key: str,
-    ) -> tuple[dict[str, Any], bool]:
+    ) -> tuple[dict[str, Any], bool, Any]:
+        from horizonx.core.event_bus import Event
+
+        now = utcnow().isoformat()
         with self._conn() as c:
             cursor = c.execute(
                 "UPDATE hitl_events SET resolved_at=?, decision=?, operator=?, reason=?, "
                 "instruction=?, resolution_idempotency_key=? "
                 "WHERE id=? AND resolved_at IS NULL",
                 (
-                    utcnow().isoformat(), action, actor, reason, instruction,
+                    now, action, actor, reason, instruction,
                     idempotency_key, event_id,
                 ),
             )
             row = c.execute("SELECT * FROM hitl_events WHERE id=?", (event_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"HITL request not found: {event_id}")
-        return dict(row), cursor.rowcount == 1
+            if row is None:
+                raise KeyError(f"HITL request not found: {event_id}")
+            event_id_value = f"hitl-resolved:{event_id}"
+            c.execute(
+                "INSERT OR IGNORE INTO events "
+                "(id, type, run_id, timestamp, payload) VALUES (?,?,?,?,?)",
+                (
+                    event_id_value,
+                    "hitl.resolved",
+                    row["run_id"],
+                    row["resolved_at"] or now,
+                    json.dumps(
+                        {
+                            "request_id": event_id,
+                            "action": row["decision"],
+                            "actor": row["operator"],
+                            "instruction": row["instruction"] or "",
+                        }
+                    ),
+                ),
+            )
+            event_row = c.execute(
+                "SELECT * FROM events WHERE id=?", (event_id_value,)
+            ).fetchone()
+        assert event_row is not None
+        event = Event(
+            id=event_row["id"], sequence=event_row["sequence"],
+            type=event_row["type"], run_id=event_row["run_id"],
+            attempt_id=event_row["attempt_id"], session_id=event_row["session_id"],
+            goal_id=event_row["goal_id"], timestamp=event_row["timestamp"],
+            payload=json.loads(event_row["payload"] or "{}"),
+        )
+        return dict(row), cursor.rowcount == 1, event
 
     async def resolve_hitl_event(
         self,
@@ -1973,7 +2006,7 @@ class SqliteStore:
         instruction: str,
         idempotency_key: str,
     ) -> tuple[dict[str, Any], bool]:
-        return await self._run_sync(
+        resolved, changed, _ = await self._run_sync(
             self._sync_resolve_hitl_event,
             event_id,
             action,
@@ -1981,6 +2014,17 @@ class SqliteStore:
             reason,
             instruction,
             idempotency_key,
+        )
+        return resolved, changed
+
+    async def resolve_hitl_event_and_event(
+        self, event_id: str, *, action: str, actor: str, reason: str,
+        instruction: str, idempotency_key: str,
+    ) -> tuple[dict[str, Any], bool, Any]:
+        """Resolve a HITL request and persist its ledger event in one transaction."""
+        return await self._run_sync(
+            self._sync_resolve_hitl_event, event_id, action, actor, reason,
+            instruction, idempotency_key,
         )
 
     @staticmethod
@@ -2035,6 +2079,50 @@ class SqliteStore:
 
     async def create_operator_command(self, command: Any) -> tuple[Any, bool]:
         return await self._run_sync(self._sync_create_operator_command, command)
+
+    def _sync_submit_cancel_command(self, candidate: Any) -> tuple[Any, bool, dict[str, Any]]:
+        """Accept and apply cancellation atomically, fencing the active lease."""
+        now = utcnow().isoformat()
+        with self._conn() as c:
+            existing = c.execute(
+                "SELECT * FROM operator_commands WHERE run_id=? AND idempotency_key=?",
+                (candidate.run_id, candidate.idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                command = self._operator_command_from_row(existing)
+                if (
+                    existing["kind"] != candidate.kind.value
+                    or existing["actor"] != candidate.actor
+                    or existing["reason"] != candidate.reason
+                    or existing["instruction"] != candidate.instruction
+                    or json.loads(existing["payload"] or "{}") != candidate.payload
+                ):
+                    raise OperatorCommandConflict(
+                        "operator command idempotency key was reused with different content"
+                    )
+                return command, False, {"run_id": candidate.run_id, "event": None}
+
+            run = c.execute("SELECT status FROM runs WHERE id=?", (candidate.run_id,)).fetchone()
+            if run is None:
+                raise KeyError(f"run not found: {candidate.run_id}")
+            if run["status"] in {status.value for status in TERMINAL_RUN_STATUSES}:
+                raise StoreError(f"run is already terminal: {run['status']}")
+            c.execute(
+                "INSERT INTO operator_commands "
+                "(id, run_id, attempt_id, kind, actor, reason, instruction, payload, "
+                "idempotency_key, created_at, consumed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (candidate.id, candidate.run_id, candidate.attempt_id, candidate.kind.value,
+                 candidate.actor, candidate.reason, candidate.instruction,
+                 json.dumps(candidate.payload, default=str), candidate.idempotency_key,
+                 candidate.created_at.isoformat(), now),
+            )
+            result = self._apply_cancel_in_transaction(c, candidate.id, now)
+            row = c.execute("SELECT * FROM operator_commands WHERE id=?", (candidate.id,)).fetchone()
+        assert row is not None
+        return self._operator_command_from_row(row), True, result
+
+    async def submit_cancel_command(self, candidate: Any) -> tuple[Any, bool, dict[str, Any]]:
+        return await self._run_sync(self._sync_submit_cancel_command, candidate)
 
     def _sync_get_operator_command(
         self, run_id: str, idempotency_key: str
@@ -2094,55 +2182,63 @@ class SqliteStore:
             self._sync_consume_operator_command, command_id, attempt_id
         )
 
-    def _sync_apply_cancel_command(self, command_id: str) -> dict[str, Any]:
-        now = utcnow().isoformat()
-        with self._conn() as c:
-            command = c.execute(
-                "SELECT * FROM operator_commands WHERE id=?", (command_id,)
-            ).fetchone()
-            if command is None:
-                raise KeyError(f"operator command not found: {command_id}")
-            if command["kind"] != "cancel":
-                raise StoreError("operator command is not a cancellation")
-            request = c.execute(
-                "SELECT * FROM hitl_events WHERE run_id=? AND resolved_at IS NULL "
-                "ORDER BY triggered_at DESC LIMIT 1",
-                (command["run_id"],),
-            ).fetchone()
-            if request is not None:
-                c.execute(
-                    "UPDATE hitl_events SET resolved_at=?, decision='abort', operator=?, "
-                    "reason=?, instruction=?, resolution_idempotency_key=? WHERE id=?",
-                    (
-                        now, command["actor"], command["reason"],
-                        command["instruction"], command["idempotency_key"], request["id"],
-                    ),
-                )
-            attempt = c.execute(
-                "SELECT id FROM attempts WHERE run_id=? ORDER BY ordinal DESC LIMIT 1",
-                (command["run_id"],),
-            ).fetchone()
-            if attempt is not None:
-                c.execute(
-                    "UPDATE attempts SET status='aborted', error=?, updated_at=?, "
-                    "completed_at=COALESCE(completed_at, ?), version=version+1 "
-                    "WHERE id=? AND status NOT IN ('completed','failed','interrupted','aborted')",
-                    (
-                        f"operator_cancel:{command['reason'] or command['actor']}",
-                        now, now, attempt["id"],
-                    ),
-                )
+    def _apply_cancel_in_transaction(
+        self, c: sqlite3.Connection, command_id: str, now: str
+    ) -> dict[str, Any]:
+        command = c.execute(
+            "SELECT * FROM operator_commands WHERE id=?", (command_id,)
+        ).fetchone()
+        if command is None:
+            raise KeyError(f"operator command not found: {command_id}")
+        if command["kind"] != "cancel":
+            raise StoreError("operator command is not a cancellation")
+        request = c.execute(
+            "SELECT * FROM hitl_events WHERE run_id=? AND resolved_at IS NULL "
+            "ORDER BY triggered_at DESC LIMIT 1", (command["run_id"],),
+        ).fetchone()
+        if request is not None:
             c.execute(
-                "UPDATE runs SET status='aborted', completed_at=COALESCE(completed_at, ?) "
-                "WHERE id=? AND status NOT IN "
-                "('completed','failed','aborted','timed_out','budget_exceeded')",
-                (now, command["run_id"]),
+                "UPDATE hitl_events SET resolved_at=?, decision='abort', operator=?, "
+                "reason=?, instruction=?, resolution_idempotency_key=? WHERE id=?",
+                (now, command["actor"], command["reason"], command["instruction"],
+                 command["idempotency_key"], request["id"]),
             )
+            event_id = f"hitl-resolved:{request['id']}"
             c.execute(
-                "UPDATE operator_commands SET consumed_at=COALESCE(consumed_at, ?), "
-                "attempt_id=COALESCE(attempt_id, ?) WHERE id=?",
-                (now, attempt["id"] if attempt else None, command_id),
+                "INSERT OR IGNORE INTO events "
+                "(id, type, run_id, timestamp, payload) VALUES (?,?,?,?,?)",
+                (event_id, "hitl.resolved", command["run_id"], now,
+                 json.dumps({"request_id": request["id"], "action": "abort",
+                             "actor": command["actor"],
+                             "instruction": command["instruction"] or ""})),
             )
+        attempt = c.execute(
+            "SELECT id FROM attempts WHERE run_id=? ORDER BY ordinal DESC LIMIT 1",
+            (command["run_id"],),
+        ).fetchone()
+        if attempt is not None:
+            c.execute(
+                "UPDATE attempts SET status='aborted', error=?, updated_at=?, "
+                "completed_at=COALESCE(completed_at, ?), version=version+1 "
+                "WHERE id=? AND status NOT IN ('completed','failed','interrupted','aborted')",
+                (f"operator_cancel:{command['reason'] or command['actor']}", now, now,
+                 attempt["id"]),
+            )
+        c.execute(
+            "UPDATE runs SET status='aborted', completed_at=COALESCE(completed_at, ?) "
+            "WHERE id=? AND status NOT IN "
+            "('completed','failed','aborted','timed_out','budget_exceeded')",
+            (now, command["run_id"]),
+        )
+        c.execute(
+            "UPDATE operator_commands SET consumed_at=COALESCE(consumed_at, ?), "
+            "attempt_id=COALESCE(attempt_id, ?) WHERE id=?",
+            (now, attempt["id"] if attempt else None, command_id),
+        )
+        c.execute(
+            "UPDATE leases SET owner='', expires_at='1970-01-01T00:00:00+00:00', "
+            "version=version+1 WHERE resource_id=?", (f"run:{command['run_id']}",),
+        )
         return {
             "run_id": command["run_id"],
             "request_id": request["id"] if request else None,
@@ -2150,7 +2246,13 @@ class SqliteStore:
             "actor": command["actor"],
             "reason": command["reason"],
             "instruction": command["instruction"],
+            "event_id": f"hitl-resolved:{request['id']}" if request else None,
         }
+
+    def _sync_apply_cancel_command(self, command_id: str) -> dict[str, Any]:
+        now = utcnow().isoformat()
+        with self._conn() as c:
+            return self._apply_cancel_in_transaction(c, command_id, now)
 
     async def apply_cancel_command(self, command_id: str) -> dict[str, Any]:
         """Atomically resolve pending HITL, abort work, and consume cancellation."""

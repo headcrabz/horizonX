@@ -11,7 +11,7 @@ from horizonx.core.leases import LeaseManager
 from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.runtime import Runtime
 from horizonx.core.types import TERMINAL_RUN_STATUSES, Run, RunStatus
-from horizonx.storage.sqlite import OperatorCommandConflict, SqliteStore
+from horizonx.storage.sqlite import OperatorCommandConflict, SqliteStore, StoreError
 
 from .deps import get_runtime, get_store
 from .routes_hitl import _authenticate_operator
@@ -105,19 +105,23 @@ async def submit_operator_command(
         idempotency_key=idempotency_key,
     )
     try:
-        existing = await store.get_operator_command(run.id, idempotency_key)
-        if existing is not None:
-            command, _ = await store.create_operator_command(candidate)
-            return {"status": "duplicate", "command_id": command.id}
-        if run.status in TERMINAL_RUN_STATUSES:
-            raise HTTPException(
-                status_code=409,
-                detail=f"run is already terminal: {run.status.value}",
-            )
-        command, created = await store.create_operator_command(candidate)
-    except OperatorCommandConflict as exc:
+        if candidate.kind == OperatorCommandKind.CANCEL:
+            command, created, _ = await store.submit_cancel_command(candidate)
+        else:
+            existing = await store.get_operator_command(run.id, idempotency_key)
+            if existing is not None:
+                command, _ = await store.create_operator_command(candidate)
+                return {"status": "duplicate", "command_id": command.id}
+            if run.status in TERMINAL_RUN_STATUSES:
+                raise StoreError(f"run is already terminal: {run.status.value}")
+            command, created = await store.create_operator_command(candidate)
+    except (OperatorCommandConflict, StoreError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    runtime.notify_operator_command(run_id)
+    runtime.notify_operator_command(
+        run_id,
+        f"operator_cancel:{candidate.reason or candidate.actor}"
+        if candidate.kind == OperatorCommandKind.CANCEL else None,
+    )
     return {
         "status": "accepted" if created else "duplicate",
         "command_id": command.id,
@@ -146,21 +150,14 @@ async def cancel_run(
         idempotency_key=idempotency_key,
     )
     try:
-        existing = await store.get_operator_command(run.id, idempotency_key)
-        if existing is not None:
-            command, _ = await store.create_operator_command(candidate)
-            return {"status": "duplicate", "run_id": run_id, "command_id": command.id}
-        if run.status in TERMINAL_RUN_STATUSES:
-            raise HTTPException(
-                status_code=409,
-                detail=f"run is already terminal: {run.status.value}",
-            )
-        command, _ = await store.create_operator_command(candidate)
-    except OperatorCommandConflict as exc:
+        command, created, _ = await store.submit_cancel_command(candidate)
+    except (OperatorCommandConflict, StoreError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    runtime.notify_operator_command(run_id)
+    runtime.notify_operator_command(
+        run_id, f"operator_cancel:{candidate.reason or candidate.actor}"
+    )
     return {
-        "status": "accepted",
+        "status": "accepted" if created else "duplicate",
         "run_id": run_id,
         "command_id": command.id,
     }

@@ -425,8 +425,9 @@ async def test_cancel_run(client: AsyncClient, app, seeded_run: Run) -> None:
     )
     assert mismatch.status_code == 409
 
-    assert (await app.state.store.load_run(running.id)).status == RunStatus.RUNNING
-    await app.state.store.apply_cancel_command(r.json()["command_id"])
+    assert (await app.state.store.load_run(running.id)).status == RunStatus.ABORTED
+    [command] = await app.state.store.list_operator_commands(running.id)
+    assert command.consumed_at is not None
     after_terminal = await client.post(
         f"/api/runs/{running.id}/cancel", headers=headers
     )

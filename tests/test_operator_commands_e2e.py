@@ -571,6 +571,179 @@ async def test_live_waiter_and_dashboard_share_one_resolved_event(
 
 
 @pytest.mark.asyncio
+async def test_cancel_acceptance_atomically_wins_and_fences_lease(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    request_id = await store.save_hitl_event(run.id, "validator_paused", {})
+    leases = LeaseManager(store)
+    lease = await leases.acquire(f"run:{run.id}", owner="worker", ttl_seconds=30)
+    assert lease is not None
+    candidate = OperatorCommand(
+        run_id=run.id, kind=OperatorCommandKind.CANCEL, actor="alice",
+        reason="stop now", idempotency_key="atomic-cancel",
+    )
+    try:
+        command, created, result = await store.submit_cancel_command(candidate)
+        assert created and command.consumed_at is not None
+        assert result["request_id"] == request_id
+        assert (await store.load_run(run.id)).status == RunStatus.ABORTED
+        assert await store.get_lease(f"run:{run.id}") is None
+        events = await store.list_events(run.id, event_type="hitl.resolved")
+        assert [event.id for event in events] == [f"hitl-resolved:{request_id}"]
+
+        duplicate, duplicate_created, _ = await store.submit_cancel_command(
+            candidate.model_copy(update={"id": "another-id"})
+        )
+        assert not duplicate_created and duplicate.id == command.id
+        with pytest.raises(Exception, match="already terminal"):
+            await store.submit_cancel_command(
+                candidate.model_copy(update={"idempotency_key": "new-cancel"})
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_connected_sse_observes_store_only_append(tmp_path: Path) -> None:
+    import asyncio
+
+    from horizonx.core.event_bus import Event, InMemoryBus
+    from horizonx.dashboard.routes_events import _event_gen
+
+    store = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    stream = _event_gen(InMemoryBus(), store=store, run_id=run.id)
+    pending = asyncio.create_task(anext(stream))
+    try:
+        await asyncio.sleep(0.02)
+        persisted = await store.append_event(Event(type="hitl.resolved", run_id=run.id))
+        received = await asyncio.wait_for(pending, timeout=1)
+        assert received["id"] == str(persisted.sequence)
+    finally:
+        await stream.aclose()
+        await store.close()
+
+
+def test_runtime_directly_signals_and_cleans_active_cancel_tokens(tmp_path: Path) -> None:
+    from horizonx.agents.base import CancelToken
+
+    runtime = Runtime(object(), workspace_root=tmp_path)
+    token = CancelToken()
+    runtime.register_cancel_token("run-live", token)
+    runtime.notify_operator_command("run-live", "operator_cancel:urgent")
+    assert token.cancelled and token.reason == "operator_cancel:urgent"
+    runtime.unregister_cancel_token("run-live", token)
+    assert "run-live" not in runtime._active_cancel_tokens
+
+
+@pytest.mark.asyncio
+async def test_http_cancel_directly_reaches_runtime_owned_attempt(tmp_path: Path) -> None:
+    import asyncio
+
+    pytest.importorskip("httpx")
+    from httpx import ASGITransport, AsyncClient
+
+    from horizonx.core.event_bus import InMemoryBus
+    from horizonx.dashboard.app import create_app
+
+    app = create_app(tmp_path / "state.db", tmp_path / "workspaces")
+    app.state.store = SqliteStore(tmp_path / "state.db")
+    app.state.bus = InMemoryBus()
+    app.state.runtime = Runtime(app.state.store, app.state.bus, tmp_path / "workspaces")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await app.state.store.save_run(run)
+    agent = _CommandAwareAgent()
+    try:
+        with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
+            execution = asyncio.create_task(
+                AttemptExecutor(app.state.runtime).execute(run, prompt="wait")
+            )
+            await agent.started.wait()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    f"/api/runs/{run.id}/cancel",
+                    headers={"idempotency-key": "live-http-cancel"},
+                )
+            result = await asyncio.wait_for(execution, timeout=0.5)
+        assert response.json()["status"] == "accepted"
+        assert result.attempt.status == AttemptStatus.ABORTED
+        assert result.agent.error.startswith("operator_cancel:")
+        run.status = RunStatus.COMPLETED
+        await app.state.store.save_run(run)
+        assert (await app.state.store.load_run(run.id)).status == RunStatus.ABORTED
+    finally:
+        await app.state.store.close()
+
+
+@pytest.mark.asyncio
+async def test_slack_modify_opens_modal_then_submission_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("httpx")
+    from httpx import ASGITransport, AsyncClient
+
+    from horizonx.core.event_bus import InMemoryBus
+    from horizonx.dashboard import routes_hitl
+    from horizonx.dashboard.app import create_app
+
+    app = create_app(tmp_path / "state.db", tmp_path / "workspaces")
+    app.state.store = SqliteStore(tmp_path / "state.db")
+    app.state.bus = InMemoryBus()
+    app.state.runtime = Runtime(app.state.store, app.state.bus, tmp_path / "workspaces")
+    run = _run(tmp_path)
+    await app.state.store.save_run(run)
+    request_id = await app.state.store.save_hitl_event(run.id, "validator_paused", {})
+    opened: list[tuple[str, str]] = []
+
+    async def fake_open(trigger_id: str, modal_request_id: str) -> None:
+        opened.append((trigger_id, modal_request_id))
+
+    monkeypatch.setattr(routes_hitl, "_open_slack_modify_modal", fake_open)
+    secret = "modify-secret"
+    monkeypatch.setenv("HORIZONX_SLACK_SIGNING_SECRET", secret)
+
+    def signed(payload: dict[str, object]) -> tuple[bytes, dict[str, str]]:
+        body = urlencode({"payload": json.dumps(payload)}).encode()
+        timestamp = str(int(time.time()))
+        signature = "v0=" + hmac.new(
+            secret.encode(), f"v0:{timestamp}:".encode() + body, hashlib.sha256
+        ).hexdigest()
+        return body, {"x-slack-request-timestamp": timestamp,
+                      "x-slack-signature": signature,
+                      "content-type": "application/x-www-form-urlencoded"}
+
+    button = {"type": "block_actions", "trigger_id": "trigger-1",
+              "user": {"id": "U1"}, "actions": [{"action_id": "hitl_modify",
+              "value": f"{request_id}:modify"}]}
+    submission = {"type": "view_submission", "user": {"id": "U1"},
+                  "view": {"id": "view-1", "callback_id": "hitl_modify_submission",
+                  "private_metadata": request_id, "state": {"values": {
+                  "modify_instruction": {"instruction": {"value": "Use the safe path"}}
+                  }}}}
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            body, headers = signed(button)
+            first = await client.post("/api/hitl/slack/interactions", content=body, headers=headers)
+            body, headers = signed(submission)
+            second = await client.post("/api/hitl/slack/interactions", content=body, headers=headers)
+            duplicate = await client.post("/api/hitl/slack/interactions", content=body, headers=headers)
+        assert first.json()["status"] == "modal_opened"
+        assert opened == [("trigger-1", request_id)]
+        assert second.json()["status"] == "resolved"
+        assert duplicate.json()["status"] == "duplicate"
+        resolved = await app.state.store.find_hitl_event(request_id)
+        assert resolved["decision"] == "modify"
+        assert resolved["instruction"] == "Use the safe path"
+    finally:
+        await app.state.store.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_shutdown_cancels_and_awaits_background_runs(
     tmp_path: Path,
 ) -> None:

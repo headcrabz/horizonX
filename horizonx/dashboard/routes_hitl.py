@@ -10,12 +10,8 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from horizonx.core.event_bus import DurableEventBus, InMemoryBus
-from horizonx.core.operator_commands import (
-    OperatorCommand,
-    OperatorCommandKind,
-    hitl_resolved_event,
-)
+from horizonx.core.event_bus import InMemoryBus
+from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.types import HITLDecision
 from horizonx.hitl.slack_interactions import verify_slack_signature
 from horizonx.storage.sqlite import OperatorCommandConflict, SqliteStore
@@ -122,7 +118,7 @@ async def resolve_hitl(
         )
     except OperatorCommandConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    resolved, changed = await store.resolve_hitl_event(
+    resolved, changed, persisted_event = await store.resolve_hitl_event_and_event(
         request_id,
         action=decision.action,
         actor=command.actor,
@@ -137,15 +133,7 @@ async def resolve_hitl(
 
     # Publish SSE event so the dashboard updates immediately
     if changed:
-        await DurableEventBus(store, bus).publish(
-            hitl_resolved_event(
-                run_id=run_id,
-                request_id=request_id,
-                action=resolved["decision"],
-                actor=resolved["operator"],
-                instruction=resolved["instruction"],
-            )
-        )
+        await bus.publish(persisted_event)
 
     return {"status": "resolved", "path": str(decision_path), "request_id": request_id}
 
@@ -158,6 +146,36 @@ def _slack_instruction(payload: dict[str, Any]) -> str:
             if isinstance(value, str):
                 return value
     return ""
+
+
+async def _open_slack_modify_modal(trigger_id: str, request_id: str) -> None:
+    import httpx
+
+    token = os.environ.get("HORIZONX_SLACK_BOT_TOKEN")
+    if not token:
+        raise HTTPException(status_code=503, detail="Slack bot token is not configured")
+    view = {
+        "type": "modal",
+        "callback_id": "hitl_modify_submission",
+        "private_metadata": request_id,
+        "title": {"type": "plain_text", "text": "Modify instruction"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [{
+            "type": "input", "block_id": "modify_instruction",
+            "label": {"type": "plain_text", "text": "Instruction"},
+            "element": {"type": "plain_text_input", "action_id": "instruction"},
+        }],
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://slack.com/api/views.open",
+            headers={"authorization": f"Bearer {token}"},
+            json={"trigger_id": trigger_id, "view": view},
+        )
+    data = response.json()
+    if not response.is_success or not data.get("ok"):
+        raise HTTPException(status_code=502, detail="Slack rejected the modify modal")
 
 
 @router.post("/hitl/slack/interactions")
@@ -179,8 +197,17 @@ async def slack_interaction(
         )
         encoded = parse_qs(body.decode()).get("payload", [""])[0]
         payload = json.loads(encoded)
-        action = payload["actions"][0]
-        request_id, decision = action["value"].rsplit(":", 1)
+        payload_type = payload.get("type", "block_actions")
+        if payload_type == "view_submission":
+            view = payload["view"]
+            if view.get("callback_id") != "hitl_modify_submission":
+                raise ValueError("unsupported Slack modal")
+            request_id = str(view.get("private_metadata") or "")
+            decision = "modify"
+            action: dict[str, Any] = {}
+        else:
+            action = payload["actions"][0]
+            request_id, decision = action["value"].rsplit(":", 1)
         if decision not in {"approve", "modify", "abort"}:
             raise ValueError("unsupported Slack action")
         events = await store.find_hitl_event(request_id)
@@ -188,14 +215,26 @@ async def slack_interaction(
         raise HTTPException(status_code=401, detail=str(exc)) from None
     user = payload.get("user", {})
     actor = str(user.get("id") or user.get("username") or "slack-operator")
+    if payload_type != "view_submission" and decision == "modify":
+        if events["resolved_at"] is not None:
+            raise HTTPException(status_code=409, detail="HITL request is already resolved")
+        trigger_id = str(payload.get("trigger_id") or "")
+        if not trigger_id:
+            raise HTTPException(status_code=400, detail="Slack trigger_id is required")
+        await _open_slack_modify_modal(trigger_id, request_id)
+        return {"status": "modal_opened", "request_id": request_id}
+
+    instruction = _slack_instruction(payload).strip()
+    if payload_type == "view_submission" and not instruction:
+        raise HTTPException(status_code=422, detail="modify instruction must not be empty")
     callback_key = str(
-        payload.get("trigger_id")
+        payload.get("view", {}).get("id")
+        or payload.get("trigger_id")
         or f"{payload.get('team', {}).get('id', '')}:"
         f"{payload.get('container', {}).get('message_ts', '')}:"
         f"{action.get('action_id', '')}:{actor}"
     )
     command_key = f"slack:{callback_key}"
-    instruction = _slack_instruction(payload)
     if events["resolved_at"] is not None:
         if (
             events["resolution_idempotency_key"] == command_key
@@ -219,7 +258,7 @@ async def slack_interaction(
         )
     except OperatorCommandConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    resolved, changed = await store.resolve_hitl_event(
+    resolved, changed, persisted_event = await store.resolve_hitl_event_and_event(
         request_id,
         action=decision,
         actor=command.actor,
@@ -228,13 +267,5 @@ async def slack_interaction(
         idempotency_key=command.idempotency_key,
     )
     if changed:
-        await DurableEventBus(store, bus).publish(
-            hitl_resolved_event(
-                run_id=resolved["run_id"],
-                request_id=request_id,
-                action=resolved["decision"],
-                actor=resolved["operator"],
-                instruction=resolved["instruction"],
-            )
-        )
+        await bus.publish(persisted_event)
     return {"status": "resolved" if changed else "duplicate", "request_id": request_id}

@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from horizonx.core.event_bus import Event
 from horizonx.core.leases import LeaseManager
-from horizonx.core.operator_commands import OperatorCommandKind, hitl_resolved_event
+from horizonx.core.operator_commands import OperatorCommandKind
 from horizonx.core.types import (
     TERMINAL_ATTEMPT_STATUSES,
     AttemptRecord,
@@ -114,16 +114,6 @@ class RecoveryCoordinator:
                 )
                 if pending_cancel is not None:
                     cancelled = await self.store.apply_cancel_command(pending_cancel.id)
-                    if cancelled["request_id"] is not None:
-                        await self.store.append_event(
-                            hitl_resolved_event(
-                                run_id=run.id,
-                                request_id=cancelled["request_id"],
-                                action="abort",
-                                actor=cancelled["actor"],
-                                instruction=cancelled["instruction"],
-                            )
-                        )
                     await self.store.append_event(
                         Event(
                             id=f"recovery-{run.id}-{lease.version}",

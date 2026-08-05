@@ -15,7 +15,6 @@ from typing import Any, cast
 
 from horizonx.core.event_bus import DurableEventBus, Event, EventBus, InMemoryBus
 from horizonx.core.governor import BudgetExceeded, ResourceGovernor
-from horizonx.core.operator_commands import hitl_resolved_event
 from horizonx.core.recorder import TrajectoryRecorder
 from horizonx.core.spin_detector import CrossSessionSpinLayer, SpinDetector
 from horizonx.core.strategy_switch import SpinControlRequested, StrategySwitchRequested
@@ -92,6 +91,7 @@ class Runtime:
         self._strategy_executions: dict[str, _StrategyExecution] = {}
         self._background_runs: dict[str, asyncio.Task[Any]] = {}
         self._command_notifications: dict[str, asyncio.Event] = {}
+        self._active_cancel_tokens: dict[str, dict[int, Any]] = {}
 
     async def __aenter__(self) -> Runtime:
         return self
@@ -107,10 +107,24 @@ class Runtime:
         task.add_done_callback(lambda completed: self._background_runs.pop(run_id, None))
         return task
 
-    def notify_operator_command(self, run_id: str) -> None:
+    def register_cancel_token(self, run_id: str, token: Any) -> None:
+        self._active_cancel_tokens.setdefault(run_id, {})[id(token)] = token
+
+    def unregister_cancel_token(self, run_id: str, token: Any) -> None:
+        tokens = self._active_cancel_tokens.get(run_id)
+        if tokens is None:
+            return
+        tokens.pop(id(token), None)
+        if not tokens:
+            self._active_cancel_tokens.pop(run_id, None)
+
+    def notify_operator_command(self, run_id: str, reason: str | None = None) -> None:
         event = self._command_notifications.get(run_id)
         if event is not None:
             event.set()
+        if reason is not None:
+            for token in tuple(self._active_cancel_tokens.get(run_id, {}).values()):
+                token.cancel(reason)
 
     async def shutdown(self, *, close_store: bool = True) -> None:
         tasks = list(self._background_runs.values())
@@ -734,15 +748,18 @@ class Runtime:
             store=self.store,
             request_id=request_id,
         )
-        await self.bus.publish(
-            hitl_resolved_event(
-                run_id=run.id,
-                request_id=request_id,
-                action=decision.action,
-                actor=decision.operator,
-                instruction=decision.instruction,
-            )
+        resolved_events = await self.store.list_events(
+            run.id, event_type="hitl.resolved"
         )
+        persisted_event = next(
+            (event for event in resolved_events
+             if event.id == f"hitl-resolved:{request_id}"), None
+        )
+        if persisted_event is not None:
+            if isinstance(self.bus, DurableEventBus):
+                await self.bus.downstream.publish(persisted_event)
+            else:
+                await self.bus.publish(persisted_event)
         if decision.action == "abort":
             run.status = RunStatus.ABORTED
             persisted = await self.store.transition_run(run.id, RunStatus.ABORTED)

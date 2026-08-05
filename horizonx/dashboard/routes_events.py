@@ -64,8 +64,25 @@ async def _event_gen(
                 if len(replay) < 1000:
                     break
         while True:
-            event = await live_task
-            live_task = asyncio.ensure_future(anext(subscription))
+            try:
+                event = await asyncio.wait_for(asyncio.shield(live_task), timeout=0.1)
+                live_task = asyncio.ensure_future(anext(subscription))
+            except TimeoutError:
+                if store is None:
+                    continue
+                replay = (
+                    await store.list_events(run_id, after_sequence=cursor, limit=1000)
+                    if run_id is not None
+                    else await store.list_all_events(after_sequence=cursor, limit=1000)
+                )
+                for persisted in replay:
+                    cursor = max(cursor, persisted.sequence or 0)
+                    yield {
+                        "id": str(persisted.sequence),
+                        "event": persisted.type,
+                        "data": persisted.model_dump_json(),
+                    }
+                continue
             if event.sequence is None and store is not None:
                 event = await store.append_event(event)
             if event.sequence is not None and event.sequence <= cursor:

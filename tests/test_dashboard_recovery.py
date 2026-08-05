@@ -310,8 +310,7 @@ async def test_http_cancel_is_consumed_by_replacement_after_owner_expires(
                 },
             )
         assert response.json()["status"] == "accepted"
-        assert (await app.state.store.load_run(run.id)).status == RunStatus.PAUSED_HITL
-        await asyncio.sleep(0.06)
+        assert (await app.state.store.load_run(run.id)).status == RunStatus.ABORTED
         tasks = await recover_pending_runs(
             app.state.store, runtime, owner="replacement", lease_ttl_seconds=1
         )
