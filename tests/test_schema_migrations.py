@@ -91,7 +91,7 @@ async def test_v01_goal_schema_migrates_without_losing_stored_fields(tmp_path: P
 
     store = SqliteStore(path)
     try:
-        assert await store.schema_version() == 5
+        assert await store.schema_version() == 6
 
         root = await store.load_goal("legacy-run", "g.root")
         child = await store.load_goal("legacy-run", "g.child")
@@ -163,6 +163,57 @@ async def test_legacy_hitl_table_adds_resolution_metadata_before_index(
         assert "idx_hitl_resolution_idempotency" in indexes
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_v5_global_command_idempotency_migrates_to_run_scope(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v5-commands.db"
+    initial = SqliteStore(path)
+    await initial.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX idx_operator_commands_idempotency")
+        connection.execute("DROP INDEX idx_operator_commands_pending")
+        connection.execute("ALTER TABLE operator_commands RENAME TO operator_commands_v6")
+        connection.execute(
+            """
+            CREATE TABLE operator_commands (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                attempt_id TEXT,
+                kind TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                instruction TEXT NOT NULL DEFAULT '',
+                payload TEXT NOT NULL DEFAULT '{}',
+                idempotency_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                consumed_at TEXT
+            )
+            """
+        )
+        connection.execute("DROP TABLE operator_commands_v6")
+        connection.execute("DELETE FROM schema_migrations WHERE version=6")
+
+    migrated = SqliteStore(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            unique_columns = {
+                tuple(
+                    row[2]
+                    for row in connection.execute(
+                        f"PRAGMA index_info('{index[1]}')"
+                    )
+                )
+                for index in connection.execute("PRAGMA index_list(operator_commands)")
+                if index[2]
+            }
+        assert ("run_id", "idempotency_key") in unique_columns
+        assert ("idempotency_key",) not in unique_columns
+        assert await migrated.schema_version() == 6
+    finally:
+        await migrated.close()
 
 
 @pytest.mark.asyncio

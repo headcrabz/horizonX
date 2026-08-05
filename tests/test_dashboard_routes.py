@@ -230,11 +230,21 @@ async def test_list_steps_pagination(
 
 @pytest.mark.asyncio
 async def test_hitl_resolve_writes_file(
-    client: AsyncClient, seeded_run: Run, tmp_path: Path
+    client: AsyncClient, app, seeded_run: Run, tmp_path: Path
 ) -> None:
+    store = SqliteStore(tmp_path / "test.db")
+    request_id = await store.save_hitl_event(
+        seeded_run.id, "validator_paused", {}
+    )
     r = await client.post(
         f"/api/runs/{seeded_run.id}/hitl",
-        json={"action": "approve", "instruction": "", "operator": "test"},
+        json={
+            "action": "approve",
+            "instruction": "",
+            "operator": "test",
+            "request_id": request_id,
+            "idempotency_key": "dashboard-approve-once",
+        },
     )
     assert r.status_code == 200
     written_path = Path(r.json()["path"])
@@ -242,6 +252,33 @@ async def test_hitl_resolve_writes_file(
     decision = json.loads(written_path.read_text())
     assert decision["action"] == "approve"
     assert decision["operator"] == "test"
+    duplicate = await client.post(
+        f"/api/runs/{seeded_run.id}/hitl",
+        json={
+            "action": "approve",
+            "instruction": "",
+            "operator": "test",
+            "request_id": request_id,
+            "idempotency_key": "dashboard-approve-once",
+        },
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["status"] == "duplicate"
+    events = await store.list_events(seeded_run.id, event_type="hitl.resolved")
+    assert len(events) == 1
+    assert isinstance(events[0].sequence, int)
+    from horizonx.dashboard.routes_events import _event_gen
+
+    replay = _event_gen(
+        app.state.bus,
+        store=store,
+        run_id=seeded_run.id,
+        after_sequence=0,
+    )
+    replayed = await anext(replay)
+    assert replayed["id"] == str(events[0].sequence)
+    await replay.aclose()
+    await store.close()
 
 
 @pytest.mark.asyncio
@@ -251,6 +288,17 @@ async def test_hitl_resolve_not_found(client: AsyncClient) -> None:
         json={"action": "approve"},
     )
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_hitl_resolve_requires_pending_request(
+    client: AsyncClient, seeded_run: Run
+) -> None:
+    response = await client.post(
+        f"/api/runs/{seeded_run.id}/hitl",
+        json={"action": "approve", "operator": "test"},
+    )
+    assert response.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -342,6 +390,14 @@ async def test_bus_delivers_events_with_predicate() -> None:
 
     assert len(received) == 1
     assert received[0].run_id == "target"
+
+
+@pytest.mark.asyncio
+async def test_sse_rejects_invalid_cursor(client: AsyncClient, seeded_run: Run) -> None:
+    response = await client.get(
+        f"/api/runs/{seeded_run.id}/events?cursor=not-a-sequence"
+    )
+    assert response.status_code == 400
 
 
 # ---------------------------------------------------------------------------

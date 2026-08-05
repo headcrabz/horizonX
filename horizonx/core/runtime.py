@@ -752,6 +752,9 @@ class Runtime:
         else:
             run.status = RunStatus.RUNNING
             await self.store.save_run(run)
+            persisted = await self.store.load_run(run.id)
+            run.status = persisted.status
+            run.completed_at = persisted.completed_at
         return decision
 
     # ---------------------------------------------------------------

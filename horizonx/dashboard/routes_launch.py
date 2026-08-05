@@ -11,7 +11,7 @@ from horizonx.core.leases import LeaseManager
 from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.runtime import Runtime
 from horizonx.core.types import TERMINAL_RUN_STATUSES, Run, RunStatus
-from horizonx.storage.sqlite import SqliteStore
+from horizonx.storage.sqlite import OperatorCommandConflict, SqliteStore
 
 from .deps import get_runtime, get_store
 from .routes_hitl import _authenticate_operator
@@ -98,19 +98,22 @@ async def submit_operator_command(
             status_code=409,
             detail=f"run is already terminal: {run.status.value}",
         )
-    command, created = await store.create_operator_command(
-        OperatorCommand(
-            run_id=run_id,
-            kind=OperatorCommandKind(body.kind),
-            actor=request.headers.get("x-horizonx-actor", "dashboard-operator"),
-            reason=body.reason,
-            instruction=body.instruction,
-            idempotency_key=(
-                request.headers.get("idempotency-key")
-                or f"{body.kind}:{run.id}:{uuid4().hex}"
-            ),
+    try:
+        command, created = await store.create_operator_command(
+            OperatorCommand(
+                run_id=run_id,
+                kind=OperatorCommandKind(body.kind),
+                actor=request.headers.get("x-horizonx-actor", "dashboard-operator"),
+                reason=body.reason,
+                instruction=body.instruction,
+                idempotency_key=(
+                    request.headers.get("idempotency-key")
+                    or f"{body.kind}:{run.id}:{uuid4().hex}"
+                ),
+            )
         )
-    )
+    except OperatorCommandConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     if command.kind == OperatorCommandKind.CANCEL:
         await store.transition_run(run.id, RunStatus.ABORTED)
     runtime.notify_operator_command(run_id)

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from horizonx.core.event_bus import Event
 from horizonx.core.leases import LeaseManager
+from horizonx.core.operator_commands import OperatorCommandKind
 from horizonx.core.types import (
     TERMINAL_ATTEMPT_STATUSES,
     AttemptRecord,
@@ -79,11 +80,7 @@ class RecoveryCoordinator:
         scan_time = now or datetime.now(UTC)
         decisions: list[RecoveryDecision] = []
         for run in await self.store.list_nonterminal_runs():
-            if run.status == RunStatus.PAUSED_HITL:
-                continue
             latest = await self.store.latest_attempt(run.id)
-            if latest is not None and latest.status == AttemptStatus.PAUSED_HITL:
-                continue
             if (
                 latest is not None
                 and latest.status == AttemptStatus.WAITING_RETRY
@@ -104,6 +101,30 @@ class RecoveryCoordinator:
 
             lease_handed_off = False
             try:
+                if run.status == RunStatus.PAUSED_HITL or (
+                    latest is not None and latest.status == AttemptStatus.PAUSED_HITL
+                ):
+                    hitl_decision = await self._recover_paused_hitl(
+                        run, latest, lease, scan_time
+                    )
+                    if hitl_decision is not None:
+                        await self.store.append_event(
+                            Event(
+                                id=f"recovery-{run.id}-{lease.version}",
+                                type="recovery.planned",
+                                run_id=run.id,
+                                attempt_id=latest.id if latest else None,
+                                payload={
+                                    "action": hitl_decision.action.value,
+                                    "reason": hitl_decision.reason,
+                                    "lease_owner": lease.owner,
+                                    "lease_version": lease.version,
+                                },
+                            )
+                        )
+                        decisions.append(hitl_decision)
+                        lease_handed_off = True
+                    continue
                 if latest is not None and latest.status == AttemptStatus.COMPLETED:
                     run.status = RunStatus.PAUSED_HITL
                     run.completed_at = None
@@ -190,6 +211,101 @@ class RecoveryCoordinator:
                         lease.resource_id, lease.owner, lease.version
                     )
         return decisions
+
+    async def _recover_paused_hitl(
+        self,
+        run: Run,
+        latest: AttemptRecord | None,
+        lease: LeaseRecord,
+        now: datetime,
+    ) -> RecoveryDecision | None:
+        """Apply durable operator state left behind when a HITL waiter died."""
+        requests = await self.store.list_hitl_events(run.id)
+        request = requests[-1] if requests else None
+        commands = await self.store.list_operator_commands(
+            run.id, unconsumed_only=True
+        )
+        cancel = next(
+            (command for command in commands if command.kind == OperatorCommandKind.CANCEL),
+            None,
+        )
+        if cancel is not None:
+            if latest is not None and latest.status not in TERMINAL_ATTEMPT_STATUSES:
+                await self.store.transition_attempt(
+                    latest.id,
+                    AttemptStatus.ABORTED,
+                    error=f"operator_cancel:{cancel.reason or cancel.actor}",
+                )
+            await self.store.transition_run(run.id, RunStatus.ABORTED)
+            await self.store.consume_operator_command(
+                cancel.id, attempt_id=latest.id if latest else None
+            )
+            await self.store.append_event(
+                Event(
+                    id=f"recovery-{run.id}-{lease.version}",
+                    type="recovery.planned",
+                    run_id=run.id,
+                    attempt_id=latest.id if latest else None,
+                    payload={
+                        "action": "abort_run",
+                        "reason": "operator_cancelled_during_hitl",
+                        "lease_owner": lease.owner,
+                        "lease_version": lease.version,
+                    },
+                )
+            )
+            return None
+        if request is None:
+            return None
+        decision_commands = [
+            command
+            for command in commands
+            if command.kind == OperatorCommandKind.DECISION
+            and command.payload.get("request_id") == request["id"]
+        ]
+        if request["resolved_at"] is None and decision_commands:
+            command = decision_commands[0]
+            request, _ = await self.store.resolve_hitl_event(
+                request["id"],
+                action=str(command.payload["action"]),
+                actor=command.actor,
+                reason=command.reason,
+                instruction=command.instruction,
+                idempotency_key=command.idempotency_key,
+            )
+        if request["resolved_at"] is None:
+            return None
+        for command in decision_commands:
+            await self.store.consume_operator_command(
+                command.id, attempt_id=latest.id if latest else None
+            )
+        if request["decision"] == "abort":
+            if latest is not None and latest.status not in TERMINAL_ATTEMPT_STATUSES:
+                await self.store.transition_attempt(
+                    latest.id,
+                    AttemptStatus.ABORTED,
+                    error="operator_aborted_during_hitl",
+                )
+            await self.store.transition_run(run.id, RunStatus.ABORTED)
+            await self.store.append_event(
+                Event(
+                    id=f"recovery-{run.id}-{lease.version}",
+                    type="recovery.planned",
+                    run_id=run.id,
+                    attempt_id=latest.id if latest else None,
+                    payload={
+                        "action": "abort_run",
+                        "reason": "hitl_resolution_aborted",
+                        "lease_owner": lease.owner,
+                        "lease_version": lease.version,
+                    },
+                )
+            )
+            return None
+        run.status = RunStatus.RUNNING
+        run.completed_at = None
+        await self.store.save_run(run)
+        return await self._decision(run, latest, lease, now)
 
     async def _decision(
         self,

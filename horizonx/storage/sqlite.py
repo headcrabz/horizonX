@@ -68,6 +68,10 @@ class GoalVersionConflict(StoreError):
     """Raised when optimistic goal version preconditions do not match."""
 
 
+class OperatorCommandConflict(StoreError):
+    """Raised when an idempotency key is reused for different command content."""
+
+
 _ALLOWED_GOAL_TRANSITIONS: dict[GoalStatus, frozenset[GoalStatus]] = {
     GoalStatus.PENDING: frozenset(
         {GoalStatus.IN_PROGRESS, GoalStatus.BLOCKED, GoalStatus.SKIPPED}
@@ -396,12 +400,14 @@ CREATE TABLE IF NOT EXISTS operator_commands (
     reason          TEXT NOT NULL DEFAULT '',
     instruction     TEXT NOT NULL DEFAULT '',
     payload         TEXT NOT NULL DEFAULT '{}',
-    idempotency_key TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
     created_at      TEXT NOT NULL,
     consumed_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_operator_commands_pending
     ON operator_commands(run_id, consumed_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_commands_idempotency
+    ON operator_commands(run_id, idempotency_key);
 
 CREATE TABLE IF NOT EXISTS spin_reports (
     id           TEXT PRIMARY KEY,
@@ -2010,11 +2016,21 @@ class SqliteStore:
                 ),
             )
             row = c.execute(
-                "SELECT * FROM operator_commands WHERE idempotency_key=?",
-                (command.idempotency_key,),
+                "SELECT * FROM operator_commands WHERE run_id=? AND idempotency_key=?",
+                (command.run_id, command.idempotency_key),
             ).fetchone()
         if row is None:  # pragma: no cover
             raise StoreError("operator command disappeared after insert")
+        if cursor.rowcount == 0 and (
+            row["kind"] != command.kind.value
+            or row["actor"] != command.actor
+            or row["reason"] != command.reason
+            or row["instruction"] != command.instruction
+            or json.loads(row["payload"] or "{}") != command.payload
+        ):
+            raise OperatorCommandConflict(
+                "operator command idempotency key was reused with different content"
+            )
         return self._operator_command_from_row(row), cursor.rowcount == 1
 
     async def create_operator_command(self, command: Any) -> tuple[Any, bool]:

@@ -274,6 +274,7 @@ class AttemptExecutor:
             )
             session_task = asyncio.create_task(invocation)
             command_stop = asyncio.Event()
+            undeliverable_commands: set[str] = set()
 
             async def consume_operator_commands() -> None:
                 """Poll durable control records; the bus is never authoritative."""
@@ -282,15 +283,24 @@ class AttemptExecutor:
                         run.id, unconsumed_only=True
                     )
                     for command in commands:
+                        if command.id in undeliverable_commands:
+                            continue
                         if command.kind == OperatorCommandKind.STEER:
                             injector = getattr(agent, "inject_diagnostic", None)
+                            delivered = False
                             if callable(injector):
-                                delivered = injector(command.instruction)
-                                if inspect.isawaitable(delivered):
-                                    await delivered
-                            await rt.store.consume_operator_command(
-                                command.id, attempt_id=attempt.id
-                            )
+                                delivery = injector(command.instruction)
+                                delivered = bool(
+                                    await delivery
+                                    if inspect.isawaitable(delivery)
+                                    else delivery
+                                )
+                            if delivered:
+                                await rt.store.consume_operator_command(
+                                    command.id, attempt_id=attempt.id
+                                )
+                            else:
+                                undeliverable_commands.add(command.id)
                         elif command.kind == OperatorCommandKind.CANCEL:
                             cancel_token.cancel(
                                 f"operator_cancel:{command.reason or command.actor}"

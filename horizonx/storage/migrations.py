@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 _REQUIRED_GOAL_COLUMNS = {
     "run_id",
@@ -70,6 +70,22 @@ CREATE TABLE goal_edges (
     PRIMARY KEY (run_id, from_goal_id, to_goal_id, edge_type),
     FOREIGN KEY (run_id, from_goal_id) REFERENCES goals(run_id, id) ON DELETE CASCADE,
     FOREIGN KEY (run_id, to_goal_id) REFERENCES goals(run_id, id) ON DELETE CASCADE
+)
+"""
+
+_LATEST_OPERATOR_COMMANDS_SQL = """
+CREATE TABLE operator_commands (
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL,
+    attempt_id      TEXT,
+    kind            TEXT NOT NULL CHECK (kind IN ('cancel', 'steer', 'decision')),
+    actor           TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT '',
+    instruction     TEXT NOT NULL DEFAULT '',
+    payload         TEXT NOT NULL DEFAULT '{}',
+    idempotency_key TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    consumed_at     TEXT
 )
 """
 
@@ -227,10 +243,43 @@ def ensure_additive_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     f"ALTER TABLE hitl_events ADD COLUMN {name} {declaration}"
                 )
+        conn.execute("DROP INDEX IF EXISTS idx_hitl_resolution_idempotency")
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_hitl_resolution_idempotency "
-            "ON hitl_events(resolution_idempotency_key) "
+            "CREATE UNIQUE INDEX idx_hitl_resolution_idempotency "
+            "ON hitl_events(run_id, resolution_idempotency_key) "
             "WHERE resolution_idempotency_key IS NOT NULL"
+        )
+    if _table_exists(conn, "operator_commands"):
+        global_unique = False
+        for index in conn.execute("PRAGMA index_list(operator_commands)"):
+            if not index[2]:
+                continue
+            index_columns = [
+                row[2]
+                for row in conn.execute(
+                    f"PRAGMA index_info('{index[1]}')"
+                )
+            ]
+            if index_columns == ["idempotency_key"]:
+                global_unique = True
+                break
+        if global_unique:
+            conn.execute("ALTER TABLE operator_commands RENAME TO operator_commands_v5")
+            conn.execute(_LATEST_OPERATOR_COMMANDS_SQL)
+            conn.execute(
+                "INSERT INTO operator_commands "
+                "SELECT id, run_id, attempt_id, kind, actor, reason, instruction, "
+                "payload, idempotency_key, created_at, consumed_at "
+                "FROM operator_commands_v5"
+            )
+            conn.execute("DROP TABLE operator_commands_v5")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_commands_pending "
+            "ON operator_commands(run_id, consumed_at, created_at)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_commands_idempotency "
+            "ON operator_commands(run_id, idempotency_key)"
         )
 
 

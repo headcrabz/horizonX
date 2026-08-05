@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from horizonx.core.leases import LeaseManager
+from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.types import (
     AgentConfig,
     AttemptRecord,
@@ -129,6 +130,121 @@ async def test_dashboard_passes_durable_provider_resume_context(tmp_path: Path) 
         assert kwargs["resume_provider_session_id"] == "thread-durable"
         assert kwargs["recovery_lineage_id"] == attempt.lineage_id
         assert kwargs["retry_cause"] == "provider_session_available"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_restarted_reconciler_resumes_resolved_hitl_and_releases_lease(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = Run(
+        id="run-hitl-restart",
+        task=Task(
+            id="hitl-restart",
+            name="HITL restart",
+            prompt="continue",
+            strategy=StrategyConfig(kind="single"),
+            agent=AgentConfig(type="mock", model="mock"),
+        ),
+        workspace_path=tmp_path / "workspace",
+        status=RunStatus.PAUSED_HITL,
+    )
+    await store.save_run(run)
+    session = Session(id="sess-hitl", run_id=run.id, sequence_index=0)
+    await store.save_session(session)
+    attempt = await store.create_attempt(
+        AttemptRecord(
+            run_id=run.id,
+            session_id=session.id,
+            status=AttemptStatus.PAUSED_HITL,
+            provider="mock",
+            model="mock",
+            workspace_path=run.workspace_path,
+        )
+    )
+    request_id = await store.save_hitl_event(run.id, "validator_paused", {})
+    await store.resolve_hitl_event(
+        request_id,
+        action="approve",
+        actor="alice",
+        reason="reviewed",
+        instruction="continue",
+        idempotency_key="restart-decision",
+    )
+
+    async def finish(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return await store.transition_run(run.id, RunStatus.COMPLETED)
+
+    runtime = AsyncMock()
+    runtime.run = AsyncMock(side_effect=finish)
+    try:
+        tasks = await recover_pending_runs(
+            store,
+            runtime,
+            owner="replacement",
+            retry_backoff_seconds=0,
+        )
+        await asyncio.gather(*tasks)
+        runtime.run.assert_awaited_once()
+        assert (await store.load_attempt(attempt.id)).status == AttemptStatus.INTERRUPTED
+        assert (await store.load_run(run.id)).status == RunStatus.COMPLETED
+        assert await store.get_lease(f"run:{run.id}") is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_restarted_reconciler_consumes_cancel_while_hitl_paused(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = Run(
+        id="run-hitl-cancel-restart",
+        task=Task(
+            id="hitl-cancel-restart",
+            name="HITL cancel restart",
+            prompt="stop",
+            strategy=StrategyConfig(kind="single"),
+            agent=AgentConfig(type="mock", model="mock"),
+        ),
+        workspace_path=tmp_path / "workspace",
+        status=RunStatus.PAUSED_HITL,
+    )
+    await store.save_run(run)
+    session = Session(id="sess-hitl-cancel", run_id=run.id, sequence_index=0)
+    await store.save_session(session)
+    attempt = await store.create_attempt(
+        AttemptRecord(
+            run_id=run.id,
+            session_id=session.id,
+            status=AttemptStatus.PAUSED_HITL,
+            provider="mock",
+            model="mock",
+            workspace_path=run.workspace_path,
+        )
+    )
+    await store.save_hitl_event(run.id, "validator_paused", {})
+    command, _ = await store.create_operator_command(
+        OperatorCommand(
+            run_id=run.id,
+            kind=OperatorCommandKind.CANCEL,
+            actor="alice",
+            reason="stop",
+            idempotency_key="cancel-after-restart",
+        )
+    )
+    runtime = AsyncMock()
+    try:
+        tasks = await recover_pending_runs(store, runtime, owner="replacement")
+        assert tasks == []
+        runtime.run.assert_not_awaited()
+        assert (await store.load_attempt(attempt.id)).status == AttemptStatus.ABORTED
+        assert (await store.load_run(run.id)).status == RunStatus.ABORTED
+        consumed = (await store.list_operator_commands(run.id))[0]
+        assert consumed.id == command.id and consumed.consumed_at is not None
+        assert await store.get_lease(f"run:{run.id}") is None
     finally:
         await store.close()
 

@@ -13,7 +13,15 @@ import sys
 import time
 from typing import Any, Literal, cast
 
-from horizonx.core.types import HITLConfig, HITLDecision, Run
+from horizonx.core.operator_commands import OperatorCommandKind
+from horizonx.core.types import (
+    TERMINAL_ATTEMPT_STATUSES,
+    AttemptStatus,
+    HITLConfig,
+    HITLDecision,
+    Run,
+    RunStatus,
+)
 
 
 async def await_decision(
@@ -53,14 +61,42 @@ async def await_decision(
         start_time = time.monotonic()
         timeout_secs = (cfg.timeout_minutes or 0) * 60
         while True:
+            commands = await store.list_operator_commands(
+                run.id, unconsumed_only=True
+            )
+            cancel = next(
+                (
+                    command
+                    for command in commands
+                    if command.kind == OperatorCommandKind.CANCEL
+                ),
+                None,
+            )
+            if cancel is not None:
+                attempt = await store.latest_attempt(run.id)
+                if (
+                    attempt is not None
+                    and attempt.status not in TERMINAL_ATTEMPT_STATUSES
+                ):
+                    await store.transition_attempt(
+                        attempt.id,
+                        AttemptStatus.ABORTED,
+                        error=f"operator_cancel:{cancel.reason or cancel.actor}",
+                    )
+                await store.transition_run(run.id, RunStatus.ABORTED)
+                await store.consume_operator_command(
+                    cancel.id, attempt_id=attempt.id if attempt else None
+                )
+                return HITLDecision(
+                    action="abort",
+                    instruction=cancel.reason,
+                    operator=cancel.actor,
+                )
             events = await store.list_hitl_events(run.id)
             request = next((item for item in events if item["id"] == request_id), None)
             if request is None:
                 raise RuntimeError(f"HITL request disappeared: {request_id}")
             if request["resolved_at"] is not None:
-                commands = await store.list_operator_commands(
-                    run.id, unconsumed_only=True
-                )
                 for command in commands:
                     if (
                         command.kind.value == "decision"

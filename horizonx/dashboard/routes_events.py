@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
 from horizonx.core.event_bus import Event, InMemoryBus
@@ -13,6 +13,19 @@ from horizonx.storage.sqlite import SqliteStore
 from .deps import get_bus, get_store
 
 router = APIRouter()
+
+
+def _parse_cursor(request: Request) -> int | None:
+    raw = request.headers.get("last-event-id") or request.query_params.get("cursor")
+    if raw is None:
+        return None
+    try:
+        cursor = int(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="event cursor must be an integer") from None
+    if cursor < 0:
+        raise HTTPException(status_code=400, detail="event cursor must be non-negative")
+    return cursor
 
 
 async def _event_gen(
@@ -53,6 +66,8 @@ async def _event_gen(
         while True:
             event = await live_task
             live_task = asyncio.ensure_future(anext(subscription))
+            if event.sequence is None and store is not None:
+                event = await store.append_event(event)
             if event.sequence is not None and event.sequence <= cursor:
                 continue
             cursor = event.sequence or cursor
@@ -74,14 +89,14 @@ async def run_events(
     bus: InMemoryBus = Depends(get_bus),
     store: SqliteStore = Depends(get_store),
 ) -> EventSourceResponse:
-    cursor = request.headers.get("last-event-id") or request.query_params.get("cursor")
+    cursor = _parse_cursor(request)
     return EventSourceResponse(
         _event_gen(
             bus,
             predicate=lambda e: e.run_id == run_id,
             store=store,
             run_id=run_id,
-            after_sequence=int(cursor) if cursor else None,
+            after_sequence=cursor,
         )
     )
 
@@ -92,11 +107,11 @@ async def all_events(
     bus: InMemoryBus = Depends(get_bus),
     store: SqliteStore = Depends(get_store),
 ) -> EventSourceResponse:
-    cursor = request.headers.get("last-event-id") or request.query_params.get("cursor")
+    cursor = _parse_cursor(request)
     return EventSourceResponse(
         _event_gen(
             bus,
             store=store,
-            after_sequence=int(cursor) if cursor else None,
+            after_sequence=cursor,
         )
     )

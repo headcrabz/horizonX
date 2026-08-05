@@ -10,22 +10,25 @@ from urllib.parse import urlencode
 
 import pytest
 
+from horizonx.agents.mock import MockAgent
 from horizonx.core.attempt_executor import AttemptExecutor
 from horizonx.core.leases import LeaseManager
 from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.runtime import Runtime
 from horizonx.core.types import (
     AgentConfig,
+    AttemptRecord,
     AttemptStatus,
     Run,
     RunStatus,
+    Session,
     SessionRunResult,
     SessionStatus,
     StrategyConfig,
     Task,
 )
 from horizonx.hitl.slack_interactions import verify_slack_signature
-from horizonx.storage.sqlite import SqliteStore
+from horizonx.storage.sqlite import OperatorCommandConflict, SqliteStore
 
 
 def _run(tmp_path: Path) -> Run:
@@ -69,6 +72,65 @@ async def test_operator_commands_are_durable_and_idempotent(tmp_path: Path) -> N
         assert consumed.consumed_at is not None
         assert consumed.attempt_id == "attempt-1"
         assert await store.list_operator_commands(run.id, unconsumed_only=True) == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_idempotency_keys_are_run_scoped_and_payload_bound(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    first_run = _run(tmp_path).model_copy(update={"id": "run-one"})
+    second_run = _run(tmp_path).model_copy(update={"id": "run-two"})
+    await store.save_run(first_run)
+    await store.save_run(second_run)
+    try:
+        first, first_created = await store.create_operator_command(
+            OperatorCommand(
+                run_id=first_run.id,
+                kind=OperatorCommandKind.CANCEL,
+                actor="alice",
+                idempotency_key="shared-key",
+            )
+        )
+        second, second_created = await store.create_operator_command(
+            OperatorCommand(
+                run_id=second_run.id,
+                kind=OperatorCommandKind.CANCEL,
+                actor="bob",
+                idempotency_key="shared-key",
+            )
+        )
+        assert first_created and second_created and first.id != second.id
+        with pytest.raises(OperatorCommandConflict, match="idempotency key"):
+            await store.create_operator_command(
+                OperatorCommand(
+                    run_id=first_run.id,
+                    kind=OperatorCommandKind.STEER,
+                    actor="alice",
+                    instruction="different operation",
+                    idempotency_key="shared-key",
+                )
+            )
+
+        first_request = await store.save_hitl_event(first_run.id, "validator_paused", {})
+        second_request = await store.save_hitl_event(second_run.id, "validator_paused", {})
+        _, first_resolved = await store.resolve_hitl_event(
+            first_request,
+            action="abort",
+            actor="alice",
+            reason="unsafe",
+            instruction="",
+            idempotency_key="shared-decision",
+        )
+        _, second_resolved = await store.resolve_hitl_event(
+            second_request,
+            action="approve",
+            actor="bob",
+            reason="safe",
+            instruction="",
+            idempotency_key="shared-decision",
+        )
+        assert first_resolved and second_resolved
     finally:
         await store.close()
 
@@ -170,6 +232,20 @@ class _CommandAwareAgent:
         )
 
 
+class _BlockingUnsupportedAdapter(MockAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = __import__("asyncio").Event()
+
+    async def run_session(self, *, cancel_token, **kwargs):  # type: ignore[no-untyped-def]
+        import asyncio
+
+        self.started.set()
+        while not cancel_token.cancelled:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        return SessionRunResult(status=SessionStatus.TIMEOUT, error=cancel_token.reason)
+
+
 @pytest.mark.asyncio
 async def test_attempt_consumes_steer_then_cancel_commands(tmp_path: Path) -> None:
     import asyncio
@@ -220,6 +296,52 @@ async def test_attempt_consumes_steer_then_cancel_commands(tmp_path: Path) -> No
         run.status = RunStatus.COMPLETED
         await store.save_run(run)
         assert (await store.load_run(run.id)).status == RunStatus.ABORTED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_production_adapter_does_not_ack_steer(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    store = SqliteStore(tmp_path / "state.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await store.save_run(run)
+    steer, _ = await store.create_operator_command(
+        OperatorCommand(
+            run_id=run.id,
+            kind=OperatorCommandKind.STEER,
+            actor="alice",
+            instruction="change direction",
+            idempotency_key="unsupported-steer",
+        )
+    )
+    agent = _BlockingUnsupportedAdapter()
+    assert await agent.inject_diagnostic("probe") is False
+    try:
+        with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
+            execution = asyncio.create_task(
+                AttemptExecutor(runtime).execute(run, prompt="wait")
+            )
+            await agent.started.wait()
+            await asyncio.sleep(0.15)
+            cancel, _ = await store.create_operator_command(
+                OperatorCommand(
+                    run_id=run.id,
+                    kind=OperatorCommandKind.CANCEL,
+                    actor="alice",
+                    reason="finish test",
+                    idempotency_key="unsupported-steer-cancel",
+                )
+            )
+            await asyncio.wait_for(execution, timeout=1)
+        commands = {item.id: item for item in await store.list_operator_commands(run.id)}
+        assert commands[steer.id].consumed_at is None
+        assert commands[cancel.id].consumed_at is not None
     finally:
         await store.close()
 
@@ -344,12 +466,40 @@ async def test_slack_callback_authenticates_resolves_and_deduplicates(
             duplicate = await client.post(
                 "/api/hitl/slack/interactions", content=body, headers=headers
             )
+            conflicting_payload = {
+                **payload,
+                "trigger_id": "different-callback",
+                "actions": [
+                    {
+                        "action_id": "hitl_abort",
+                        "value": f"{request_id}:abort",
+                    }
+                ],
+            }
+            conflicting_body = urlencode(
+                {"payload": json.dumps(conflicting_payload)}
+            ).encode()
+            conflicting_signature = "v0=" + hmac.new(
+                secret.encode(),
+                f"v0:{timestamp}:".encode() + conflicting_body,
+                hashlib.sha256,
+            ).hexdigest()
+            conflict = await client.post(
+                "/api/hitl/slack/interactions",
+                content=conflicting_body,
+                headers={**headers, "x-slack-signature": conflicting_signature},
+            )
         assert first.json()["status"] == "resolved"
         assert duplicate.json()["status"] == "duplicate"
+        assert conflict.status_code == 409
         resolved = await app.state.store.find_hitl_event(request_id)
         assert resolved["operator"] == "U123"
         commands = await app.state.store.list_operator_commands(run.id)
         assert len(commands) == 1
+        events = await app.state.store.list_events(
+            run.id, event_type="hitl.resolved"
+        )
+        assert len(events) == 1 and isinstance(events[0].sequence, int)
     finally:
         await app.state.store.close()
 
@@ -417,8 +567,18 @@ async def test_authenticated_command_route_persists_steering(
                 },
                 json={"kind": "steer", "instruction": "inspect the lease"},
             )
+            conflict = await client.post(
+                f"/api/runs/{run.id}/commands",
+                headers={
+                    "authorization": "Bearer operator-secret",
+                    "idempotency-key": "steer-route-1",
+                    "x-horizonx-actor": "alice",
+                },
+                json={"kind": "steer", "instruction": "different instruction"},
+            )
         assert denied.status_code == 401
         assert accepted.status_code == 202
+        assert conflict.status_code == 409
         commands = await app.state.store.list_operator_commands(run.id)
         assert [(item.actor, item.instruction) for item in commands] == [
             ("alice", "inspect the lease")
@@ -506,4 +666,66 @@ async def test_acknowledgement_requirement_fails_closed_on_timeout(
         assert decision.operator == "system:timeout"
         assert (await store.load_run(run.id)).status == RunStatus.ABORTED
     finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_cancel_stops_unbounded_hitl_wait_and_releases_lease(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    store = SqliteStore(tmp_path / "state.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await store.save_run(run)
+    session = Session(id="session-hitl-cancel", run_id=run.id, sequence_index=0)
+    await store.save_session(session)
+    attempt = await store.create_attempt(
+        AttemptRecord(
+            run_id=run.id,
+            session_id=session.id,
+            status=AttemptStatus.PAUSED_HITL,
+            provider="mock",
+            model="mock",
+            workspace_path=run.workspace_path,
+        )
+    )
+    leases = LeaseManager(store)
+    lease = await leases.acquire(f"run:{run.id}", owner="live-worker", ttl_seconds=2)
+    assert lease is not None
+
+    async def wait_with_lease():  # type: ignore[no-untyped-def]
+        async with leases.maintain(lease, ttl_seconds=2):
+            return await runtime.request_hitl(
+                run, reason="validator_paused", context={}
+            )
+
+    task = asyncio.create_task(wait_with_lease())
+    try:
+        for _ in range(50):
+            if await store.list_hitl_events(run.id):
+                break
+            await asyncio.sleep(0.01)
+        command, _ = await store.create_operator_command(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.CANCEL,
+                actor="alice",
+                reason="stop while paused",
+                idempotency_key="live-hitl-cancel",
+            )
+        )
+        decision = await asyncio.wait_for(task, timeout=0.5)
+        assert decision.action == "abort"
+        assert (await store.load_run(run.id)).status == RunStatus.ABORTED
+        assert (await store.load_attempt(attempt.id)).status == AttemptStatus.ABORTED
+        saved = (await store.list_operator_commands(run.id))[0]
+        assert saved.id == command.id and saved.consumed_at is not None
+        assert await store.get_lease(f"run:{run.id}") is None
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await store.close()
