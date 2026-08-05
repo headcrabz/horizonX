@@ -10,8 +10,12 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from horizonx.core.event_bus import DurableEventBus, Event, InMemoryBus
-from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
+from horizonx.core.event_bus import DurableEventBus, InMemoryBus
+from horizonx.core.operator_commands import (
+    OperatorCommand,
+    OperatorCommandKind,
+    hitl_resolved_event,
+)
 from horizonx.core.types import HITLDecision
 from horizonx.hitl.slack_interactions import verify_slack_signature
 from horizonx.storage.sqlite import OperatorCommandConflict, SqliteStore
@@ -134,15 +138,12 @@ async def resolve_hitl(
     # Publish SSE event so the dashboard updates immediately
     if changed:
         await DurableEventBus(store, bus).publish(
-            Event(
-                type="hitl.resolved",
+            hitl_resolved_event(
                 run_id=run_id,
-                payload={
-                    "request_id": request_id,
-                    "action": resolved["decision"],
-                    "operator": resolved["operator"],
-                    "instruction": resolved["instruction"],
-                },
+                request_id=request_id,
+                action=resolved["decision"],
+                actor=resolved["operator"],
+                instruction=resolved["instruction"],
             )
         )
 
@@ -228,10 +229,12 @@ async def slack_interaction(
     )
     if changed:
         await DurableEventBus(store, bus).publish(
-            Event(
-                type="hitl.resolved",
+            hitl_resolved_event(
                 run_id=resolved["run_id"],
-                payload={"request_id": request_id, "action": resolved["decision"]},
+                request_id=request_id,
+                action=resolved["decision"],
+                actor=resolved["operator"],
+                instruction=resolved["instruction"],
             )
         )
     return {"status": "resolved" if changed else "duplicate", "request_id": request_id}

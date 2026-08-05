@@ -15,12 +15,9 @@ from typing import Any, Literal, cast
 
 from horizonx.core.operator_commands import OperatorCommandKind
 from horizonx.core.types import (
-    TERMINAL_ATTEMPT_STATUSES,
-    AttemptStatus,
     HITLConfig,
     HITLDecision,
     Run,
-    RunStatus,
 )
 
 
@@ -73,20 +70,7 @@ async def await_decision(
                 None,
             )
             if cancel is not None:
-                attempt = await store.latest_attempt(run.id)
-                if (
-                    attempt is not None
-                    and attempt.status not in TERMINAL_ATTEMPT_STATUSES
-                ):
-                    await store.transition_attempt(
-                        attempt.id,
-                        AttemptStatus.ABORTED,
-                        error=f"operator_cancel:{cancel.reason or cancel.actor}",
-                    )
-                await store.transition_run(run.id, RunStatus.ABORTED)
-                await store.consume_operator_command(
-                    cancel.id, attempt_id=attempt.id if attempt else None
-                )
+                await store.apply_cancel_command(cancel.id)
                 return HITLDecision(
                     action="abort",
                     instruction=cancel.reason,
@@ -110,7 +94,7 @@ async def await_decision(
                     decided_at=request["resolved_at"],
                 )
             if timeout_secs and (time.monotonic() - start_time) >= timeout_secs:
-                if cfg.escalation_channel and cfg.notification_type == "slack":
+                if cfg.escalation_channel:
                     await _notify_slack(
                         cfg.escalation_channel,
                         run.id,
@@ -149,7 +133,7 @@ async def await_decision(
             await asyncio.sleep(2.0)
             if timeout_secs and (time.monotonic() - start_time) >= timeout_secs:
                 # Escalate to secondary channel if configured
-                if cfg.escalation_channel and cfg.notification_type == "slack":
+                if cfg.escalation_channel:
                     await _notify_slack(
                         cfg.escalation_channel,
                         run.id,

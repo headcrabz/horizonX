@@ -15,6 +15,7 @@ from typing import Any, cast
 
 from horizonx.core.event_bus import DurableEventBus, Event, EventBus, InMemoryBus
 from horizonx.core.governor import BudgetExceeded, ResourceGovernor
+from horizonx.core.operator_commands import hitl_resolved_event
 from horizonx.core.recorder import TrajectoryRecorder
 from horizonx.core.spin_detector import CrossSessionSpinLayer, SpinDetector
 from horizonx.core.strategy_switch import SpinControlRequested, StrategySwitchRequested
@@ -734,15 +735,12 @@ class Runtime:
             request_id=request_id,
         )
         await self.bus.publish(
-            Event(
-                type="hitl.resolved",
+            hitl_resolved_event(
                 run_id=run.id,
-                payload={
-                    "request_id": request_id,
-                    "action": decision.action,
-                    "actor": decision.operator,
-                    "instruction": decision.instruction,
-                },
+                request_id=request_id,
+                action=decision.action,
+                actor=decision.operator,
+                instruction=decision.instruction,
             )
         )
         if decision.action == "abort":

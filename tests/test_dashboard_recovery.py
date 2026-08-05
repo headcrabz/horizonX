@@ -250,6 +250,84 @@ async def test_restarted_reconciler_consumes_cancel_while_hitl_paused(
 
 
 @pytest.mark.asyncio
+async def test_http_cancel_is_consumed_by_replacement_after_owner_expires(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("httpx")
+    from httpx import ASGITransport, AsyncClient
+
+    from horizonx.core.event_bus import InMemoryBus
+    from horizonx.core.runtime import Runtime
+    from horizonx.dashboard.app import create_app
+
+    app = create_app(tmp_path / "horizonx.db", tmp_path / "workspaces")
+    app.state.store = SqliteStore(tmp_path / "horizonx.db")
+    app.state.bus = InMemoryBus()
+    app.state.runtime = Runtime(
+        app.state.store, app.state.bus, tmp_path / "workspaces"
+    )
+    run = Run(
+        id="run-http-cancel-recovery",
+        task=Task(
+            id="http-cancel-recovery",
+            name="HTTP cancel recovery",
+            prompt="wait",
+            strategy=StrategyConfig(kind="single"),
+            agent=AgentConfig(type="mock", model="mock"),
+        ),
+        workspace_path=tmp_path / "workspace",
+        status=RunStatus.PAUSED_HITL,
+    )
+    await app.state.store.save_run(run)
+    session = Session(id="sess-http-cancel", run_id=run.id, sequence_index=0)
+    await app.state.store.save_session(session)
+    await app.state.store.create_attempt(
+        AttemptRecord(
+            run_id=run.id,
+            session_id=session.id,
+            status=AttemptStatus.PAUSED_HITL,
+            provider="mock",
+            model="mock",
+            workspace_path=run.workspace_path,
+        )
+    )
+    await app.state.store.save_hitl_event(run.id, "validator_paused", {})
+    dead_lease = await LeaseManager(app.state.store).acquire(
+        f"run:{run.id}", owner="dead-owner", ttl_seconds=0.05
+    )
+    assert dead_lease is not None
+    runtime = AsyncMock()
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                f"/api/runs/{run.id}/cancel",
+                headers={
+                    "idempotency-key": "http-cancel-after-crash",
+                    "x-horizonx-actor": "alice",
+                    "x-horizonx-reason": "stop recovered run",
+                },
+            )
+        assert response.json()["status"] == "accepted"
+        assert (await app.state.store.load_run(run.id)).status == RunStatus.PAUSED_HITL
+        await asyncio.sleep(0.06)
+        tasks = await recover_pending_runs(
+            app.state.store, runtime, owner="replacement", lease_ttl_seconds=1
+        )
+        assert tasks == []
+        runtime.run.assert_not_awaited()
+        hitl = (await app.state.store.list_hitl_events(run.id))[0]
+        assert hitl["decision"] == "abort" and hitl["operator"] == "alice"
+        assert hitl["reason"] == "stop recovered run"
+        assert (await app.state.store.load_run(run.id)).status == RunStatus.ABORTED
+        assert (await app.state.store.list_operator_commands(run.id))[0].consumed_at
+        assert await app.state.store.get_lease(f"run:{run.id}") is None
+    finally:
+        await app.state.store.close()
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_reclaims_lease_left_by_dead_process(
     tmp_path: Path,
 ) -> None:

@@ -2036,6 +2036,23 @@ class SqliteStore:
     async def create_operator_command(self, command: Any) -> tuple[Any, bool]:
         return await self._run_sync(self._sync_create_operator_command, command)
 
+    def _sync_get_operator_command(
+        self, run_id: str, idempotency_key: str
+    ) -> Any | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM operator_commands WHERE run_id=? AND idempotency_key=?",
+                (run_id, idempotency_key),
+            ).fetchone()
+        return self._operator_command_from_row(row) if row is not None else None
+
+    async def get_operator_command(
+        self, run_id: str, idempotency_key: str
+    ) -> Any | None:
+        return await self._run_sync(
+            self._sync_get_operator_command, run_id, idempotency_key
+        )
+
     def _sync_list_operator_commands(
         self, run_id: str, unconsumed_only: bool
     ) -> list[Any]:
@@ -2076,6 +2093,68 @@ class SqliteStore:
         return await self._run_sync(
             self._sync_consume_operator_command, command_id, attempt_id
         )
+
+    def _sync_apply_cancel_command(self, command_id: str) -> dict[str, Any]:
+        now = utcnow().isoformat()
+        with self._conn() as c:
+            command = c.execute(
+                "SELECT * FROM operator_commands WHERE id=?", (command_id,)
+            ).fetchone()
+            if command is None:
+                raise KeyError(f"operator command not found: {command_id}")
+            if command["kind"] != "cancel":
+                raise StoreError("operator command is not a cancellation")
+            request = c.execute(
+                "SELECT * FROM hitl_events WHERE run_id=? AND resolved_at IS NULL "
+                "ORDER BY triggered_at DESC LIMIT 1",
+                (command["run_id"],),
+            ).fetchone()
+            if request is not None:
+                c.execute(
+                    "UPDATE hitl_events SET resolved_at=?, decision='abort', operator=?, "
+                    "reason=?, instruction=?, resolution_idempotency_key=? WHERE id=?",
+                    (
+                        now, command["actor"], command["reason"],
+                        command["instruction"], command["idempotency_key"], request["id"],
+                    ),
+                )
+            attempt = c.execute(
+                "SELECT id FROM attempts WHERE run_id=? ORDER BY ordinal DESC LIMIT 1",
+                (command["run_id"],),
+            ).fetchone()
+            if attempt is not None:
+                c.execute(
+                    "UPDATE attempts SET status='aborted', error=?, updated_at=?, "
+                    "completed_at=COALESCE(completed_at, ?), version=version+1 "
+                    "WHERE id=? AND status NOT IN ('completed','failed','interrupted','aborted')",
+                    (
+                        f"operator_cancel:{command['reason'] or command['actor']}",
+                        now, now, attempt["id"],
+                    ),
+                )
+            c.execute(
+                "UPDATE runs SET status='aborted', completed_at=COALESCE(completed_at, ?) "
+                "WHERE id=? AND status NOT IN "
+                "('completed','failed','aborted','timed_out','budget_exceeded')",
+                (now, command["run_id"]),
+            )
+            c.execute(
+                "UPDATE operator_commands SET consumed_at=COALESCE(consumed_at, ?), "
+                "attempt_id=COALESCE(attempt_id, ?) WHERE id=?",
+                (now, attempt["id"] if attempt else None, command_id),
+            )
+        return {
+            "run_id": command["run_id"],
+            "request_id": request["id"] if request else None,
+            "attempt_id": attempt["id"] if attempt else None,
+            "actor": command["actor"],
+            "reason": command["reason"],
+            "instruction": command["instruction"],
+        }
+
+    async def apply_cancel_command(self, command_id: str) -> dict[str, Any]:
+        """Atomically resolve pending HITL, abort work, and consume cancellation."""
+        return await self._run_sync(self._sync_apply_cancel_command, command_id)
 
     def _sync_list_spin_reports(self, run_id: str) -> list[dict[str, Any]]:
         with self._conn() as c:

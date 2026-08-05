@@ -411,12 +411,24 @@ async def test_cancel_run(client: AsyncClient, app, seeded_run: Run) -> None:
     )
     await app.state.store.save_run(running)
 
-    r = await client.post(f"/api/runs/{running.id}/cancel")
+    headers = {"idempotency-key": "cancel-route-once"}
+    r = await client.post(f"/api/runs/{running.id}/cancel", headers=headers)
     assert r.status_code == 200
-    assert r.json()["status"] == "aborted"
+    assert r.json()["status"] == "accepted"
+    duplicate = await client.post(f"/api/runs/{running.id}/cancel", headers=headers)
+    assert duplicate.status_code == 200
+    assert duplicate.json()["status"] == "duplicate"
+    assert duplicate.json()["command_id"] == r.json()["command_id"]
+    mismatch = await client.post(
+        f"/api/runs/{running.id}/cancel",
+        headers={**headers, "x-horizonx-reason": "different cancellation"},
+    )
+    assert mismatch.status_code == 409
 
-    # Verify status updated in DB
-    running.status = RunStatus.COMPLETED
-    await app.state.store.save_run(running)
-    r2 = await client.get(f"/api/runs/{running.id}")
-    assert r2.json()["status"] == "aborted"
+    assert (await app.state.store.load_run(running.id)).status == RunStatus.RUNNING
+    await app.state.store.apply_cancel_command(r.json()["command_id"])
+    after_terminal = await client.post(
+        f"/api/runs/{running.id}/cancel", headers=headers
+    )
+    assert after_terminal.status_code == 200
+    assert after_terminal.json()["status"] == "duplicate"

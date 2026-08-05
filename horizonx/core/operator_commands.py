@@ -12,6 +12,24 @@ from pydantic import BaseModel, Field
 from horizonx.core.types import utcnow
 
 
+def hitl_resolved_event(
+    *, run_id: str, request_id: str, action: str, actor: str | None, instruction: str
+) -> Any:
+    from horizonx.core.event_bus import Event
+
+    return Event(
+        id=f"hitl-resolved:{request_id}",
+        type="hitl.resolved",
+        run_id=run_id,
+        payload={
+            "request_id": request_id,
+            "action": action,
+            "actor": actor,
+            "instruction": instruction,
+        },
+    )
+
+
 class OperatorCommandKind(str, Enum):
     CANCEL = "cancel"
     STEER = "steer"
@@ -30,4 +48,3 @@ class OperatorCommand(BaseModel):
     idempotency_key: str
     created_at: datetime = Field(default_factory=utcnow)
     consumed_at: datetime | None = None
-

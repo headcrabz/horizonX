@@ -505,6 +505,72 @@ async def test_slack_callback_authenticates_resolves_and_deduplicates(
 
 
 @pytest.mark.asyncio
+async def test_live_waiter_and_dashboard_share_one_resolved_event(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    pytest.importorskip("httpx")
+    from httpx import ASGITransport, AsyncClient
+
+    from horizonx.core.event_bus import InMemoryBus
+    from horizonx.dashboard.app import create_app
+    from horizonx.dashboard.routes_events import _event_gen
+
+    app = create_app(tmp_path / "state.db", tmp_path / "workspaces")
+    app.state.store = SqliteStore(tmp_path / "state.db")
+    app.state.bus = InMemoryBus()
+    app.state.runtime = Runtime(
+        app.state.store, app.state.bus, tmp_path / "workspaces"
+    )
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await app.state.store.save_run(run)
+    waiter = asyncio.create_task(
+        app.state.runtime.request_hitl(
+            run, reason="validator_paused", context={}
+        )
+    )
+    try:
+        for _ in range(50):
+            requests = await app.state.store.list_hitl_events(run.id)
+            if requests:
+                break
+            await asyncio.sleep(0.01)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                f"/api/runs/{run.id}/hitl",
+                json={
+                    "request_id": requests[0]["id"],
+                    "action": "approve",
+                    "operator": "alice",
+                    "idempotency_key": "live-and-route",
+                },
+            )
+        assert response.status_code == 200
+        await asyncio.wait_for(waiter, timeout=1)
+        events = await app.state.store.list_events(
+            run.id, event_type="hitl.resolved"
+        )
+        assert len(events) == 1
+        replay = _event_gen(
+            app.state.bus,
+            store=app.state.store,
+            run_id=run.id,
+            after_sequence=(events[0].sequence or 0) - 1,
+        )
+        assert (await anext(replay))["id"] == str(events[0].sequence)
+        await replay.aclose()
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+        await app.state.store.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_shutdown_cancels_and_awaits_background_runs(
     tmp_path: Path,
 ) -> None:
@@ -576,9 +642,21 @@ async def test_authenticated_command_route_persists_steering(
                 },
                 json={"kind": "steer", "instruction": "different instruction"},
             )
+            await app.state.store.transition_run(run.id, RunStatus.ABORTED)
+            terminal_duplicate = await client.post(
+                f"/api/runs/{run.id}/commands",
+                headers={
+                    "authorization": "Bearer operator-secret",
+                    "idempotency-key": "steer-route-1",
+                    "x-horizonx-actor": "alice",
+                },
+                json={"kind": "steer", "instruction": "inspect the lease"},
+            )
         assert denied.status_code == 401
         assert accepted.status_code == 202
         assert conflict.status_code == 409
+        assert terminal_duplicate.status_code == 202
+        assert terminal_duplicate.json()["status"] == "duplicate"
         commands = await app.state.store.list_operator_commands(run.id)
         assert [(item.actor, item.instruction) for item in commands] == [
             ("alice", "inspect the lease")
@@ -723,6 +801,12 @@ async def test_live_cancel_stops_unbounded_hitl_wait_and_releases_lease(
         assert (await store.load_attempt(attempt.id)).status == AttemptStatus.ABORTED
         saved = (await store.list_operator_commands(run.id))[0]
         assert saved.id == command.id and saved.consumed_at is not None
+        hitl = (await store.list_hitl_events(run.id))[0]
+        assert hitl["decision"] == "abort"
+        assert hitl["operator"] == "alice"
+        assert hitl["reason"] == "stop while paused"
+        assert hitl["instruction"] == ""
+        assert hitl["resolved_at"] is not None
         assert await store.get_lease(f"run:{run.id}") is None
     finally:
         if not task.done():

@@ -305,16 +305,10 @@ class AttemptExecutor:
                             cancel_token.cancel(
                                 f"operator_cancel:{command.reason or command.actor}"
                             )
-                            from horizonx.core.types import RunStatus
-
-                            persisted_run = await rt.store.transition_run(
-                                run.id, RunStatus.ABORTED
-                            )
+                            await rt.store.apply_cancel_command(command.id)
+                            persisted_run = await rt.store.load_run(run.id)
                             run.status = persisted_run.status
                             run.completed_at = persisted_run.completed_at
-                            await rt.store.consume_operator_command(
-                                command.id, attempt_id=attempt.id
-                            )
                     await asyncio.sleep(0.05)
 
             command_task = asyncio.create_task(

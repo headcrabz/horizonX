@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from horizonx.core.event_bus import Event
 from horizonx.core.leases import LeaseManager
-from horizonx.core.operator_commands import OperatorCommandKind
+from horizonx.core.operator_commands import OperatorCommandKind, hitl_resolved_event
 from horizonx.core.types import (
     TERMINAL_ATTEMPT_STATUSES,
     AttemptRecord,
@@ -101,6 +101,44 @@ class RecoveryCoordinator:
 
             lease_handed_off = False
             try:
+                pending_commands = await self.store.list_operator_commands(
+                    run.id, unconsumed_only=True
+                )
+                pending_cancel = next(
+                    (
+                        command
+                        for command in pending_commands
+                        if command.kind == OperatorCommandKind.CANCEL
+                    ),
+                    None,
+                )
+                if pending_cancel is not None:
+                    cancelled = await self.store.apply_cancel_command(pending_cancel.id)
+                    if cancelled["request_id"] is not None:
+                        await self.store.append_event(
+                            hitl_resolved_event(
+                                run_id=run.id,
+                                request_id=cancelled["request_id"],
+                                action="abort",
+                                actor=cancelled["actor"],
+                                instruction=cancelled["instruction"],
+                            )
+                        )
+                    await self.store.append_event(
+                        Event(
+                            id=f"recovery-{run.id}-{lease.version}",
+                            type="recovery.planned",
+                            run_id=run.id,
+                            attempt_id=cancelled["attempt_id"],
+                            payload={
+                                "action": "abort_run",
+                                "reason": "operator_cancelled_before_recovery",
+                                "lease_owner": lease.owner,
+                                "lease_version": lease.version,
+                            },
+                        )
+                    )
+                    continue
                 if run.status == RunStatus.PAUSED_HITL or (
                     latest is not None and latest.status == AttemptStatus.PAUSED_HITL
                 ):
@@ -225,36 +263,6 @@ class RecoveryCoordinator:
         commands = await self.store.list_operator_commands(
             run.id, unconsumed_only=True
         )
-        cancel = next(
-            (command for command in commands if command.kind == OperatorCommandKind.CANCEL),
-            None,
-        )
-        if cancel is not None:
-            if latest is not None and latest.status not in TERMINAL_ATTEMPT_STATUSES:
-                await self.store.transition_attempt(
-                    latest.id,
-                    AttemptStatus.ABORTED,
-                    error=f"operator_cancel:{cancel.reason or cancel.actor}",
-                )
-            await self.store.transition_run(run.id, RunStatus.ABORTED)
-            await self.store.consume_operator_command(
-                cancel.id, attempt_id=latest.id if latest else None
-            )
-            await self.store.append_event(
-                Event(
-                    id=f"recovery-{run.id}-{lease.version}",
-                    type="recovery.planned",
-                    run_id=run.id,
-                    attempt_id=latest.id if latest else None,
-                    payload={
-                        "action": "abort_run",
-                        "reason": "operator_cancelled_during_hitl",
-                        "lease_owner": lease.owner,
-                        "lease_version": lease.version,
-                    },
-                )
-            )
-            return None
         if request is None:
             return None
         decision_commands = [

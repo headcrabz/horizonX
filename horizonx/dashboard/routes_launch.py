@@ -93,29 +93,30 @@ async def submit_operator_command(
         run = await store.load_run(run_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
-    if run.status in TERMINAL_RUN_STATUSES:
-        raise HTTPException(
-            status_code=409,
-            detail=f"run is already terminal: {run.status.value}",
-        )
+    idempotency_key = (
+        request.headers.get("idempotency-key") or f"{body.kind}:{run.id}:{uuid4().hex}"
+    )
+    candidate = OperatorCommand(
+        run_id=run_id,
+        kind=OperatorCommandKind(body.kind),
+        actor=request.headers.get("x-horizonx-actor", "dashboard-operator"),
+        reason=body.reason,
+        instruction=body.instruction,
+        idempotency_key=idempotency_key,
+    )
     try:
-        command, created = await store.create_operator_command(
-            OperatorCommand(
-                run_id=run_id,
-                kind=OperatorCommandKind(body.kind),
-                actor=request.headers.get("x-horizonx-actor", "dashboard-operator"),
-                reason=body.reason,
-                instruction=body.instruction,
-                idempotency_key=(
-                    request.headers.get("idempotency-key")
-                    or f"{body.kind}:{run.id}:{uuid4().hex}"
-                ),
+        existing = await store.get_operator_command(run.id, idempotency_key)
+        if existing is not None:
+            command, _ = await store.create_operator_command(candidate)
+            return {"status": "duplicate", "command_id": command.id}
+        if run.status in TERMINAL_RUN_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"run is already terminal: {run.status.value}",
             )
-        )
+        command, created = await store.create_operator_command(candidate)
     except OperatorCommandConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    if command.kind == OperatorCommandKind.CANCEL:
-        await store.transition_run(run.id, RunStatus.ABORTED)
     runtime.notify_operator_command(run_id)
     return {
         "status": "accepted" if created else "duplicate",
@@ -136,31 +137,30 @@ async def cancel_run(
         run = await store.load_run(run_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
-    if run.status in TERMINAL_RUN_STATUSES:
-        raise HTTPException(
-            status_code=409,
-            detail=f"run is already terminal: {run.status.value}",
-        )
-    command, _ = await store.create_operator_command(
-        OperatorCommand(
-            run_id=run.id,
-            kind=OperatorCommandKind.CANCEL,
-            actor=request.headers.get("x-horizonx-actor", "dashboard-operator"),
-            reason=request.headers.get("x-horizonx-reason", "operator requested cancellation"),
-            idempotency_key=(
-                request.headers.get("idempotency-key") or f"cancel:{run.id}:{uuid4().hex}"
-            ),
-        )
+    idempotency_key = request.headers.get("idempotency-key") or f"cancel:{run.id}:{uuid4().hex}"
+    candidate = OperatorCommand(
+        run_id=run.id,
+        kind=OperatorCommandKind.CANCEL,
+        actor=request.headers.get("x-horizonx-actor", "dashboard-operator"),
+        reason=request.headers.get("x-horizonx-reason", "operator requested cancellation"),
+        idempotency_key=idempotency_key,
     )
-    transitioned = await store.transition_run(run.id, RunStatus.ABORTED)
-    if transitioned.status != RunStatus.ABORTED:
-        raise HTTPException(
-            status_code=409,
-            detail=f"run is already terminal: {transitioned.status.value}",
-        )
+    try:
+        existing = await store.get_operator_command(run.id, idempotency_key)
+        if existing is not None:
+            command, _ = await store.create_operator_command(candidate)
+            return {"status": "duplicate", "run_id": run_id, "command_id": command.id}
+        if run.status in TERMINAL_RUN_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"run is already terminal: {run.status.value}",
+            )
+        command, _ = await store.create_operator_command(candidate)
+    except OperatorCommandConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     runtime.notify_operator_command(run_id)
     return {
-        "status": transitioned.status.value,
+        "status": "accepted",
         "run_id": run_id,
         "command_id": command.id,
     }

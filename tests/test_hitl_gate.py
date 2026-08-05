@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -358,6 +359,30 @@ async def test_await_decision_timeout_defaults_to_approve(tmp_path: Path) -> Non
 
     assert result.action == "approve"
     assert "timeout" in result.instruction.lower()
+
+
+async def test_console_timeout_sends_secondary_slack_escalation(tmp_path: Path) -> None:
+    run = _make_run(tmp_path)
+    cfg = HITLConfig(
+        notification_type="console",
+        timeout_minutes=1,
+        escalation_channel="#on-call",
+        escalation_action="abort",
+    )
+    with patch("sys.stdin") as stdin:
+        stdin.isatty.return_value = False
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("HORIZONX_HITL_AUTO_APPROVE", None)
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with patch("horizonx.hitl.gate.time") as mock_time:
+                    mock_time.monotonic.side_effect = [0.0, 61.0]
+                    with patch(
+                        "horizonx.hitl.gate._notify_slack", new_callable=AsyncMock
+                    ) as notify:
+                        decision = await await_decision(run, "spin", {}, cfg)
+    assert decision.action == "abort"
+    notify.assert_awaited_once()
+    assert notify.await_args.args[0] == "#on-call"
 
 
 # ---------------------------------------------------------------------------
