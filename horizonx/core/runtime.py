@@ -9,6 +9,7 @@ import asyncio
 import importlib.metadata
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +17,7 @@ from horizonx.core.event_bus import DurableEventBus, Event, EventBus, InMemoryBu
 from horizonx.core.governor import BudgetExceeded, ResourceGovernor
 from horizonx.core.recorder import TrajectoryRecorder
 from horizonx.core.spin_detector import CrossSessionSpinLayer, SpinDetector
+from horizonx.core.strategy_switch import StrategySwitchRequested
 from horizonx.core.summarizer import Summarizer
 from horizonx.core.types import (
     TERMINAL_RUN_STATUSES,
@@ -49,6 +51,14 @@ _BUILTIN_STRATEGIES = {
 }
 
 
+@dataclass
+class _StrategyExecution:
+    current: str
+    requested: str | None = None
+    switched: bool = False
+    terminal_outcome_seen: bool = False
+
+
 class Runtime:
     """Top-level orchestrator. One Runtime serves N concurrent Runs.
 
@@ -77,6 +87,7 @@ class Runtime:
         self._last_sessions: dict[str, Session] = {}
         self._prepared_workspaces: dict[str, PreparedWorkspace] = {}
         self._recovery_contexts: dict[str, dict[str, str | None]] = {}
+        self._strategy_executions: dict[str, _StrategyExecution] = {}
 
     async def __aenter__(self) -> Runtime:
         return self
@@ -125,10 +136,10 @@ class Runtime:
                     f"workspace {task.workspace.workspace_id!r} daily budget "
                     f"${task.workspace.daily_budget_usd:.2f} already spent (${spent:.2f} today)"
                 )
-        # Resolve and validate execution code before creating a run or touching a repository.
-        strategy_cls = self._load_strategy(task.strategy.kind)
-        strategy = strategy_cls(task.strategy.config)
         run = await self._load_or_create(task, resume_from)
+        current_kind = await self._begin_strategy_execution(run, task.strategy.kind)
+        # Resolve the durable current strategy before touching a repository.
+        strategy_cls = self._load_strategy(current_kind)
         await self.store.save_run(run)
         try:
             workspace_metadata = run.workspace_path / ".horizonx" / "workspace.json"
@@ -137,6 +148,7 @@ class Runtime:
                 resume=resume_from is not None and workspace_metadata.is_file(),
             )
         except WorkspaceError as exc:
+            self._end_strategy_execution(run.id)
             await self._finish_run(
                 run,
                 StrategyOutcome(
@@ -167,6 +179,7 @@ class Runtime:
                         details={"report": report.to_dict()},
                     ),
                 )
+                self._end_strategy_execution(run.id)
                 return run
 
         if recovery_lineage_id or resume_provider_session_id or retry_cause:
@@ -178,23 +191,84 @@ class Runtime:
 
         async with self._governor(run):
             try:
+                current_cls = strategy_cls
                 outcome: StrategyOutcome | None = None
-                async for item in strategy.execute(run, self):
-                    if isinstance(item, StrategyOutcome):
+                while True:
+                    strategy = current_cls(task.strategy.config)
+                    outcome = None
+                    iterator = strategy.execute(run, self).__aiter__()
+                    try:
+                        async for item in iterator:
+                            if isinstance(item, StrategyOutcome):
+                                if outcome is not None:
+                                    raise RuntimeError(
+                                        "strategy yielded more than one terminal outcome"
+                                    )
+                                outcome = item
+                                self._strategy_executions[
+                                    run.id
+                                ].terminal_outcome_seen = True
+                                continue
+                            if outcome is not None:
+                                raise RuntimeError(
+                                    "strategy yielded an event after its terminal outcome"
+                                )
+                            await self.bus.publish(item)
+                            # Re-run decomposition check after graph is first written
+                            if goals_path.exists() and (
+                                not hasattr(run, "decomposition_report")
+                                or not run.decomposition_report
+                            ):
+                                from horizonx.core.decomposition_checker import (
+                                    DecompositionChecker,
+                                )
+
+                                rpt = DecompositionChecker().check_file(goals_path, task)
+                                run.decomposition_report = rpt.to_dict()
+                    except StrategySwitchRequested as request:
+                        await iterator.aclose()
                         if outcome is not None:
-                            raise RuntimeError("strategy yielded more than one terminal outcome")
-                        outcome = item
+                            raise RuntimeError(
+                                "strategy requested a switch after terminal outcome"
+                            ) from request
+                        if request.run_id != run.id:
+                            raise RuntimeError(
+                                "strategy switch belongs to another run"
+                            ) from request
+                        target = self.pending_strategy_switch(run.id)
+                        if target != request.target:
+                            raise RuntimeError(
+                                "strategy switch request was not pending"
+                            ) from request
+                        next_cls = self._load_strategy(target)
+                        switch_event = Event(
+                            type="strategy.switched",
+                            run_id=run.id,
+                            payload={
+                                "from": current_kind,
+                                "to": target,
+                                "reason": "spin_detected",
+                            },
+                        )
+                        persisted_switch, owns_switch = await self._publish_strategy_switch(
+                            switch_event
+                        )
+                        if not owns_switch:
+                            return run
+                        durable_target = persisted_switch.payload.get("to")
+                        if not isinstance(durable_target, str) or not durable_target:
+                            raise RuntimeError(
+                                "durable strategy switch has no target"
+                            ) from request
+                        if durable_target != target:
+                            next_cls = self._load_strategy(durable_target)
+                            context = self._strategy_executions[run.id]
+                            context.requested = durable_target
+                        self._mark_strategy_switched(run, durable_target)
+                        current_kind = durable_target
+                        current_cls = next_cls
                         continue
-                    if outcome is not None:
-                        raise RuntimeError("strategy yielded an event after its terminal outcome")
-                    await self.bus.publish(item)
-                    # Re-run decomposition check after graph is first written
-                    if not goals_path.exists():
-                        pass
-                    elif not hasattr(run, "decomposition_report") or not run.decomposition_report:
-                        from horizonx.core.decomposition_checker import DecompositionChecker
-                        rpt = DecompositionChecker().check_file(goals_path, task)
-                        run.decomposition_report = rpt.to_dict()
+                    break
                 if outcome is None:
                     outcome = StrategyOutcome(
                         status=RunStatus.FAILED,
@@ -243,9 +317,74 @@ class Runtime:
                 )
                 raise
             finally:
+                self._end_strategy_execution(run.id)
                 self._recovery_contexts.pop(run.id, None)
                 await self.store.save_run(run)
         return run
+
+    async def _publish_strategy_switch(self, event: Event) -> tuple[Event, bool]:
+        """Atomically claim the one durable switch, then notify live subscribers."""
+        if isinstance(self.bus, DurableEventBus):
+            persisted = cast(Event, await self.store.append_event(event))
+            if persisted.id == event.id:
+                await self.bus.downstream.publish(persisted)
+            return persisted, persisted.id == event.id
+        await self.bus.publish(event)
+        return event, True
+
+    async def _begin_strategy_execution(self, run: Run, strategy: str) -> str:
+        switched_events = await self.store.list_events(
+            run.id, event_type="strategy.switched"
+        )
+        if switched_events:
+            target = switched_events[-1].payload.get("to")
+            if not isinstance(target, str) or not target:
+                raise RuntimeError("durable strategy switch has no target")
+            self._strategy_executions[run.id] = _StrategyExecution(
+                current=target, switched=True
+            )
+            return target
+        self._strategy_executions[run.id] = _StrategyExecution(current=strategy)
+        return strategy
+
+    def _end_strategy_execution(self, run_id: str) -> None:
+        self._strategy_executions.pop(run_id, None)
+
+    def pending_strategy_switch(self, run_id: str) -> str | None:
+        context = self._strategy_executions.get(run_id)
+        return context.requested if context is not None else None
+
+    async def request_strategy_switch(
+        self, run: Run, *, target: str | None = None
+    ) -> bool:
+        """Accept at most one distinct switch request during an active run."""
+        context = self._strategy_executions.get(run.id)
+        if (
+            context is None
+            or context.switched
+            or context.requested is not None
+            or context.terminal_outcome_seen
+        ):
+            return False
+        selected = target or run.task.spin_detection.switch_strategy_to
+        if selected is None:
+            selected = "sequential" if context.current == "single" else "single"
+        if selected == context.current:
+            return False
+        try:
+            self._load_strategy(selected)
+        except (ValueError, ImportError, AttributeError):
+            return False
+        context.requested = selected
+        return True
+
+    def _mark_strategy_switched(self, run: Run, target: str) -> None:
+        context = self._strategy_executions.get(run.id)
+        if context is None or context.requested != target or context.switched:
+            raise RuntimeError("strategy switch is not pending")
+        context.current = target
+        context.requested = None
+        context.switched = True
 
     async def _apply_final_validators(
         self, run: Run, outcome: StrategyOutcome

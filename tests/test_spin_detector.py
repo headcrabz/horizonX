@@ -370,3 +370,4 @@ class TestSpinDetectionConfigDefaults:
         assert cfg.bucketed_hash_soft_threshold == 3
         assert cfg.bucketed_hash_hard_threshold == 5
         assert cfg.bucketed_hash_window == 30
+        assert cfg.switch_strategy_to is None

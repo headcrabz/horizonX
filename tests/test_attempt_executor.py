@@ -448,6 +448,41 @@ async def test_hard_spin_detection_has_a_distinct_terminal_status(tmp_path: Path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "requests_switch"),
+    [
+        ("terminate_session_and_retry", False),
+        ("terminate_and_hitl", False),
+        ("switch_strategy", True),
+    ],
+)
+async def test_hard_spin_actions_remain_distinct(
+    tmp_path: Path, action: str, requests_switch: bool
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await store.save_run(run)
+    runtime.check_spin = AsyncMock(  # type: ignore[method-assign]
+        return_value=SpinReport(detected=True, layer="test", action=action)
+    )
+    runtime.request_strategy_switch = AsyncMock(  # type: ignore[method-assign]
+        return_value=False
+    )
+    try:
+        with patch(
+            "horizonx.core.attempt_executor.build_agent", return_value=_RepeatingAgent()
+        ):
+            result = await AttemptExecutor(runtime).execute(run, prompt="Do the work")
+
+        assert result.spin_action == action
+        assert runtime.request_strategy_switch.await_count == int(requests_switch)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_soft_spin_warning_does_not_mark_attempt_as_failed(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "horizonx.db")
     runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")

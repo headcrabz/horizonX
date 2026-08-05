@@ -13,6 +13,7 @@ from horizonx.agents.registry import build_agent
 from horizonx.core.attempt_result import AttemptResult
 from horizonx.core.event_bus import Event
 from horizonx.core.governor import BudgetExceeded
+from horizonx.core.strategy_switch import StrategySwitchRequested
 from horizonx.core.types import (
     AgentConfig,
     AttemptRecord,
@@ -467,7 +468,7 @@ class AttemptExecutor:
                     )
                 )
 
-        return AttemptResult(
+        attempt_result = AttemptResult(
             attempt=attempt,
             session=session,
             agent=result,
@@ -475,3 +476,11 @@ class AttemptExecutor:
             spin_detected=spin_detected,
             spin_action=spin_action,
         )
+        if spin_action == "switch_strategy":
+            accepted = await rt.request_strategy_switch(run)
+            if accepted:
+                target = rt.pending_strategy_switch(run.id)
+                if target is None:
+                    raise RuntimeError("accepted strategy switch has no target")
+                raise StrategySwitchRequested(run.id, target)
+        return attempt_result

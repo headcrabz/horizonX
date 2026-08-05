@@ -302,6 +302,14 @@ class SpinDetectionConfig(BaseModel):
     on_spin: Literal["terminate_and_retry", "terminate_and_hitl", "switch_strategy"] = (
         "terminate_and_hitl"
     )
+    switch_strategy_to: str | None = None
+
+    @field_validator("switch_strategy_to")
+    @classmethod
+    def _switch_target_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("switch strategy target must not be blank")
+        return value
 
 
 class HITLConfig(BaseModel):

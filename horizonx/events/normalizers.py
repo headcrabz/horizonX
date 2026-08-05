@@ -17,6 +17,11 @@ def _digest(value: Any) -> str | None:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def _content_digest(value: str | bytes) -> str:
+    encoded = value.encode() if isinstance(value, str) else value
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _category(name: str | None) -> str:
     lowered = (name or "").lower()
     if any(part in lowered for part in ("read", "glob", "grep", "list", "ls")):
@@ -51,14 +56,23 @@ def _arguments(content: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_step(step: Step) -> CanonicalEvent:
+def normalize_step(
+    step: Step, *, changed_file_digest: str | None = None
+) -> CanonicalEvent:
     """Derive stable fields without mutating the raw provider diagnostic payload."""
     content = step.content
     args = _arguments(content)
     tool_name = step.tool_name
+    changes = args.get("changes") or content.get("changes")
+    first_change = (
+        changes[0]
+        if isinstance(changes, list) and changes and isinstance(changes[0], dict)
+        else {}
+    )
     target = (
         args.get("file_path")
         or args.get("path")
+        or first_change.get("path")
         or args.get("command")
         or content.get("command")
     )
@@ -70,7 +84,7 @@ def normalize_step(step: Step) -> CanonicalEvent:
     usage = cast(
         dict[str, Any], content.get("usage") if isinstance(content.get("usage"), dict) else content
     )
-    changed = args.get("new_string") or args.get("new") or args.get("changes") or content.get("changes")
+    changed = args.get("new_string") or args.get("new") or changes
     error = content.get("error")
     category = _category(tool_name)
     return CanonicalEvent(
@@ -84,7 +98,12 @@ def normalize_step(step: Step) -> CanonicalEvent:
         target=str(target) if target is not None else None,
         result_digest=_digest(result),
         exit_status=content.get("exit_code"),
-        changed_file_digest=_digest(changed),
+        changed_file_digest=changed_file_digest
+        or (
+            _content_digest(changed)
+            if isinstance(changed, (str, bytes))
+            else _digest(changed)
+        ),
         error_classification="provider_error" if error or content.get("is_error") else None,
         provider_session_id=content.get("session_id"),
         tokens_in=usage.get("input_tokens"),

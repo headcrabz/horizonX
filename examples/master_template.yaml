@@ -367,6 +367,9 @@ spin_detection:
   # Action when spin is confirmed at hard threshold:
   # terminate_and_retry | terminate_and_hitl | switch_strategy
   on_spin: terminate_and_hitl          # default terminate_and_hitl
+  # Optional explicit handoff target for switch_strategy. When omitted, the
+  # runtime deterministically switches single→sequential and all others→single.
+  switch_strategy_to: null             # strategy kind or entry-point name
 
 
 # ---------------------------------------------------------------------------

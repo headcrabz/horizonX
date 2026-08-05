@@ -297,6 +297,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_run_sequence ON events(run_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_events_attempt_sequence ON events(attempt_id, sequence);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_one_strategy_switch
+    ON events(run_id) WHERE type='strategy.switched';
 
 CREATE TABLE IF NOT EXISTS leases (
     resource_id  TEXT PRIMARY KEY,
@@ -1904,6 +1906,11 @@ class SqliteStore:
                 ),
             )
             row = c.execute("SELECT * FROM events WHERE id=?", (event.id,)).fetchone()
+            if row is None and event.type == "strategy.switched":
+                row = c.execute(
+                    "SELECT * FROM events WHERE run_id=? AND type='strategy.switched'",
+                    (event.run_id,),
+                ).fetchone()
         if row is None:  # pragma: no cover - insert or existing row must be visible
             raise StoreError(f"event disappeared after append: {event.id}")
         return Event(

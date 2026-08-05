@@ -1,1 +1,8 @@
-{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-edit","name":"Edit","input":{"file_path":"app.py","old_string":"A","new_string":"B"}}]}}
+[
+  {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-edit-1","name":"Edit","input":{"file_path":"app.py","old_string":"B","new_string":"A"}}]}},
+  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-edit-1","content":"updated app.py","is_error":false}]}},
+  {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-edit-2","name":"Edit","input":{"file_path":"app.py","old_string":"A","new_string":"B"}}]}},
+  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-edit-2","content":"updated app.py","is_error":false}]}},
+  {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-edit-3","name":"Edit","input":{"file_path":"app.py","old_string":"B","new_string":"A"}}]}},
+  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-edit-3","content":"updated app.py","is_error":false}]}}
+]

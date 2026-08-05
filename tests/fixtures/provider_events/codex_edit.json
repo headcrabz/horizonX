@@ -1,1 +1,5 @@
-{"type":"item.started","item":{"id":"item-edit","type":"command_execution","command":"sed -i '' 's/A/B/' app.py"}}
+[
+  {"type":"item.completed","item":{"id":"item-edit-1","type":"file_change","changes":[{"path":"app.py","kind":"update"}],"status":"completed"}},
+  {"type":"item.completed","item":{"id":"item-edit-2","type":"file_change","changes":[{"path":"app.py","kind":"update"}],"status":"completed"}},
+  {"type":"item.completed","item":{"id":"item-edit-3","type":"file_change","changes":[{"path":"app.py","kind":"update"}],"status":"completed"}}
+]

@@ -35,6 +35,7 @@ EventType = Literal[
     "validator.failed",
     "validator.paused",
     "spin.detected",
+    "strategy.switched",
     "hitl.requested",
     "hitl.resolved",
     "budget.threshold",

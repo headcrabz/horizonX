@@ -1,0 +1,12 @@
+[
+  {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-read-1","name":"Read","input":{"file_path":"status.txt"}}]}},
+  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-read-1","content":"pending 1","is_error":false}]}},
+  {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-read-2","name":"Read","input":{"file_path":"status.txt"}}]}},
+  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-read-2","content":"pending 2","is_error":false}]}},
+  {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-read-3","name":"Read","input":{"file_path":"status.txt"}}]}},
+  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-read-3","content":"pending 3","is_error":false}]}},
+  {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-read-4","name":"Read","input":{"file_path":"status.txt"}}]}},
+  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-read-4","content":"pending 4","is_error":false}]}},
+  {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-read-5","name":"Read","input":{"file_path":"status.txt"}}]}},
+  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-read-5","content":"ready","is_error":false}]}}
+]
