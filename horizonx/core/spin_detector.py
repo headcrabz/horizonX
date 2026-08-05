@@ -225,12 +225,18 @@ class ToolThrashingLayer:
             and (event.result_digest or results.get(event.correlation_id or ""))
         ]
         if idempotent:
-            result_hashes = Counter(
-                event.result_digest or results.get(event.correlation_id or "")
+            operation_results = Counter(
+                (
+                    event.tool_name,
+                    event.category,
+                    event.target or json.dumps(event.arguments, sort_keys=True),
+                    event.result_digest or results.get(event.correlation_id or ""),
+                )
                 for _, event in idempotent
+                if not self._is_legitimate_poll(event)
             )
-            if result_hashes:
-                top_count = result_hashes.most_common(1)[0][1]
+            if operation_results:
+                top_count = operation_results.most_common(1)[0][1]
                 if top_count >= self.no_progress_threshold:
                     return SpinReport(
                         detected=True,
@@ -259,6 +265,14 @@ class ToolThrashingLayer:
                     )
 
         return SpinReport(detected=False, layer=self.name)
+
+    @staticmethod
+    def _is_legitimate_poll(event: CanonicalEvent) -> bool:
+        target = (event.target or "").lower()
+        return any(
+            marker in target
+            for marker in ("status", "health", "progress", "poll", "heartbeat")
+        )
 
 
 SEMANTIC_SPIN_SYSTEM = """\

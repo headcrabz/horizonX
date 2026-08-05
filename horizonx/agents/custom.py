@@ -85,6 +85,19 @@ class CustomAgent:
         self._output_format: str = extra.get("output_format", "text")
         self._extra_env: dict[str, str] = {str(k): str(v) for k, v in extra.get("env", {}).items()}
         self._timeout: float = float(extra.get("timeout", 1800.0))
+        self.supports_diagnostic_injection = self._prompt_mode == "stdin_control"
+        self._control_writer: asyncio.StreamWriter | None = None
+        self._control_lock = asyncio.Lock()
+
+    async def inject_diagnostic(self, diagnostic: str) -> bool:
+        if not self.supports_diagnostic_injection or self._control_writer is None:
+            return False
+        async with self._control_lock:
+            self._control_writer.write(
+                (json.dumps({"type": "diagnostic", "content": diagnostic}) + "\n").encode()
+            )
+            await self._control_writer.drain()
+        return True
 
     async def run_session(
         self,
@@ -108,6 +121,10 @@ class CustomAgent:
 
         if self._prompt_mode == "stdin":
             stdin_data = session_prompt.encode()
+        elif self._prompt_mode == "stdin_control":
+            stdin_data = (
+                json.dumps({"type": "prompt", "content": session_prompt}) + "\n"
+            ).encode()
         elif self._prompt_mode == "arg":
             cmd.append(session_prompt)
         elif self._prompt_mode == "env":
@@ -140,7 +157,10 @@ class CustomAgent:
         if stdin_data is not None and proc.stdin:
             proc.stdin.write(stdin_data)
             await proc.stdin.drain()
-            proc.stdin.close()
+            if self.supports_diagnostic_injection:
+                self._control_writer = proc.stdin
+            else:
+                proc.stdin.close()
 
         assert proc.stdout is not None
         seq = 0
@@ -201,6 +221,7 @@ class CustomAgent:
                 await stderr_task
                 raise
         finally:
+            self._control_writer = None
             watcher.cancel()
             await asyncio.gather(watcher, return_exceptions=True)
 

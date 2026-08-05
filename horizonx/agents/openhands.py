@@ -29,7 +29,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.agents.base import CancelToken, DiagnosticInjectionUnsupported, Workspace
 from horizonx.core.types import AgentConfig, SessionRunResult, SessionStatus, Step, StepType
 from horizonx.security.environment_policy import build_child_environment, redact_secrets
 from horizonx.security.process import drain_stream, spawn_process, terminate_process_tree
@@ -37,7 +37,7 @@ from horizonx.security.process import drain_stream, spawn_process, terminate_pro
 logger = logging.getLogger(__name__)
 
 
-class OpenHandsAgent:
+class OpenHandsAgent(DiagnosticInjectionUnsupported):
     name = "openhands"
 
     def __init__(self, config: AgentConfig):

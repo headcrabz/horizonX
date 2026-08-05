@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -9,7 +10,11 @@ import pytest
 
 from horizonx.agents.base import CancelToken, Workspace
 from horizonx.agents.custom import CustomAgent
-from horizonx.core.types import AgentConfig, SessionStatus, StepType
+from horizonx.core.types import AgentConfig, SessionStatus, Step, StepType
+
+
+async def _append_step(steps: list[Step], step: Step) -> None:
+    steps.append(step)
 
 
 def _cfg(extra: dict) -> AgentConfig:
@@ -58,6 +63,48 @@ class TestCustomAgentInit:
 
 
 class TestCustomAgentRun:
+    @pytest.mark.asyncio
+    async def test_stdin_control_delivers_diagnostic_to_live_subprocess(
+        self, tmp_path: Path
+    ) -> None:
+        import sys
+
+        from horizonx.agents.base import Workspace
+
+        script = (
+            "import json,sys; "
+            "json.loads(sys.stdin.readline()); "
+            "print(json.dumps({'type':'thought','content':{'text':'ready'}}), flush=True); "
+            "message=json.loads(sys.stdin.readline()); "
+            "print(json.dumps({'type':'thought','content':message}), flush=True)"
+        )
+        agent = CustomAgent(
+            AgentConfig(
+                type="custom",
+                model="test",
+                extra={
+                    "command": [sys.executable, "-u", "-c", script],
+                    "prompt_mode": "stdin_control",
+                    "output_format": "jsonl",
+                },
+            )
+        )
+        steps: list[Step] = []
+        task = asyncio.create_task(
+            agent.run_session(
+                "work",
+                Workspace(path=tmp_path, env={}),
+                on_step=lambda step: _append_step(steps, step),
+            )
+        )
+        for _ in range(100):
+            if steps:
+                break
+            await asyncio.sleep(0.01)
+        assert await agent.inject_diagnostic("change approach") is True
+        result = await asyncio.wait_for(task, timeout=5)
+        assert result.status == SessionStatus.COMPLETED
+        assert any(step.content.get("content") == "change approach" for step in steps)
     @pytest.mark.asyncio
     async def test_text_output_becomes_thought_steps(self, tmp_path: Path):
         steps: list = []

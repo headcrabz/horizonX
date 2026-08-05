@@ -28,7 +28,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from horizonx.agents.base import CancelToken, Workspace, stream_subprocess_jsonl
+from horizonx.agents.base import (
+    CancelToken,
+    DiagnosticInjectionUnsupported,
+    Workspace,
+    stream_subprocess_jsonl,
+)
 from horizonx.core.types import (
     AgentConfig,
     SessionRunResult,
@@ -76,7 +81,7 @@ class CodexConfig:
         )
 
 
-class CodexAgent:
+class CodexAgent(DiagnosticInjectionUnsupported):
     """Validated Codex CLI driver."""
 
     name = "codex"

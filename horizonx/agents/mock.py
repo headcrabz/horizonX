@@ -28,7 +28,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.agents.base import CancelToken, DiagnosticInjectionUnsupported, Workspace
 from horizonx.core.types import (
     AgentConfig,
     SessionRunResult,
@@ -38,7 +38,7 @@ from horizonx.core.types import (
 )
 
 
-class MockAgent:
+class MockAgent(DiagnosticInjectionUnsupported):
     name = "mock"
 
     def __init__(

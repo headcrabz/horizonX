@@ -8,11 +8,11 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.agents.base import CancelToken, DiagnosticInjectionUnsupported, Workspace
 from horizonx.core.types import SessionRunResult, SessionStatus, Step
 
 
-class SDKAgent:
+class SDKAgent(DiagnosticInjectionUnsupported):
     """Wraps a Python async generator as a HorizonX agent.
 
     The callable receives (prompt: str, workspace_path: Path) and must yield

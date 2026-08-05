@@ -742,6 +742,20 @@ class SqliteStore:
         """Set a terminal status once; later terminal writes preserve the first result."""
         return await self._run_sync(self._sync_transition_run, run_id, to_status)
 
+    def _sync_pause_run(self, run_id: str) -> Run:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE runs SET status='paused_hitl', completed_at=NULL "
+                "WHERE id=? AND status NOT IN "
+                "('completed', 'failed', 'aborted', 'timed_out', 'budget_exceeded')",
+                (run_id,),
+            )
+        return self._sync_load_run(run_id)
+
+    async def pause_run(self, run_id: str) -> Run:
+        """Atomically pause a nonterminal run while preserving terminal winners."""
+        return await self._run_sync(self._sync_pause_run, run_id)
+
     def _sync_load_run(self, run_id: str) -> Run:
         from horizonx.core.types import CumulativeMetrics, RunStatus, Task
 

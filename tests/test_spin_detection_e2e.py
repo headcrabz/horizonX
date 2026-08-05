@@ -54,6 +54,36 @@ async def test_repeated_polling_with_distinct_result_digests_is_not_thrashing() 
     assert not report.detected
 
 
+@pytest.mark.asyncio
+async def test_same_static_output_from_different_targets_is_not_grouped_globally() -> None:
+    store = MagicMock()
+    store.recent_steps = AsyncMock(
+        return_value=[
+            _canonical_step(i, category="read", target=f"file-{i}.txt", result="same")
+            for i in range(5)
+        ]
+    )
+    report = await ToolThrashingLayer(no_progress_threshold=5).check(
+        Session(run_id="r1", sequence_index=0), store
+    )
+    assert not report.detected
+
+
+@pytest.mark.asyncio
+async def test_unchanged_status_poll_is_recognized_as_legitimate() -> None:
+    store = MagicMock()
+    store.recent_steps = AsyncMock(
+        return_value=[
+            _canonical_step(i, category="read", target="/status", result="pending")
+            for i in range(5)
+        ]
+    )
+    report = await ToolThrashingLayer(no_progress_threshold=5).check(
+        Session(run_id="r1", sequence_index=0), store
+    )
+    assert not report.detected
+
+
 async def _record_edit_fixture(
     tmp_path: Path, fixture_name: str, agent: object
 ) -> tuple[list[Step], bool]:
@@ -113,7 +143,9 @@ async def test_provider_edit_fixtures_have_equivalent_persisted_a_to_b_to_a_dige
         return [
             (step.canonical["target"], step.canonical["changed_file_digest"])
             for step in steps
-            if step.canonical and step.canonical["category"] == "edit"
+            if step.canonical
+            and step.canonical["category"] == "edit"
+            and step.canonical["changed_file_digest"] is not None
         ]
 
     assert semantics(claude_steps) == semantics(codex_steps)
@@ -122,7 +154,50 @@ async def test_provider_edit_fixtures_have_equivalent_persisted_a_to_b_to_a_dige
 
 
 @pytest.mark.asyncio
-async def test_fixture_driven_repeated_reads_with_progress_do_not_trigger_spin(
+async def test_failed_claude_edit_does_not_record_requested_content_as_applied(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "failed-edit.db")
+    workspace = tmp_path / "failed-edit"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("A")
+    run = Run(task=Task(id="e", name="e", prompt="e", strategy=StrategyConfig(kind="single"), agent=AgentConfig(type="mock", model="mock")), workspace_path=workspace)
+    session = Session(id="s", run_id=run.id, sequence_index=0)
+    await store.save_run(run)
+    await store.save_session(session)
+    recorder = TrajectoryRecorder(store, InMemoryBus())
+    agent = ClaudeCodeAgent(ClaudeCodeConfig())
+    events = [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "edit-fail", "name": "Edit", "input": {"file_path": "app.py", "old_string": "A", "new_string": "B"}}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "edit-fail", "content": "old text not found", "is_error": True}]}},
+    ]
+    try:
+        sequence = 0
+        for raw in events:
+            for step in agent._event_to_steps(raw, sequence, session.id):
+                step.sequence = sequence
+                await recorder.record(session, step)
+                sequence += 1
+        steps = await store.recent_steps(session.id, 10)
+        assert all(
+            not step.canonical or step.canonical["changed_file_digest"] is None
+            for step in steps
+        )
+        assert not (await EditRevertLayer().check(session, store)).detected
+    finally:
+        await store.close()
+
+
+def test_interrupted_session_discards_pending_edit_correlations() -> None:
+    recorder = TrajectoryRecorder(MagicMock(), InMemoryBus())
+    recorder._pending_edits[("interrupted", "tool-1")] = "app.py"
+    recorder._pending_edits[("active", "tool-2")] = "other.py"
+    recorder.discard_pending_edits("interrupted")
+    assert recorder._pending_edits == {("active", "tool-2"): "other.py"}
+
+
+@pytest.mark.asyncio
+async def test_fixture_driven_unchanged_status_poll_does_not_trigger_spin(
     tmp_path: Path,
 ) -> None:
     fixture = Path(__file__).parent / "fixtures" / "provider_events" / "claude_reads.json"

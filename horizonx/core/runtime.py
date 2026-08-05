@@ -17,7 +17,7 @@ from horizonx.core.event_bus import DurableEventBus, Event, EventBus, InMemoryBu
 from horizonx.core.governor import BudgetExceeded, ResourceGovernor
 from horizonx.core.recorder import TrajectoryRecorder
 from horizonx.core.spin_detector import CrossSessionSpinLayer, SpinDetector
-from horizonx.core.strategy_switch import StrategySwitchRequested
+from horizonx.core.strategy_switch import SpinControlRequested, StrategySwitchRequested
 from horizonx.core.summarizer import Summarizer
 from horizonx.core.types import (
     TERMINAL_RUN_STATUSES,
@@ -57,6 +57,7 @@ class _StrategyExecution:
     requested: str | None = None
     switched: bool = False
     terminal_outcome_seen: bool = False
+    retry_used: bool = False
 
 
 class Runtime:
@@ -268,6 +269,21 @@ class Runtime:
                         current_kind = durable_target
                         current_cls = next_cls
                         continue
+                    except SpinControlRequested as request:
+                        await iterator.aclose()
+                        if request.run_id != run.id or outcome is not None:
+                            raise RuntimeError("invalid post-attempt spin control") from request
+                        if request.action == "terminate_session_and_retry":
+                            self._strategy_executions[
+                                run.id
+                            ].terminal_outcome_seen = False
+                            continue
+                        if request.action == "terminate_and_hitl":
+                            await self._pause_run_for_spin(run)
+                            return run
+                        raise RuntimeError(
+                            f"unsupported spin control {request.action}"
+                        ) from request
                     break
                 if outcome is None:
                     outcome = StrategyOutcome(
@@ -331,6 +347,30 @@ class Runtime:
             return persisted, persisted.id == event.id
         await self.bus.publish(event)
         return event, True
+
+    async def _pause_run_for_spin(self, run: Run) -> None:
+        persisted = await self.store.pause_run(run.id)
+        run.status = persisted.status
+        run.completed_at = persisted.completed_at
+        if run.status == RunStatus.PAUSED_HITL:
+            await self.bus.publish(
+                Event(
+                    type="run.paused_hitl",
+                    run_id=run.id,
+                    payload={"status": run.status.value, "reason": "spin_detected"},
+                )
+            )
+
+    async def request_spin_control(self, run: Run, action: str) -> bool:
+        context = self._strategy_executions.get(run.id)
+        if context is None or context.terminal_outcome_seen:
+            return False
+        if action == "terminate_session_and_retry":
+            if context.retry_used:
+                return False
+            context.retry_used = True
+            return True
+        return action == "terminate_and_hitl"
 
     async def _begin_strategy_execution(self, run: Run, strategy: str) -> str:
         switched_events = await self.store.list_events(

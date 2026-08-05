@@ -13,7 +13,7 @@ from horizonx.agents.registry import build_agent
 from horizonx.core.attempt_result import AttemptResult
 from horizonx.core.event_bus import Event
 from horizonx.core.governor import BudgetExceeded
-from horizonx.core.strategy_switch import StrategySwitchRequested
+from horizonx.core.strategy_switch import SpinControlRequested, StrategySwitchRequested
 from horizonx.core.types import (
     AgentConfig,
     AttemptRecord,
@@ -217,16 +217,24 @@ class AttemptExecutor:
                 report = await rt.check_spin(session, run)
                 if report and report.detected:
                     if report.action == "warn_and_inject_diagnostic":
+                        injected = False
                         injector = getattr(agent, "inject_diagnostic", None)
-                        if callable(injector):
-                            injected = injector(
+                        if getattr(agent, "supports_diagnostic_injection", False) and callable(injector):
+                            delivered = injector(
                                 f"Spin warning from {report.layer}: change approach and avoid repeating the last action."
                             )
-                            if inspect.isawaitable(injected):
-                                await injected
+                            injected = bool(
+                                await delivered
+                                if inspect.isawaitable(delivered)
+                                else delivered
+                            )
                         await rt.bus.publish(
                             Event(
-                                type="session.spin_nudge",
+                                type=(
+                                    "session.spin_nudge"
+                                    if injected
+                                    else "session.spin_nudge_unsupported"
+                                ),
                                 run_id=run.id,
                                 attempt_id=attempt.id,
                                 session_id=session.id,
@@ -429,6 +437,7 @@ class AttemptExecutor:
                         "error": f"cleanup failed: {'; '.join(cleanup_errors)}",
                     }
                 )
+            rt.recorder.discard_pending_edits(session.id)
             await rt.end_session(session, result.status)
             attempt_status = (
                 AttemptStatus.COMPLETED
@@ -483,4 +492,7 @@ class AttemptExecutor:
                 if target is None:
                     raise RuntimeError("accepted strategy switch has no target")
                 raise StrategySwitchRequested(run.id, target)
+        elif spin_action in {"terminate_session_and_retry", "terminate_and_hitl"}:
+            if await rt.request_spin_control(run, spin_action):
+                raise SpinControlRequested(run.id, spin_action)
         return attempt_result

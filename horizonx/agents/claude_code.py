@@ -27,7 +27,12 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from horizonx.agents.base import CancelToken, Workspace, stream_subprocess_jsonl
+from horizonx.agents.base import (
+    CancelToken,
+    DiagnosticInjectionUnsupported,
+    Workspace,
+    stream_subprocess_jsonl,
+)
 from horizonx.core.types import (
     AgentConfig,
     SessionRunResult,
@@ -92,7 +97,7 @@ def _thinking_to_effort(thinking_budget: int | None) -> str | None:
     return "xhigh"
 
 
-class ClaudeCodeAgent:
+class ClaudeCodeAgent(DiagnosticInjectionUnsupported):
     """Validated Claude Code CLI driver.
 
     Honors prompt caching (visible in usage events), captures TodoWrite events

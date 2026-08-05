@@ -375,11 +375,14 @@ async def test_cleanup_failure_prevents_false_completion(tmp_path: Path) -> None
 
 
 class _RepeatingAgent:
+    supports_diagnostic_injection = True
+
     def __init__(self) -> None:
         self.diagnostics: list[str] = []
 
-    async def inject_diagnostic(self, diagnostic: str) -> None:
+    async def inject_diagnostic(self, diagnostic: str) -> bool:
         self.diagnostics.append(diagnostic)
+        return True
 
     async def run_session(self, *, on_step, cancel_token, **kwargs):  # type: ignore[no-untyped-def]
         for sequence in range(6):
@@ -506,6 +509,65 @@ async def test_soft_spin_warning_does_not_mark_attempt_as_failed(tmp_path: Path)
         assert result.status == SessionStatus.COMPLETED
         assert result.spin_detected is False
         assert agent.diagnostics
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_soft_spin_truthfully_reports_unsupported_injection(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await store.save_run(run)
+    runtime.check_spin = AsyncMock(  # type: ignore[method-assign]
+        return_value=SpinReport(
+            detected=True,
+            layer="within_session",
+            action="warn_and_inject_diagnostic",
+        )
+    )
+    agent = _RepeatingAgent()
+    agent.supports_diagnostic_injection = False
+    try:
+        with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
+            result = await AttemptExecutor(runtime).execute(run, prompt="work")
+        assert result.status == SessionStatus.COMPLETED
+        assert not agent.diagnostics
+        assert len(
+            await store.list_events(
+                run.id, event_type="session.spin_nudge_unsupported"
+            )
+        ) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_attempt_finalization_clears_edit_without_tool_result(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await store.save_run(run)
+    agent = MockAgent(
+        steps=[
+            {
+                "type": "tool_call",
+                "tool_name": "Edit",
+                "content": {
+                    "input": {"file_path": "app.py", "new_string": "B"},
+                    "tool_use_id": "abandoned-edit",
+                },
+            }
+        ],
+        status=SessionStatus.ERRORED,
+    )
+    try:
+        with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
+            result = await AttemptExecutor(runtime).execute(run, prompt="work")
+        assert result.status == SessionStatus.ERRORED
+        assert runtime.recorder._pending_edits == {}
     finally:
         await store.close()
 

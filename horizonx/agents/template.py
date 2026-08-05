@@ -14,11 +14,11 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from horizonx.agents.base import CancelToken, Workspace
+from horizonx.agents.base import CancelToken, DiagnosticInjectionUnsupported, Workspace
 from horizonx.core.types import SessionRunResult, Step
 
 
-class TemplateAgent:
+class TemplateAgent(DiagnosticInjectionUnsupported):
     """Minimal agent driver — replace with your implementation."""
 
     name = "template"

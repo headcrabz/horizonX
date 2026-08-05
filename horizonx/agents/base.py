@@ -39,6 +39,11 @@ class BaseAgent(Protocol):
     """Driver protocol. Implement run_session and you get all observability free."""
 
     name: str
+    supports_diagnostic_injection: bool
+
+    async def inject_diagnostic(self, diagnostic: str) -> bool:
+        """Deliver guidance to an active session, returning whether it was sent."""
+        ...
 
     async def run_session(
         self,
@@ -55,6 +60,15 @@ class BaseAgent(Protocol):
         agent_session_id (for Claude Code / Codex resume) and status.
         """
         ...
+
+
+class DiagnosticInjectionUnsupported:
+    """Truthful default for adapters without an active steering channel."""
+
+    supports_diagnostic_injection = False
+
+    async def inject_diagnostic(self, diagnostic: str) -> bool:
+        return False
 
 
 # ---------------------------------------------------------------------------

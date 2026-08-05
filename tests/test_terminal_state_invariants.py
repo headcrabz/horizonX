@@ -121,6 +121,22 @@ class _ConcurrentSwitchStrategy:
         yield StrategyOutcome(status=RunStatus.FAILED)  # pragma: no cover
 
 
+class _AttemptBackedStrategy:
+    executions = 0
+
+    def __init__(self, config: dict[str, object]) -> None:
+        pass
+
+    async def execute(self, run: Run, rt: Runtime):  # type: ignore[no-untyped-def]
+        from horizonx.core.attempt_executor import AttemptExecutor
+
+        type(self).executions += 1
+        attempt = await AttemptExecutor(rt).execute(run, prompt="work")
+        yield StrategyOutcome(
+            status=RunStatus.COMPLETED if attempt.succeeded else RunStatus.FAILED
+        )
+
+
 @pytest.mark.asyncio
 async def test_strategy_failure_remains_failed_after_runtime_teardown(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "horizonx.db")
@@ -543,6 +559,76 @@ async def test_switch_after_source_terminal_outcome_is_rejected(tmp_path: Path) 
         assert terminal == ["run.completed"]
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_retries_same_strategy_once_after_hard_spin(tmp_path: Path) -> None:
+    from horizonx.core.types import SpinReport
+    from tests.test_attempt_executor import _RepeatingAgent
+
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    task = _task()
+    reports = [
+        SpinReport(detected=True, layer="loop", action="terminate_session_and_retry"),
+        None,
+    ]
+    runtime.check_spin = AsyncMock(side_effect=reports)  # type: ignore[method-assign]
+    _AttemptBackedStrategy.executions = 0
+    try:
+        with (
+            patch.object(runtime, "_load_strategy", return_value=_AttemptBackedStrategy),
+            patch("horizonx.core.attempt_executor.build_agent", return_value=_RepeatingAgent()),
+        ):
+            run = await runtime.run(task)
+        assert run.status == RunStatus.COMPLETED
+        assert _AttemptBackedStrategy.executions == 2
+        assert len(await store.list_attempts(run.id)) == 2
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_pauses_for_hitl_after_hard_spin(tmp_path: Path) -> None:
+    from horizonx.core.types import SpinReport
+    from tests.test_attempt_executor import _RepeatingAgent
+
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    runtime.check_spin = AsyncMock(  # type: ignore[method-assign]
+        return_value=SpinReport(detected=True, layer="loop", action="terminate_and_hitl")
+    )
+    try:
+        with (
+            patch.object(runtime, "_load_strategy", return_value=_AttemptBackedStrategy),
+            patch("horizonx.core.attempt_executor.build_agent", return_value=_RepeatingAgent()),
+        ):
+            run = await runtime.run(_task())
+        assert run.status == RunStatus.PAUSED_HITL
+        assert run.completed_at is None
+        assert len(await store.list_attempts(run.id)) == 1
+        assert len(await store.list_events(run.id, event_type="run.paused_hitl")) == 1
+        assert not [
+            event for event in await store.list_events(run.id)
+            if event.type in {"run.completed", "run.failed"}
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_spin_pause_does_not_publish_after_concurrent_terminalization(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    stale = Run(task=_task(), status=RunStatus.RUNNING, workspace_path=tmp_path)
+    await store.save_run(stale)
+    await store.transition_run(stale.id, RunStatus.COMPLETED)
+    await runtime._pause_run_for_spin(stale)
+    assert stale.status == RunStatus.COMPLETED
+    assert await store.list_events(stale.id, event_type="run.paused_hitl") == []
+    await store.close()
 
 
 @pytest.mark.asyncio

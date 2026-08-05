@@ -21,12 +21,52 @@ class TrajectoryRecorder:
     def __init__(self, store: Any, bus: EventBus):
         self.store = store
         self.bus = bus
+        self._pending_edits: dict[tuple[str, str], str] = {}
+
+    def discard_pending_edits(self, session_id: str) -> None:
+        self._pending_edits = {
+            key: target
+            for key, target in self._pending_edits.items()
+            if key[0] != session_id
+        }
 
     async def record(self, session: Session, step: Step) -> None:
-        changed_file_digest = await self._changed_file_digest(session, step)
-        step.canonical = normalize_step(
-            step, changed_file_digest=changed_file_digest
-        ).model_dump(mode="json")
+        preliminary = normalize_step(step)
+        correlation = preliminary.correlation_id
+        is_edit_request = (
+            step.type == StepType.TOOL_CALL
+            and preliminary.category == "edit"
+            and correlation is not None
+            and preliminary.target is not None
+        )
+        if is_edit_request:
+            assert correlation is not None
+            assert preliminary.target is not None
+            self._pending_edits[(session.id, correlation)] = preliminary.target
+        pending_target = (
+            self._pending_edits.pop((session.id, correlation), None)
+            if step.type == StepType.OBSERVATION and correlation is not None
+            else None
+        )
+        changed_file_digest = await self._changed_file_digest(
+            session, step, target_override=pending_target
+        )
+        canonical = normalize_step(
+            step,
+            changed_file_digest=changed_file_digest,
+            include_declared_change=not is_edit_request,
+        )
+        if pending_target is not None:
+            canonical = canonical.model_copy(
+                update={
+                    "category": "edit",
+                    "target": pending_target,
+                    "changed_file_digest": (
+                        None if step.content.get("is_error") else changed_file_digest
+                    ),
+                }
+            )
+        step.canonical = canonical.model_dump(mode="json")
         await self._append_jsonl(session, step)
         await self.store.save_step(step)
         await self.bus.publish(
@@ -43,15 +83,15 @@ class TrajectoryRecorder:
         )
 
     async def _changed_file_digest(
-        self, session: Session, step: Step
+        self, session: Session, step: Step, *, target_override: str | None = None
     ) -> str | None:
         """Snapshot a provider-reported edit from the run workspace when available."""
         event = normalize_step(step)
-        if step.type != StepType.FILE_CHANGE or event.target is None:
+        if step.type != StepType.FILE_CHANGE and target_override is None:
             return None
         run = await self.store.load_run(session.run_id)
         workspace = Path(run.workspace_path).resolve()
-        candidate = (workspace / event.target).resolve()
+        candidate = (workspace / (target_override or event.target or "")).resolve()
         try:
             candidate.relative_to(workspace)
         except ValueError:

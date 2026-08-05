@@ -57,7 +57,10 @@ def _arguments(content: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_step(
-    step: Step, *, changed_file_digest: str | None = None
+    step: Step,
+    *,
+    changed_file_digest: str | None = None,
+    include_declared_change: bool = True,
 ) -> CanonicalEvent:
     """Derive stable fields without mutating the raw provider diagnostic payload."""
     content = step.content
@@ -84,7 +87,11 @@ def normalize_step(
     usage = cast(
         dict[str, Any], content.get("usage") if isinstance(content.get("usage"), dict) else content
     )
-    changed = args.get("new_string") or args.get("new") or changes
+    changed = (
+        args.get("new_string") or args.get("new") or changes
+        if include_declared_change
+        else None
+    )
     error = content.get("error")
     category = _category(tool_name)
     return CanonicalEvent(

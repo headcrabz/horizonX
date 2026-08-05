@@ -11,12 +11,25 @@ import pytest
 
 from horizonx.agents.claude_code import ClaudeCodeAgent, ClaudeCodeConfig
 from horizonx.agents.codex import CodexAgent, CodexConfig
+from horizonx.agents.registry import build_agent
 from horizonx.core.types import AgentConfig, StepType
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_type", ["claude_code", "codex", "openhands", "mock", "sdk", "custom"])
+async def test_all_builtin_agents_implement_diagnostic_capability(agent_type: str) -> None:
+    extra = {"command": ["true"]} if agent_type == "custom" else {}
+    agent = build_agent(AgentConfig(type=agent_type, model="test", extra=extra))
+    assert agent.supports_diagnostic_injection is False
+    assert await agent.inject_diagnostic("change approach") is False
 
 
 class TestClaudeCodeEventParsing:
     def setup_method(self):
         self.agent = ClaudeCodeAgent(ClaudeCodeConfig())
+
+    def test_truthfully_declares_diagnostic_injection_unsupported(self):
+        assert self.agent.supports_diagnostic_injection is False
 
     def test_system_init(self):
         event = {
@@ -230,6 +243,9 @@ class TestClaudeCodeUsageAccumulation:
 class TestCodexEventParsing:
     def setup_method(self):
         self.agent = CodexAgent(CodexConfig())
+
+    def test_truthfully_declares_diagnostic_injection_unsupported(self):
+        assert self.agent.supports_diagnostic_injection is False
 
     def test_thread_started(self):
         event = {"type": "thread.started", "thread_id": "uuid-123"}
