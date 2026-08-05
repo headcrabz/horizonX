@@ -131,10 +131,12 @@ class AttemptExecutor:
         cancel_token = CancelToken()
         decisions: list[GateDecision] = []
         spin_detected = False
+        spin_action: str | None = None
         streamed_tokens = 0
         result: SessionRunResult | None = None
         limits = run.task.resources
         watchdog: StallWatchdog | None = None
+        agent: Any | None = None
         if limits.stall_soft_seconds > 0 and limits.stall_hard_seconds > 0:
             watchdog = StallWatchdog(
                 soft_seconds=limits.stall_soft_seconds,
@@ -150,7 +152,7 @@ class AttemptExecutor:
             )
 
         async def on_step(step: Step) -> None:
-            nonlocal spin_detected, streamed_tokens
+            nonlocal spin_detected, spin_action, streamed_tokens
             if watchdog is not None:
                 watchdog.notify_activity()
             step.session_id = session.id
@@ -214,6 +216,13 @@ class AttemptExecutor:
                 report = await rt.check_spin(session, run)
                 if report and report.detected:
                     if report.action == "warn_and_inject_diagnostic":
+                        injector = getattr(agent, "inject_diagnostic", None)
+                        if callable(injector):
+                            injected = injector(
+                                f"Spin warning from {report.layer}: change approach and avoid repeating the last action."
+                            )
+                            if inspect.isawaitable(injected):
+                                await injected
                         await rt.bus.publish(
                             Event(
                                 type="session.spin_nudge",
@@ -226,6 +235,7 @@ class AttemptExecutor:
                         )
                     else:
                         spin_detected = True
+                        spin_action = report.action
                         cancel_token.cancel(reason=f"spin:{report.layer}")
             if session.steps_count >= run.task.resources.max_steps_per_session:
                 cancel_token.cancel(reason="session_step_limit")
@@ -463,4 +473,5 @@ class AttemptExecutor:
             agent=result,
             decisions=decisions,
             spin_detected=spin_detected,
+            spin_action=spin_action,
         )

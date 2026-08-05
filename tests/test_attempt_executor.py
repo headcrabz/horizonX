@@ -375,6 +375,12 @@ async def test_cleanup_failure_prevents_false_completion(tmp_path: Path) -> None
 
 
 class _RepeatingAgent:
+    def __init__(self) -> None:
+        self.diagnostics: list[str] = []
+
+    async def inject_diagnostic(self, diagnostic: str) -> None:
+        self.diagnostics.append(diagnostic)
+
     async def run_session(self, *, on_step, cancel_token, **kwargs):  # type: ignore[no-untyped-def]
         for sequence in range(6):
             await on_step(
@@ -458,13 +464,13 @@ async def test_soft_spin_warning_does_not_mark_attempt_as_failed(tmp_path: Path)
         )
     )
     try:
-        with patch(
-            "horizonx.core.attempt_executor.build_agent", return_value=_RepeatingAgent()
-        ):
+        agent = _RepeatingAgent()
+        with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
             result = await AttemptExecutor(runtime).execute(run, prompt="Do the work")
 
         assert result.status == SessionStatus.COMPLETED
         assert result.spin_detected is False
+        assert agent.diagnostics
     finally:
         await store.close()
 

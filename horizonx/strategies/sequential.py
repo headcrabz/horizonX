@@ -242,10 +242,13 @@ class SequentialSubgoals:
                 ),
             )
 
+        if spin_cancelled and attempt.spin_action == "terminate_session_and_retry":
+            return False, final_validated, None
+
         if spin_cancelled or any_pause:
             ctx = {
                 "goal_id": goal.id,
-                "spin_reason": "spin_detected" if spin_cancelled else None,
+                "spin_reason": attempt.spin_action if spin_cancelled else None,
                 "validator_decisions": [d.model_dump() for d in decisions],
             }
             decision = await rt.request_hitl(run, reason="validator_or_spin", context=ctx)

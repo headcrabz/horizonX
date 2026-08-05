@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from horizonx.agents.claude_code import ClaudeCodeAgent, ClaudeCodeConfig
+from horizonx.agents.codex import CodexAgent, CodexConfig
 from horizonx.core.recorder import TrajectoryRecorder
 from horizonx.core.types import Session, Step, StepType
 from horizonx.events.normalizers import normalize_step
@@ -72,3 +76,23 @@ async def test_recorder_persists_canonical_event_alongside_raw_provider_payload(
     assert step.content["command"] == "pytest -q"
     assert step.canonical is not None
     assert step.canonical["tool_name"] == "shell"
+
+
+@pytest.mark.asyncio
+async def test_recorded_provider_fixtures_flow_through_adapter_and_recorder() -> None:
+    fixtures = Path(__file__).parent / "fixtures" / "provider_events"
+    claude_event = json.loads((fixtures / "claude_edit.json").read_text())
+    codex_event = json.loads((fixtures / "codex_edit.json").read_text())
+    claude_step = ClaudeCodeAgent(ClaudeCodeConfig())._event_to_steps(claude_event, 0, "s1")[0]
+    codex_step = CodexAgent(CodexConfig())._event_to_steps(codex_event, 0, "s1")[0]
+    store = MagicMock()
+    store.save_step = AsyncMock()
+    bus = MagicMock()
+    bus.publish = AsyncMock()
+    recorder = TrajectoryRecorder(store, bus)
+    recorder._append_jsonl = AsyncMock()  # type: ignore[method-assign]
+    session = Session(id="s1", run_id="r1", sequence_index=0)
+    await recorder.record(session, claude_step)
+    await recorder.record(session, codex_step)
+    assert claude_step.canonical and claude_step.canonical["category"] == "edit"
+    assert codex_step.canonical and codex_step.canonical["category"] == "execute"

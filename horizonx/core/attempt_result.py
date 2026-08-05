@@ -19,6 +19,7 @@ class AttemptResult(BaseModel):
     agent: SessionRunResult
     decisions: list[GateDecision] = Field(default_factory=list)
     spin_detected: bool = False
+    spin_action: str | None = None
 
     @property
     def status(self) -> SessionStatus:

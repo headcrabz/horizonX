@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import os
 import sqlite3
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -148,8 +149,9 @@ async def test_legacy_zero_cost_usage_migrates_as_unknown(tmp_path: Path) -> Non
         )
         conn.execute(
             "INSERT INTO workspace_usage VALUES "
-            "('usage-legacy', 'workspace-legacy', 'run-codex', date('now'), "
-            "100, 50, 0.0, datetime('now'))"
+            "('usage-legacy', 'workspace-legacy', 'run-codex', ?, "
+            "100, 50, 0.0, datetime('now'))",
+            (str(date.today()),),
         )
         conn.execute("DROP TABLE workspace_usage_v3")
 
