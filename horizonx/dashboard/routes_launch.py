@@ -1,25 +1,32 @@
 from __future__ import annotations
 
-import asyncio
 import os
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ValidationError
 
 from horizonx.core.leases import LeaseManager
+from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.runtime import Runtime
-from horizonx.core.types import Run, RunStatus
+from horizonx.core.types import TERMINAL_RUN_STATUSES, Run, RunStatus
 from horizonx.storage.sqlite import SqliteStore
 
 from .deps import get_runtime, get_store
+from .routes_hitl import _authenticate_operator
 
 router = APIRouter()
 
 
 class LaunchBody(BaseModel):
     task: dict[str, Any]
+
+
+class OperatorCommandBody(BaseModel):
+    kind: Literal["cancel", "steer"]
+    reason: str = ""
+    instruction: str = ""
 
 
 @router.post("/runs", status_code=202)
@@ -66,28 +73,91 @@ async def launch_run(
 
     # Fire strategy execution in background; resume_from causes runtime to reload
     # the pre-created run from the store and start it
-    asyncio.create_task(_run_and_cleanup(run.id), name=f"run-{run.id}")
+    runtime.start_background_run(
+        run.id, _run_and_cleanup(run.id), name=f"run-{run.id}"
+    )
 
     return {"run_id": run.id}
+
+
+@router.post("/runs/{run_id}/commands", status_code=202)
+async def submit_operator_command(
+    run_id: str,
+    body: OperatorCommandBody,
+    request: Request,
+    runtime: Runtime = Depends(get_runtime),
+    store: SqliteStore = Depends(get_store),
+) -> dict[str, str]:
+    _authenticate_operator(request)
+    try:
+        run = await store.load_run(run_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
+    if run.status in TERMINAL_RUN_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"run is already terminal: {run.status.value}",
+        )
+    command, created = await store.create_operator_command(
+        OperatorCommand(
+            run_id=run_id,
+            kind=OperatorCommandKind(body.kind),
+            actor=request.headers.get("x-horizonx-actor", "dashboard-operator"),
+            reason=body.reason,
+            instruction=body.instruction,
+            idempotency_key=(
+                request.headers.get("idempotency-key")
+                or f"{body.kind}:{run.id}:{uuid4().hex}"
+            ),
+        )
+    )
+    if command.kind == OperatorCommandKind.CANCEL:
+        await store.transition_run(run.id, RunStatus.ABORTED)
+    runtime.notify_operator_command(run_id)
+    return {
+        "status": "accepted" if created else "duplicate",
+        "command_id": command.id,
+    }
 
 
 @router.post("/runs/{run_id}/cancel")
 async def cancel_run(
     run_id: str,
+    request: Request,
+    runtime: Runtime = Depends(get_runtime),
     store: SqliteStore = Depends(get_store),
 ) -> dict[str, str]:
-    """Best-effort cancel: sets status to ABORTED in the DB.
-
-    The running coroutine may not stop immediately — no in-flight cancel token.
-    """
+    """Persist cancellation before monotonically aborting the run."""
+    _authenticate_operator(request)
     try:
         run = await store.load_run(run_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
+    if run.status in TERMINAL_RUN_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"run is already terminal: {run.status.value}",
+        )
+    command, _ = await store.create_operator_command(
+        OperatorCommand(
+            run_id=run.id,
+            kind=OperatorCommandKind.CANCEL,
+            actor=request.headers.get("x-horizonx-actor", "dashboard-operator"),
+            reason=request.headers.get("x-horizonx-reason", "operator requested cancellation"),
+            idempotency_key=(
+                request.headers.get("idempotency-key") or f"cancel:{run.id}:{uuid4().hex}"
+            ),
+        )
+    )
     transitioned = await store.transition_run(run.id, RunStatus.ABORTED)
     if transitioned.status != RunStatus.ABORTED:
         raise HTTPException(
             status_code=409,
             detail=f"run is already terminal: {transitioned.status.value}",
         )
-    return {"status": transitioned.status.value, "run_id": run_id}
+    runtime.notify_operator_command(run_id)
+    return {
+        "status": transitioned.status.value,
+        "run_id": run_id,
+        "command_id": command.id,
+    }

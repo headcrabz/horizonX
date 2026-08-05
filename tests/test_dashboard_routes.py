@@ -253,6 +253,23 @@ async def test_hitl_resolve_not_found(client: AsyncClient) -> None:
     assert r.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_hitl_resolve_rejects_request_from_another_run(
+    client: AsyncClient, app, seeded_run: Run
+) -> None:
+    other = seeded_run.model_copy(update={"id": "run-other"})
+    await app.state.store.save_run(other)
+    other_request = await app.state.store.save_hitl_event(
+        other.id, "validator_paused", {}
+    )
+    response = await client.post(
+        f"/api/runs/{seeded_run.id}/hitl",
+        json={"action": "approve", "request_id": other_request},
+    )
+    assert response.status_code == 404
+    assert (await app.state.store.find_hitl_event(other_request))["resolved_at"] is None
+
+
 # ---------------------------------------------------------------------------
 # Launch (POST /api/runs)
 # ---------------------------------------------------------------------------

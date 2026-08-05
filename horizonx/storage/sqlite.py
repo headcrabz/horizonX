@@ -379,8 +379,29 @@ CREATE TABLE IF NOT EXISTS hitl_events (
     resolved_at  TEXT,
     decision     TEXT,
     operator     TEXT,
-    instruction  TEXT
+    instruction  TEXT,
+    request_actor TEXT NOT NULL DEFAULT 'system',
+    request_reason TEXT NOT NULL DEFAULT '',
+    request_instruction TEXT NOT NULL DEFAULT '',
+    reason       TEXT NOT NULL DEFAULT '',
+    resolution_idempotency_key TEXT
 );
+
+CREATE TABLE IF NOT EXISTS operator_commands (
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL,
+    attempt_id      TEXT,
+    kind            TEXT NOT NULL CHECK (kind IN ('cancel', 'steer', 'decision')),
+    actor           TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT '',
+    instruction     TEXT NOT NULL DEFAULT '',
+    payload         TEXT NOT NULL DEFAULT '{}',
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at      TEXT NOT NULL,
+    consumed_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_operator_commands_pending
+    ON operator_commands(run_id, consumed_at, created_at);
 
 CREATE TABLE IF NOT EXISTS spin_reports (
     id           TEXT PRIMARY KEY,
@@ -1816,15 +1837,27 @@ class SqliteStore:
         trigger: str,
         context: dict[str, Any],
         hitl_id: str | None,
+        actor: str,
+        instruction: str,
     ) -> str:
         from uuid import uuid4
 
         event_id = hitl_id or str(uuid4())
         with self._conn() as c:
             c.execute(
-                "INSERT INTO hitl_events (id, run_id, triggered_at, trigger, context) "
-                "VALUES (?,?,datetime('now'),?,?)",
-                (event_id, run_id, trigger, json.dumps(context, default=str)),
+                "INSERT OR IGNORE INTO hitl_events "
+                "(id, run_id, triggered_at, trigger, context, request_actor, "
+                "request_reason, request_instruction) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    event_id,
+                    run_id,
+                    utcnow().isoformat(),
+                    trigger,
+                    json.dumps(context, default=str),
+                    actor,
+                    trigger,
+                    instruction,
+                ),
             )
         return event_id
 
@@ -1834,8 +1867,18 @@ class SqliteStore:
         trigger: str,
         context: dict[str, Any],
         hitl_id: str | None = None,
+        actor: str = "system",
+        instruction: str = "",
     ) -> str:
-        return await self._run_sync(self._sync_save_hitl_event, run_id, trigger, context, hitl_id)
+        return await self._run_sync(
+            self._sync_save_hitl_event,
+            run_id,
+            trigger,
+            context,
+            hitl_id,
+            actor,
+            instruction,
+        )
 
     def _sync_update_hitl_event(
         self,
@@ -1846,9 +1889,16 @@ class SqliteStore:
     ) -> None:
         with self._conn() as c:
             c.execute(
-                "UPDATE hitl_events SET resolved_at=datetime('now'), decision=?, operator=?, "
-                "instruction=? WHERE id=?",
-                (action, operator, instruction, event_id),
+                "UPDATE hitl_events SET resolved_at=?, decision=?, operator=?, "
+                "reason='legacy resolution', instruction=? "
+                "WHERE id=? AND resolved_at IS NULL",
+                (
+                    utcnow().isoformat(),
+                    action,
+                    operator or "unknown-operator",
+                    instruction,
+                    event_id,
+                ),
             )
 
     async def update_hitl_event(
@@ -1870,6 +1920,146 @@ class SqliteStore:
 
     async def list_hitl_events(self, run_id: str) -> list[dict[str, Any]]:
         return await self._run_sync(self._sync_list_hitl_events, run_id)
+
+    def _sync_find_hitl_event(self, event_id: str) -> dict[str, Any]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM hitl_events WHERE id=?", (event_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"HITL request not found: {event_id}")
+        return dict(row)
+
+    async def find_hitl_event(self, event_id: str) -> dict[str, Any]:
+        return await self._run_sync(self._sync_find_hitl_event, event_id)
+
+    def _sync_resolve_hitl_event(
+        self,
+        event_id: str,
+        action: str,
+        actor: str,
+        reason: str,
+        instruction: str,
+        idempotency_key: str,
+    ) -> tuple[dict[str, Any], bool]:
+        with self._conn() as c:
+            cursor = c.execute(
+                "UPDATE hitl_events SET resolved_at=?, decision=?, operator=?, reason=?, "
+                "instruction=?, resolution_idempotency_key=? "
+                "WHERE id=? AND resolved_at IS NULL",
+                (
+                    utcnow().isoformat(), action, actor, reason, instruction,
+                    idempotency_key, event_id,
+                ),
+            )
+            row = c.execute("SELECT * FROM hitl_events WHERE id=?", (event_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"HITL request not found: {event_id}")
+        return dict(row), cursor.rowcount == 1
+
+    async def resolve_hitl_event(
+        self,
+        event_id: str,
+        *,
+        action: str,
+        actor: str,
+        reason: str,
+        instruction: str,
+        idempotency_key: str,
+    ) -> tuple[dict[str, Any], bool]:
+        return await self._run_sync(
+            self._sync_resolve_hitl_event,
+            event_id,
+            action,
+            actor,
+            reason,
+            instruction,
+            idempotency_key,
+        )
+
+    @staticmethod
+    def _operator_command_from_row(row: sqlite3.Row) -> Any:
+        from horizonx.core.operator_commands import OperatorCommand
+
+        return OperatorCommand(
+            id=row["id"],
+            run_id=row["run_id"],
+            attempt_id=row["attempt_id"],
+            kind=row["kind"],
+            actor=row["actor"],
+            reason=row["reason"],
+            instruction=row["instruction"],
+            payload=json.loads(row["payload"] or "{}"),
+            idempotency_key=row["idempotency_key"],
+            created_at=row["created_at"],
+            consumed_at=row["consumed_at"],
+        )
+
+    def _sync_create_operator_command(self, command: Any) -> tuple[Any, bool]:
+        with self._conn() as c:
+            cursor = c.execute(
+                "INSERT OR IGNORE INTO operator_commands "
+                "(id, run_id, attempt_id, kind, actor, reason, instruction, payload, "
+                "idempotency_key, created_at, consumed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    command.id, command.run_id, command.attempt_id,
+                    command.kind.value, command.actor, command.reason,
+                    command.instruction, json.dumps(command.payload, default=str),
+                    command.idempotency_key, command.created_at.isoformat(),
+                    command.consumed_at.isoformat() if command.consumed_at else None,
+                ),
+            )
+            row = c.execute(
+                "SELECT * FROM operator_commands WHERE idempotency_key=?",
+                (command.idempotency_key,),
+            ).fetchone()
+        if row is None:  # pragma: no cover
+            raise StoreError("operator command disappeared after insert")
+        return self._operator_command_from_row(row), cursor.rowcount == 1
+
+    async def create_operator_command(self, command: Any) -> tuple[Any, bool]:
+        return await self._run_sync(self._sync_create_operator_command, command)
+
+    def _sync_list_operator_commands(
+        self, run_id: str, unconsumed_only: bool
+    ) -> list[Any]:
+        query = "SELECT * FROM operator_commands WHERE run_id=?"
+        if unconsumed_only:
+            query += " AND consumed_at IS NULL"
+        query += " ORDER BY created_at, id"
+        with self._conn() as c:
+            rows = c.execute(query, (run_id,)).fetchall()
+        return [self._operator_command_from_row(row) for row in rows]
+
+    async def list_operator_commands(
+        self, run_id: str, *, unconsumed_only: bool = False
+    ) -> list[Any]:
+        return await self._run_sync(
+            self._sync_list_operator_commands, run_id, unconsumed_only
+        )
+
+    def _sync_consume_operator_command(
+        self, command_id: str, attempt_id: str | None
+    ) -> Any:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE operator_commands SET consumed_at=COALESCE(consumed_at, ?), "
+                "attempt_id=COALESCE(attempt_id, ?) WHERE id=?",
+                (utcnow().isoformat(), attempt_id, command_id),
+            )
+            row = c.execute(
+                "SELECT * FROM operator_commands WHERE id=?", (command_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"operator command not found: {command_id}")
+        return self._operator_command_from_row(row)
+
+    async def consume_operator_command(
+        self, command_id: str, *, attempt_id: str | None = None
+    ) -> Any:
+        return await self._run_sync(
+            self._sync_consume_operator_command, command_id, attempt_id
+        )
 
     def _sync_list_spin_reports(self, run_id: str) -> list[dict[str, Any]]:
         with self._conn() as c:
@@ -1996,6 +2186,37 @@ class SqliteStore:
             after_sequence,
             limit,
             event_type,
+        )
+
+    def _sync_list_all_events(
+        self, after_sequence: int | None, limit: int
+    ) -> list[Any]:
+        from horizonx.core.event_bus import Event
+
+        query = "SELECT * FROM events"
+        values: list[Any] = []
+        if after_sequence is not None:
+            query += " WHERE sequence>?"
+            values.append(after_sequence)
+        query += " ORDER BY sequence LIMIT ?"
+        values.append(limit)
+        with self._conn() as c:
+            rows = c.execute(query, values).fetchall()
+        return [
+            Event(
+                id=row["id"], sequence=row["sequence"], type=row["type"],
+                run_id=row["run_id"], attempt_id=row["attempt_id"],
+                session_id=row["session_id"], goal_id=row["goal_id"],
+                timestamp=row["timestamp"], payload=json.loads(row["payload"] or "{}"),
+            )
+            for row in rows
+        ]
+
+    async def list_all_events(
+        self, *, after_sequence: int | None = None, limit: int = 1000
+    ) -> list[Any]:
+        return await self._run_sync(
+            self._sync_list_all_events, after_sequence, limit
         )
 
     # ------------------------------------------------------------------

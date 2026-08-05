@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 _REQUIRED_GOAL_COLUMNS = {
     "run_id",
@@ -31,7 +31,7 @@ _REQUIRED_GOAL_EDGE_COLUMNS = {
     "edge_type",
     "position",
 }
-_REQUIRED_DURABILITY_TABLES = {"attempts", "events", "leases"}
+_REQUIRED_DURABILITY_TABLES = {"attempts", "events", "leases", "operator_commands"}
 
 
 class SchemaMigrationError(RuntimeError):
@@ -211,6 +211,27 @@ def ensure_additive_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE workspace_usage SET usd_known=1 WHERE usd != 0.0"
             )
+    if _table_exists(conn, "hitl_events"):
+        hitl_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(hitl_events)")
+        }
+        additions = {
+            "request_actor": "TEXT NOT NULL DEFAULT 'system'",
+            "request_reason": "TEXT NOT NULL DEFAULT ''",
+            "request_instruction": "TEXT NOT NULL DEFAULT ''",
+            "reason": "TEXT NOT NULL DEFAULT ''",
+            "resolution_idempotency_key": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in hitl_columns:
+                conn.execute(
+                    f"ALTER TABLE hitl_events ADD COLUMN {name} {declaration}"
+                )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_hitl_resolution_idempotency "
+            "ON hitl_events(resolution_idempotency_key) "
+            "WHERE resolution_idempotency_key IS NOT NULL"
+        )
 
 
 def record_current_schema(conn: sqlite3.Connection) -> None:

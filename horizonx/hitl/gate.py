@@ -17,7 +17,13 @@ from horizonx.core.types import HITLConfig, HITLDecision, Run
 
 
 async def await_decision(
-    run: Run, reason: str, context: dict[str, Any], cfg: HITLConfig
+    run: Run,
+    reason: str,
+    context: dict[str, Any],
+    cfg: HITLConfig,
+    *,
+    store: Any | None = None,
+    request_id: str | None = None,
 ) -> HITLDecision:
     """Block until operator decides. Default impl: console prompt."""
 
@@ -29,12 +35,74 @@ async def await_decision(
     sys.stderr.write("=" * 70 + "\n")
 
     if cfg.notification_type == "slack":
-        await _notify_slack(cfg.notification_target, run.id, reason, context, cfg)
+        await _notify_slack(
+            cfg.notification_target,
+            run.id,
+            reason,
+            context,
+            cfg,
+            request_id=request_id,
+        )
     elif cfg.notification_type == "webhook":
         await _notify_webhook(cfg.notification_target, run.id, reason, context)
 
     # Wait for an operator decision file or interactive input
     decision_path = run.workspace_path / ".hitl_decision.json"
+
+    if store is not None and request_id is not None:
+        start_time = time.monotonic()
+        timeout_secs = (cfg.timeout_minutes or 0) * 60
+        while True:
+            events = await store.list_hitl_events(run.id)
+            request = next((item for item in events if item["id"] == request_id), None)
+            if request is None:
+                raise RuntimeError(f"HITL request disappeared: {request_id}")
+            if request["resolved_at"] is not None:
+                commands = await store.list_operator_commands(
+                    run.id, unconsumed_only=True
+                )
+                for command in commands:
+                    if (
+                        command.kind.value == "decision"
+                        and command.payload.get("request_id") == request_id
+                    ):
+                        await store.consume_operator_command(command.id)
+                return HITLDecision(
+                    action=request["decision"],
+                    instruction=request["instruction"] or "",
+                    operator=request["operator"],
+                    decided_at=request["resolved_at"],
+                )
+            if timeout_secs and (time.monotonic() - start_time) >= timeout_secs:
+                if cfg.escalation_channel and cfg.notification_type == "slack":
+                    await _notify_slack(
+                        cfg.escalation_channel,
+                        run.id,
+                        f"TIMEOUT: {reason}",
+                        context,
+                        cfg,
+                        request_id=request_id,
+                    )
+                action = "abort" if cfg.require_acknowledgement else (
+                    cfg.escalation_action or "approve"
+                )
+                actor = "system:timeout"
+                instruction = f"auto-{action} after {cfg.timeout_minutes}m timeout"
+                resolved, _ = await store.resolve_hitl_event(
+                    request_id,
+                    action=action,
+                    actor=actor,
+                    reason="HITL timeout",
+                    instruction=instruction,
+                    idempotency_key=f"timeout:{request_id}",
+                )
+                return HITLDecision(
+                    action=resolved["decision"],
+                    instruction=resolved["instruction"],
+                    operator=resolved["operator"],
+                    decided_at=resolved["resolved_at"],
+                )
+            await asyncio.sleep(0.05)
 
     if not sys.stdin.isatty() and not os.environ.get("HORIZONX_HITL_AUTO_APPROVE"):
         # Wait for decision file, with optional timeout escalation
@@ -88,6 +156,7 @@ async def _notify_slack(
     reason: str,
     ctx: dict[str, Any],
     cfg: HITLConfig,
+    request_id: str | None = None,
 ) -> None:
     token = os.environ.get("HORIZONX_SLACK_TOKEN")
     if not token or not channel:
@@ -125,20 +194,20 @@ async def _notify_slack(
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Approve"},
                             "action_id": "hitl_approve",
-                            "value": f"{run_id}:approve",
+                            "value": f"{request_id or run_id}:approve",
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Modify"},
                             "action_id": "hitl_modify",
-                            "value": f"{run_id}:modify",
+                            "value": f"{request_id or run_id}:modify",
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Abort"},
                             "style": "danger",
                             "action_id": "hitl_abort",
-                            "value": f"{run_id}:abort",
+                            "value": f"{request_id or run_id}:abort",
                         },
                     ],
                 },

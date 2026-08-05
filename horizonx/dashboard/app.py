@@ -48,7 +48,7 @@ def create_app(
         finally:
             recovery_task.cancel()
             await asyncio.gather(recovery_task, return_exceptions=True)
-            await app.state.store.close()
+            await app.state.runtime.shutdown()
 
     app = FastAPI(title="HorizonX Dashboard", version="0.1.0", lifespan=lifespan)
 

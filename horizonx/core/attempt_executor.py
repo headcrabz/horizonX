@@ -13,6 +13,7 @@ from horizonx.agents.registry import build_agent
 from horizonx.core.attempt_result import AttemptResult
 from horizonx.core.event_bus import Event
 from horizonx.core.governor import BudgetExceeded
+from horizonx.core.operator_commands import OperatorCommandKind
 from horizonx.core.strategy_switch import SpinControlRequested, StrategySwitchRequested
 from horizonx.core.types import (
     AgentConfig,
@@ -272,6 +273,43 @@ class AttemptExecutor:
                 **invocation_kwargs,
             )
             session_task = asyncio.create_task(invocation)
+            command_stop = asyncio.Event()
+
+            async def consume_operator_commands() -> None:
+                """Poll durable control records; the bus is never authoritative."""
+                while not command_stop.is_set() and not session_task.done():
+                    commands = await rt.store.list_operator_commands(
+                        run.id, unconsumed_only=True
+                    )
+                    for command in commands:
+                        if command.kind == OperatorCommandKind.STEER:
+                            injector = getattr(agent, "inject_diagnostic", None)
+                            if callable(injector):
+                                delivered = injector(command.instruction)
+                                if inspect.isawaitable(delivered):
+                                    await delivered
+                            await rt.store.consume_operator_command(
+                                command.id, attempt_id=attempt.id
+                            )
+                        elif command.kind == OperatorCommandKind.CANCEL:
+                            cancel_token.cancel(
+                                f"operator_cancel:{command.reason or command.actor}"
+                            )
+                            from horizonx.core.types import RunStatus
+
+                            persisted_run = await rt.store.transition_run(
+                                run.id, RunStatus.ABORTED
+                            )
+                            run.status = persisted_run.status
+                            run.completed_at = persisted_run.completed_at
+                            await rt.store.consume_operator_command(
+                                command.id, attempt_id=attempt.id
+                            )
+                    await asyncio.sleep(0.05)
+
+            command_task = asyncio.create_task(
+                consume_operator_commands(), name=f"commands-{attempt.id}"
+            )
 
             async def on_stall_nudge(reason: str) -> None:
                 await rt.bus.publish(
@@ -357,6 +395,8 @@ class AttemptExecutor:
                     error=str(exc),
                 )
             finally:
+                command_stop.set()
+                await asyncio.gather(command_task, return_exceptions=True)
                 if watchdog_task is not None and not watchdog_task.done():
                     watchdog_task.cancel()
                     await asyncio.gather(watchdog_task, return_exceptions=True)
@@ -444,7 +484,11 @@ class AttemptExecutor:
                 if result.status == SessionStatus.COMPLETED
                 else AttemptStatus.ABORTED
                 if result.status == SessionStatus.TIMEOUT
-                and result.error == "run_cancelled"
+                and result.error is not None
+                and (
+                    result.error == "run_cancelled"
+                    or result.error.startswith("operator_cancel:")
+                )
                 else AttemptStatus.FAILED
             )
             transition_result = rt.store.transition_attempt(

@@ -91,7 +91,7 @@ async def test_v01_goal_schema_migrates_without_losing_stored_fields(tmp_path: P
 
     store = SqliteStore(path)
     try:
-        assert await store.schema_version() == 4
+        assert await store.schema_version() == 5
 
         root = await store.load_goal("legacy-run", "g.root")
         child = await store.load_goal("legacy-run", "g.child")
@@ -124,6 +124,45 @@ async def test_v01_goal_schema_migrates_without_losing_stored_fields(tmp_path: P
         ]
         assert pk_columns == ["run_id", "id"]
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_legacy_hitl_table_adds_resolution_metadata_before_index(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-hitl.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE hitl_events (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            triggered_at TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            context TEXT NOT NULL,
+            resolved_at TEXT,
+            decision TEXT,
+            operator TEXT,
+            instruction TEXT
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = SqliteStore(path)
+    try:
+        with sqlite3.connect(path) as migrated:
+            columns = {
+                row[1] for row in migrated.execute("PRAGMA table_info(hitl_events)")
+            }
+            indexes = {
+                row[1] for row in migrated.execute("PRAGMA index_list(hitl_events)")
+            }
+        assert "resolution_idempotency_key" in columns
+        assert "idx_hitl_resolution_idempotency" in indexes
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

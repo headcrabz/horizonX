@@ -89,12 +89,36 @@ class Runtime:
         self._prepared_workspaces: dict[str, PreparedWorkspace] = {}
         self._recovery_contexts: dict[str, dict[str, str | None]] = {}
         self._strategy_executions: dict[str, _StrategyExecution] = {}
+        self._background_runs: dict[str, asyncio.Task[Any]] = {}
+        self._command_notifications: dict[str, asyncio.Event] = {}
 
     async def __aenter__(self) -> Runtime:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
-        if hasattr(self.store, "close"):
+        await self.shutdown()
+
+    def start_background_run(
+        self, run_id: str, coroutine: Any, *, name: str
+    ) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coroutine, name=name)
+        self._background_runs[run_id] = task
+        task.add_done_callback(lambda completed: self._background_runs.pop(run_id, None))
+        return task
+
+    def notify_operator_command(self, run_id: str) -> None:
+        event = self._command_notifications.get(run_id)
+        if event is not None:
+            event.set()
+
+    async def shutdown(self, *, close_store: bool = True) -> None:
+        tasks = list(self._background_runs.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_runs.clear()
+        if close_store and hasattr(self.store, "close"):
             await self.store.close()
 
     # ---------------------------------------------------------------
@@ -668,27 +692,66 @@ class Runtime:
     async def request_hitl(
         self, run: Run, *, reason: str, context: dict[str, Any]
     ) -> HITLDecision:
+        cfg = run.task.hitl
+        configured_trigger = reason
+        if reason in {"validator_pause", "validator_or_spin"}:
+            configured_trigger = (
+                "spin_detected"
+                if context.get("spin_reason")
+                else "validator_paused"
+            )
+        if not cfg.enabled or (
+            cfg.triggers and configured_trigger not in cfg.triggers
+        ):
+            return HITLDecision(
+                action="approve",
+                instruction=f"HITL skipped for unconfigured trigger: {reason}",
+                operator="system:policy",
+            )
         run.status = RunStatus.PAUSED_HITL
         await self.store.save_run(run)
+        request_id = await self.store.save_hitl_event(
+            run.id,
+            reason,
+            context,
+            actor="system",
+        )
         await self.bus.publish(
             Event(
                 type="hitl.requested",
                 run_id=run.id,
-                payload={"reason": reason, "context": context},
+                payload={"request_id": request_id, "reason": reason, "context": context},
             )
         )
         from horizonx.hitl.gate import await_decision
 
-        decision = await await_decision(run, reason, context, run.task.hitl)
+        decision = await await_decision(
+            run,
+            reason,
+            context,
+            cfg,
+            store=self.store,
+            request_id=request_id,
+        )
         await self.bus.publish(
             Event(
                 type="hitl.resolved",
                 run_id=run.id,
-                payload={"action": decision.action, "instruction": decision.instruction},
+                payload={
+                    "request_id": request_id,
+                    "action": decision.action,
+                    "actor": decision.operator,
+                    "instruction": decision.instruction,
+                },
             )
         )
-        run.status = RunStatus.RUNNING
-        await self.store.save_run(run)
+        if decision.action == "abort":
+            run.status = RunStatus.ABORTED
+            persisted = await self.store.transition_run(run.id, RunStatus.ABORTED)
+            run.completed_at = persisted.completed_at
+        else:
+            run.status = RunStatus.RUNNING
+            await self.store.save_run(run)
         return decision
 
     # ---------------------------------------------------------------
