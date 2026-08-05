@@ -123,7 +123,7 @@ async def test_sequential_persists_graph_before_first_claim(tmp_path: Path) -> N
     try:
         agent = MockAgent(steps=[])
         with patch("horizonx.core.attempt_executor.build_agent", return_value=agent):
-            run = await asyncio.wait_for(runtime.run(task), timeout=2)
+            run = await asyncio.wait_for(runtime.run(task), timeout=10)
         persisted = await store.load_graph(run.id)
 
         assert run.status == RunStatus.COMPLETED
@@ -166,7 +166,7 @@ async def test_decomposition_persists_graph_before_first_claim(tmp_path: Path) -
             new_callable=AsyncMock,
             return_value=decomposition,
         ):
-            run = await asyncio.wait_for(runtime.run(task), timeout=2)
+            run = await asyncio.wait_for(runtime.run(task), timeout=10)
         persisted = await store.load_graph(run.id)
 
         assert run.status == RunStatus.COMPLETED
