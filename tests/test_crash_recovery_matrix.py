@@ -86,6 +86,30 @@ async def _attempt(
     )
 
 
+async def _submit_hitl_decision(
+    store: SqliteStore,
+    run_id: str,
+    request_id: str,
+    *,
+    action: str,
+    actor: str,
+    reason: str,
+    instruction: str,
+    idempotency_key: str,
+) -> None:
+    await store.submit_active_hitl_decision(
+        OperatorCommand(
+            run_id=run_id,
+            kind=OperatorCommandKind.DECISION,
+            actor=actor,
+            reason=reason,
+            instruction=instruction,
+            payload={"request_id": request_id, "action": action},
+            idempotency_key=idempotency_key,
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_events_are_monotonic_append_only_and_idempotent(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "horizonx.db")
@@ -713,6 +737,162 @@ async def test_recovery_consumes_only_authoritative_hitl_decision(
 
 
 @pytest.mark.asyncio
+async def test_recovery_adopts_concurrent_human_decision_and_releases_lease(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "horizonx.db"
+    recovery_store = SqliteStore(path)
+    human_store = SqliteStore(path)
+    run = _run(tmp_path)
+    await recovery_store.save_run(run)
+    attempt = await _attempt(
+        recovery_store, run, status=AttemptStatus.PAUSED_HITL
+    )
+    request_id, _ = await recovery_store.enter_hitl(
+        run.id, "validator_paused", {}
+    )
+    recovery_candidate = OperatorCommand(
+        run_id=run.id,
+        kind=OperatorCommandKind.DECISION,
+        actor="recovery-operator",
+        reason="stale recovery decision",
+        payload={"request_id": request_id, "action": "approve"},
+        idempotency_key="recovery-candidate",
+    )
+    original_list = recovery_store.list_operator_commands
+    original_submit = recovery_store.submit_active_hitl_decision
+    submit_started = asyncio.Event()
+    human_done = asyncio.Event()
+
+    async def list_with_inflight_candidate(
+        run_id: str, *, unconsumed_only: bool = False
+    ) -> list[OperatorCommand]:
+        commands = await original_list(run_id, unconsumed_only=unconsumed_only)
+        return commands or [recovery_candidate]
+
+    async def submit_after_human(candidate: OperatorCommand):
+        submit_started.set()
+        await human_done.wait()
+        return await original_submit(candidate)
+
+    recovery_store.list_operator_commands = list_with_inflight_candidate  # type: ignore[method-assign]
+    recovery_store.submit_active_hitl_decision = submit_after_human  # type: ignore[method-assign]
+
+    async def human_wins() -> None:
+        await submit_started.wait()
+        await human_store.submit_active_hitl_decision(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.DECISION,
+                actor="human-operator",
+                reason="human abort",
+                instruction="stop recovered run",
+                payload={"request_id": request_id, "action": "abort"},
+                idempotency_key="human-recovery-abort",
+            )
+        )
+        human_done.set()
+
+    human_task = asyncio.create_task(human_wins())
+    try:
+        assert await RecoveryCoordinator(recovery_store).plan(
+            owner="recovery-worker"
+        ) == []
+        await human_task
+        persisted = await human_store.load_run(run.id)
+        [command] = await human_store.list_operator_commands(run.id)
+        [resolved] = await human_store.list_hitl_events(run.id)
+        [event] = await human_store.list_events(run.id, event_type="hitl.resolved")
+        assert persisted.status == RunStatus.ABORTED
+        assert (await human_store.load_attempt(attempt.id)).status == AttemptStatus.ABORTED
+        assert command.idempotency_key == "human-recovery-abort"
+        assert command.consumed_at is not None
+        assert resolved["decision"] == "abort"
+        assert event.id == f"hitl-resolved:{request_id}"
+        assert await human_store.get_lease(f"run:{run.id}") is None
+        recovery_events = await human_store.list_events(
+            run.id, event_type="recovery.planned"
+        )
+        assert recovery_events[-1].payload["reason"] == "hitl_resolution_aborted"
+    finally:
+        if not human_task.done():
+            human_task.cancel()
+            await asyncio.gather(human_task, return_exceptions=True)
+        await recovery_store.close()
+        await human_store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_submission_conflict_with_new_generation_fails_closed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "horizonx.db"
+    recovery_store = SqliteStore(path)
+    operator_store = SqliteStore(path)
+    run = _run(tmp_path)
+    await recovery_store.save_run(run)
+    await _attempt(recovery_store, run, status=AttemptStatus.PAUSED_HITL)
+    request_id, _ = await recovery_store.enter_hitl(
+        run.id, "validator_paused", {}
+    )
+    recovery_candidate = OperatorCommand(
+        run_id=run.id,
+        kind=OperatorCommandKind.DECISION,
+        actor="recovery-operator",
+        payload={"request_id": request_id, "action": "abort"},
+        idempotency_key="stale-recovery-candidate",
+    )
+    original_list = recovery_store.list_operator_commands
+    original_submit = recovery_store.submit_active_hitl_decision
+
+    async def list_with_inflight_candidate(
+        run_id: str, *, unconsumed_only: bool = False
+    ) -> list[OperatorCommand]:
+        commands = await original_list(run_id, unconsumed_only=unconsumed_only)
+        return commands or [recovery_candidate]
+
+    async def advance_generation(candidate: OperatorCommand):
+        await operator_store.submit_active_hitl_decision(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.DECISION,
+                actor="human-operator",
+                payload={"request_id": request_id, "action": "approve"},
+                idempotency_key="human-old-generation",
+            )
+        )
+        await operator_store.apply_hitl_decision(
+            run.id,
+            expected_request_id=request_id,
+            to_status=RunStatus.RUNNING,
+        )
+        await operator_store.enter_hitl(run.id, "validator_paused", {"new": True})
+        return await original_submit(candidate)
+
+    recovery_store.list_operator_commands = list_with_inflight_candidate  # type: ignore[method-assign]
+    recovery_store.submit_active_hitl_decision = advance_generation  # type: ignore[method-assign]
+    try:
+        assert await RecoveryCoordinator(recovery_store).plan(
+            owner="recovery-worker"
+        ) == []
+        assert (await operator_store.load_run(run.id)).status == RunStatus.FAILED
+        assert await operator_store.get_lease(f"run:{run.id}") is None
+        recovery_events = await operator_store.list_events(
+            run.id, event_type="recovery.planned"
+        )
+        assert recovery_events[-1].payload == {
+            "action": "fail_run",
+            "reason": "active_hitl_resolution_invalid_after_submission_conflict",
+            "status": "failed",
+            "lease_owner": "recovery-worker",
+            "lease_version": 1,
+        }
+    finally:
+        await recovery_store.close()
+        await operator_store.close()
+
+
+@pytest.mark.asyncio
 async def test_recovery_does_not_replay_resolved_history_without_active_owner(
     tmp_path: Path,
 ) -> None:
@@ -765,7 +945,9 @@ async def test_recovery_uses_new_active_request_not_older_resolution(
     active_request, _ = await store.enter_hitl(
         run.id, "validator_paused", {"generation": "current"}
     )
-    await store.resolve_hitl_event_and_event(
+    await _submit_hitl_decision(
+        store,
+        run.id,
         active_request,
         action="abort",
         actor="current-operator",
@@ -827,7 +1009,9 @@ async def test_recovery_approval_rejects_stale_attempt_reference(tmp_path: Path)
         "recovery_ambiguous_completion",
         {"attempt_id": "attempt-stale"},
     )
-    await store.resolve_hitl_event_and_event(
+    await _submit_hitl_decision(
+        store,
+        run.id,
         request_id,
         action="approve",
         actor="operator",
@@ -881,7 +1065,9 @@ async def test_unsupported_recovery_resolution_fails_with_instruction(
     await _attempt(store, run, status=AttemptStatus.COMPLETED)
     await RecoveryCoordinator(store).plan(owner="recovery-worker")
     [request] = await store.list_hitl_events(run.id)
-    await store.resolve_hitl_event_and_event(
+    await _submit_hitl_decision(
+        store,
+        run.id,
         request["id"],
         action=action,
         actor="operator",
@@ -936,7 +1122,9 @@ async def test_terminal_winner_during_recovery_hitl_consumption_is_preserved(
     completed = await _attempt(store, run, status=AttemptStatus.COMPLETED)
     await RecoveryCoordinator(store).plan(owner="recovery-worker")
     [request] = await store.list_hitl_events(run.id)
-    await store.resolve_hitl_event_and_event(
+    await _submit_hitl_decision(
+        store,
+        run.id,
         request["id"],
         action="approve",
         actor="operator",

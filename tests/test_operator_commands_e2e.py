@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import sqlite3
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -268,6 +269,57 @@ async def test_two_store_active_decision_race_has_one_command_and_exact_replay(
     finally:
         await first_store.close()
         await second_store.close()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_active_decision_lookup_is_strict(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    store = SqliteStore(path)
+    run = _run(tmp_path)
+    await store.save_run(run)
+    request_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
+    try:
+        with pytest.raises(OperatorCommandConflict, match="not resolved"):
+            await store.load_authoritative_active_hitl_decision(run.id, request_id)
+
+        submitted = await store.submit_active_hitl_decision(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.DECISION,
+                actor="human-operator",
+                reason="human reason",
+                instruction="human instruction",
+                payload={"request_id": request_id, "action": "modify"},
+                idempotency_key="human-authoritative",
+            )
+        )
+        loaded = await store.load_authoritative_active_hitl_decision(
+            run.id, request_id
+        )
+        assert loaded.created is False
+        assert loaded.command == submitted.command
+        assert loaded.request == submitted.request
+        assert loaded.event == submitted.event
+
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "UPDATE operator_commands SET instruction='corrupted' WHERE id=?",
+                (submitted.command.id,),
+            )
+        with pytest.raises(OperatorCommandConflict, match="authoritative command"):
+            await store.load_authoritative_active_hitl_decision(run.id, request_id)
+
+        await store.apply_hitl_decision(
+            run.id,
+            expected_request_id=request_id,
+            to_status=RunStatus.RUNNING,
+        )
+        with pytest.raises(OperatorCommandConflict, match="current pause"):
+            await store.load_authoritative_active_hitl_decision(run.id, request_id)
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -654,13 +706,19 @@ async def test_runtime_hitl_persists_request_and_resolution(tmp_path: Path) -> N
             await __import__("asyncio").sleep(0.01)
         assert requests[0]["request_actor"] == "system"
         assert requests[0]["request_reason"] == "validator_paused"
-        await store.resolve_hitl_event(
-            requests[0]["id"],
-            action="approve",
-            actor="alice",
-            reason="reviewed",
-            instruction="continue carefully",
-            idempotency_key="web-approve-1",
+        await store.submit_active_hitl_decision(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.DECISION,
+                actor="alice",
+                reason="reviewed",
+                instruction="continue carefully",
+                payload={
+                    "request_id": requests[0]["id"],
+                    "action": "approve",
+                },
+                idempotency_key="web-approve-1",
+            )
         )
         decision = await __import__("asyncio").wait_for(decision_task, timeout=1)
         assert decision.operator == "alice"

@@ -337,6 +337,11 @@ class RecoveryCoordinator:
         now: datetime,
     ) -> RecoveryDecision | None:
         """Apply durable operator state left behind when a HITL waiter died."""
+        from horizonx.storage.sqlite import (
+            HITLTransitionError,
+            OperatorCommandConflict,
+        )
+
         request_id = run.active_hitl_request_id
         request = None
         if request_id is not None:
@@ -376,36 +381,53 @@ class RecoveryCoordinator:
             if command.kind == OperatorCommandKind.DECISION
             and command.payload.get("request_id") == request["id"]
         ]
-        authoritative_command = None
+        authoritative_result = None
         if request["resolved_at"] is None and decision_commands:
             command = decision_commands[0]
-            result = await self.store.submit_active_hitl_decision(command)
-            request = result.request
-            authoritative_command = result.command
+            try:
+                authoritative_result = (
+                    await self.store.submit_active_hitl_decision(command)
+                )
+            except (OperatorCommandConflict, HITLTransitionError):
+                try:
+                    authoritative_result = (
+                        await self.store.load_authoritative_active_hitl_decision(
+                            run.id, request["id"]
+                        )
+                    )
+                except (OperatorCommandConflict, HITLTransitionError):
+                    await self._fail_recovery_hitl_resolution(
+                        run,
+                        lease,
+                        latest,
+                        reason=(
+                            "active_hitl_resolution_invalid_after_submission_conflict"
+                        ),
+                    )
+                    return None
+            request = authoritative_result.request
         if request["resolved_at"] is None:
             return None
-        if authoritative_command is None:
-            authoritative_command = next(
-                (
-                    command
-                    for command in decision_commands
-                    if command.idempotency_key
-                    == request["resolution_idempotency_key"]
-                    and command.payload
-                    == {
-                        "request_id": request["id"],
-                        "action": request["decision"],
-                    }
-                    and command.actor == request["operator"]
-                    and command.reason == request["reason"]
-                    and command.instruction == request["instruction"]
-                ),
-                None,
-            )
-        if authoritative_command is not None:
-            await self.store.consume_operator_command(
-                authoritative_command.id, attempt_id=latest.id if latest else None
-            )
+        if authoritative_result is None:
+            try:
+                authoritative_result = (
+                    await self.store.load_authoritative_active_hitl_decision(
+                        run.id, request["id"]
+                    )
+                )
+            except (OperatorCommandConflict, HITLTransitionError):
+                await self._fail_recovery_hitl_resolution(
+                    run,
+                    lease,
+                    latest,
+                    reason="active_hitl_resolution_is_not_authoritative",
+                )
+                return None
+            request = authoritative_result.request
+        await self.store.consume_operator_command(
+            authoritative_result.command.id,
+            attempt_id=latest.id if latest else None,
+        )
         if request["decision"] == "abort":
             if latest is not None and latest.status not in TERMINAL_ATTEMPT_STATUSES:
                 await self.store.transition_attempt(
@@ -482,6 +504,36 @@ class RecoveryCoordinator:
         if resumed is None:
             return None
         return await self._decision(resumed, latest, lease, now)
+
+    async def _fail_recovery_hitl_resolution(
+        self,
+        run: Run,
+        lease: LeaseRecord,
+        latest: AttemptRecord | None,
+        *,
+        reason: str,
+    ) -> None:
+        persisted = await self.store.load_run(run.id)
+        if persisted.status in TERMINAL_RUN_STATUSES:
+            action = "preserve_terminal"
+        else:
+            persisted = await self.store.transition_run(run.id, RunStatus.FAILED)
+            action = "fail_run"
+        await self.store.append_event(
+            Event(
+                id=f"recovery-{run.id}-{lease.version}",
+                type="recovery.planned",
+                run_id=run.id,
+                attempt_id=latest.id if latest else None,
+                payload={
+                    "action": action,
+                    "reason": reason,
+                    "status": persisted.status.value,
+                    "lease_owner": lease.owner,
+                    "lease_version": lease.version,
+                },
+            )
+        )
 
     async def _decision(
         self,

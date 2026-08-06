@@ -19,6 +19,7 @@ from horizonx.core.types import (
     HITLDecision,
     Run,
 )
+from horizonx.storage.sqlite import HITLTransitionError, OperatorCommandConflict
 
 
 async def await_decision(
@@ -92,26 +93,11 @@ async def await_decision(
             if request is None:
                 raise RuntimeError(f"HITL request disappeared: {request_id}")
             if request["resolved_at"] is not None:
-                authoritative = next(
-                    (
-                        command
-                        for command in commands
-                        if command.kind == OperatorCommandKind.DECISION
-                        and command.idempotency_key
-                        == request["resolution_idempotency_key"]
-                        and command.payload
-                        == {
-                            "request_id": request_id,
-                            "action": request["decision"],
-                        }
-                        and command.actor == request["operator"]
-                        and command.reason == request["reason"]
-                        and command.instruction == request["instruction"]
-                    ),
-                    None,
+                result = await store.load_authoritative_active_hitl_decision(
+                    run.id, request_id
                 )
-                if authoritative is not None:
-                    await store.consume_operator_command(authoritative.id)
+                await store.consume_operator_command(result.command.id)
+                request = result.request
                 return HITLDecision(
                     action=request["decision"],
                     instruction=request["instruction"] or "",
@@ -133,17 +119,48 @@ async def await_decision(
                 )
                 actor = "system:timeout"
                 instruction = f"auto-{action} after {cfg.timeout_minutes}m timeout"
-                result = await store.submit_active_hitl_decision(
-                    OperatorCommand(
-                        run_id=run.id,
-                        kind=OperatorCommandKind.DECISION,
-                        actor=actor,
-                        reason="HITL timeout",
-                        instruction=instruction,
-                        payload={"request_id": request_id, "action": action},
-                        idempotency_key=f"timeout:{request_id}",
+                try:
+                    result = await store.submit_active_hitl_decision(
+                        OperatorCommand(
+                            run_id=run.id,
+                            kind=OperatorCommandKind.DECISION,
+                            actor=actor,
+                            reason="HITL timeout",
+                            instruction=instruction,
+                            payload={"request_id": request_id, "action": action},
+                            idempotency_key=f"timeout:{request_id}",
+                        )
                     )
-                )
+                except (OperatorCommandConflict, HITLTransitionError) as exc:
+                    persisted_run = await store.load_run(run.id)
+                    if persisted_run.active_hitl_request_id != request_id:
+                        if persisted_run.status.value == "aborted":
+                            return HITLDecision(
+                                action="abort",
+                                instruction="run was cancelled while awaiting HITL",
+                                operator="system:operator-control",
+                            )
+                        raise RuntimeError(
+                            f"HITL request is no longer active: {request_id}"
+                        ) from exc
+                    try:
+                        result = (
+                            await store.load_authoritative_active_hitl_decision(
+                                run.id, request_id
+                            )
+                        )
+                    except OperatorCommandConflict as adoption_error:
+                        persisted_run = await store.load_run(run.id)
+                        if persisted_run.status.value == "aborted":
+                            return HITLDecision(
+                                action="abort",
+                                instruction="run was cancelled while awaiting HITL",
+                                operator="system:operator-control",
+                            )
+                        raise RuntimeError(
+                            "HITL timeout lost submission without an "
+                            "authoritative same-generation decision"
+                        ) from adoption_error
                 await store.consume_operator_command(result.command.id)
                 resolved = result.request
                 return HITLDecision(

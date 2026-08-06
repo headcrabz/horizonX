@@ -165,13 +165,16 @@ async def test_restarted_reconciler_resumes_resolved_hitl_and_releases_lease(
         )
     )
     request_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
-    await store.resolve_hitl_event(
-        request_id,
-        action="approve",
-        actor="alice",
-        reason="reviewed",
-        instruction="continue",
-        idempotency_key="restart-decision",
+    await store.submit_active_hitl_decision(
+        OperatorCommand(
+            run_id=run.id,
+            kind=OperatorCommandKind.DECISION,
+            actor="alice",
+            reason="reviewed",
+            instruction="continue",
+            payload={"request_id": request_id, "action": "approve"},
+            idempotency_key="restart-decision",
+        )
     )
 
     async def finish(*args, **kwargs):  # type: ignore[no-untyped-def]

@@ -2530,6 +2530,104 @@ class SqliteStore:
             self._sync_submit_active_hitl_decision, candidate
         )
 
+    def _sync_load_authoritative_active_hitl_decision(
+        self, run_id: str, request_id: str
+    ) -> ActiveHITLDecisionResult:
+        from horizonx.core.event_bus import Event
+        from horizonx.core.operator_commands import OperatorCommandKind
+
+        with self._conn() as c:
+            c.execute("BEGIN")
+            run = c.execute(
+                "SELECT status, active_hitl_request_id FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            request = c.execute(
+                "SELECT * FROM hitl_events WHERE id=? AND run_id=?",
+                (request_id, run_id),
+            ).fetchone()
+            if (
+                run is None
+                or run["status"] != RunStatus.PAUSED_HITL.value
+                or run["active_hitl_request_id"] != request_id
+                or request is None
+            ):
+                raise OperatorCommandConflict(
+                    "HITL request does not own the run's current pause"
+                )
+            if request["resolved_at"] is None:
+                raise OperatorCommandConflict(
+                    "active HITL request is not resolved"
+                )
+            command_rows = c.execute(
+                "SELECT * FROM operator_commands WHERE run_id=? "
+                "AND idempotency_key=?",
+                (run_id, request["resolution_idempotency_key"]),
+            ).fetchall()
+            expected_payload = {
+                "request_id": request_id,
+                "action": request["decision"],
+            }
+            matching_commands = [
+                row
+                for row in command_rows
+                if row["kind"] == OperatorCommandKind.DECISION.value
+                and row["actor"] == request["operator"]
+                and row["reason"] == (request["reason"] or "")
+                and row["instruction"] == (request["instruction"] or "")
+                and json.loads(row["payload"] or "{}") == expected_payload
+            ]
+            if len(matching_commands) != 1:
+                raise OperatorCommandConflict(
+                    "active HITL resolution has no unique authoritative command"
+                )
+            event_id = f"hitl-resolved:{request_id}"
+            event_row = c.execute(
+                "SELECT * FROM events WHERE id=? AND run_id=? AND type=?",
+                (event_id, run_id, "hitl.resolved"),
+            ).fetchone()
+            expected_event_payload = {
+                "request_id": request_id,
+                "action": request["decision"],
+                "actor": request["operator"],
+                "instruction": request["instruction"] or "",
+            }
+            if (
+                event_row is None
+                or json.loads(event_row["payload"] or "{}")
+                != expected_event_payload
+            ):
+                raise OperatorCommandConflict(
+                    "active HITL resolution has no authoritative event"
+                )
+            event = Event(
+                id=event_row["id"],
+                sequence=event_row["sequence"],
+                type=event_row["type"],
+                run_id=event_row["run_id"],
+                attempt_id=event_row["attempt_id"],
+                session_id=event_row["session_id"],
+                goal_id=event_row["goal_id"],
+                timestamp=event_row["timestamp"],
+                payload=json.loads(event_row["payload"] or "{}"),
+            )
+            return ActiveHITLDecisionResult(
+                command=self._operator_command_from_row(matching_commands[0]),
+                request=dict(request),
+                event=event,
+                created=False,
+            )
+
+    async def load_authoritative_active_hitl_decision(
+        self, run_id: str, request_id: str
+    ) -> ActiveHITLDecisionResult:
+        """Load the one authoritative decision for an exact active generation."""
+        return await self._run_sync(
+            self._sync_load_authoritative_active_hitl_decision,
+            run_id,
+            request_id,
+        )
+
     def _sync_submit_cancel_command(self, candidate: Any) -> tuple[Any, bool, dict[str, Any]]:
         """Accept and apply cancellation atomically, fencing the active lease."""
         now = utcnow().isoformat()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.types import (
     AgentConfig,
     HITLConfig,
@@ -398,6 +400,148 @@ async def test_store_timeout_persists_one_authoritative_decision_command(
         assert resolved["resolution_idempotency_key"] == command.idempotency_key
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "instruction"),
+    [
+        ("approve", "ship human result"),
+        ("abort", "stop human result"),
+        ("modify", "apply human revision"),
+    ],
+)
+async def test_timeout_adopts_concurrent_human_decision(
+    tmp_path: Path,
+    action: str,
+    instruction: str,
+) -> None:
+    path = tmp_path / "state.db"
+    gate_store = SqliteStore(path)
+    human_store = SqliteStore(path)
+    run = _make_run(tmp_path).model_copy(update={"status": RunStatus.RUNNING})
+    await gate_store.save_run(run)
+    request_id, _ = await gate_store.enter_hitl(run.id, "validator_paused", {})
+    cfg = HITLConfig(timeout_minutes=1, escalation_action="abort")
+    submit_started = asyncio.Event()
+    human_done = asyncio.Event()
+    original_submit = gate_store.submit_active_hitl_decision
+
+    async def submit_after_human(candidate: OperatorCommand):
+        submit_started.set()
+        await human_done.wait()
+        return await original_submit(candidate)
+
+    gate_store.submit_active_hitl_decision = submit_after_human  # type: ignore[method-assign]
+
+    async def human_wins() -> None:
+        await submit_started.wait()
+        await human_store.submit_active_hitl_decision(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.DECISION,
+                actor="human-operator",
+                reason="human decision",
+                instruction=instruction,
+                payload={"request_id": request_id, "action": action},
+                idempotency_key=f"human-{action}",
+            )
+        )
+        human_done.set()
+
+    calls = [0]
+
+    def patched_monotonic() -> float:
+        calls[0] += 1
+        return 0.0 if calls[0] == 1 else 61.0
+
+    human_task = asyncio.create_task(human_wins())
+    try:
+        with (
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch("horizonx.hitl.gate.time") as mock_time,
+        ):
+            mock_time.monotonic = patched_monotonic
+            decision = await await_decision(
+                run,
+                "validator_paused",
+                {},
+                cfg,
+                store=gate_store,
+                request_id=request_id,
+            )
+        await human_task
+        assert decision.action == action
+        assert decision.instruction == instruction
+        assert decision.operator == "human-operator"
+        [command] = await human_store.list_operator_commands(run.id)
+        [resolved] = await human_store.list_hitl_events(run.id)
+        [event] = await human_store.list_events(run.id, event_type="hitl.resolved")
+        assert command.idempotency_key == resolved["resolution_idempotency_key"]
+        assert command.consumed_at is not None
+        assert resolved["decision"] == action
+        assert event.id == f"hitl-resolved:{request_id}"
+    finally:
+        if not human_task.done():
+            human_task.cancel()
+            await asyncio.gather(human_task, return_exceptions=True)
+        await gate_store.close()
+        await human_store.close()
+
+
+async def test_timeout_adopts_concurrent_cancellation(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    gate_store = SqliteStore(path)
+    operator_store = SqliteStore(path)
+    run = _make_run(tmp_path).model_copy(update={"status": RunStatus.RUNNING})
+    await gate_store.save_run(run)
+    request_id, _ = await gate_store.enter_hitl(run.id, "validator_paused", {})
+    cfg = HITLConfig(timeout_minutes=1, escalation_action="approve")
+    original_submit = gate_store.submit_active_hitl_decision
+
+    async def cancel_before_timeout(candidate: OperatorCommand):
+        await operator_store.submit_cancel_command(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.CANCEL,
+                actor="human-operator",
+                reason="cancel during timeout",
+                idempotency_key="human-timeout-cancel",
+            )
+        )
+        return await original_submit(candidate)
+
+    gate_store.submit_active_hitl_decision = cancel_before_timeout  # type: ignore[method-assign]
+    calls = [0]
+
+    def patched_monotonic() -> float:
+        calls[0] += 1
+        return 0.0 if calls[0] == 1 else 61.0
+
+    try:
+        with (
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch("horizonx.hitl.gate.time") as mock_time,
+        ):
+            mock_time.monotonic = patched_monotonic
+            decision = await await_decision(
+                run,
+                "validator_paused",
+                {},
+                cfg,
+                store=gate_store,
+                request_id=request_id,
+            )
+        assert decision.action == "abort"
+        assert decision.operator == "system:operator-control"
+        assert (await operator_store.load_run(run.id)).status == RunStatus.ABORTED
+        [command] = await operator_store.list_operator_commands(run.id)
+        [event] = await operator_store.list_events(run.id, event_type="hitl.resolved")
+        assert command.kind == OperatorCommandKind.CANCEL
+        assert command.consumed_at is not None
+        assert event.payload["action"] == "abort"
+    finally:
+        await gate_store.close()
+        await operator_store.close()
 
 
 async def test_console_timeout_sends_secondary_slack_escalation(tmp_path: Path) -> None:

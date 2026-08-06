@@ -10,6 +10,7 @@ import pytest
 
 from horizonx.agents.mock import MockAgent
 from horizonx.core.governor import BudgetExceeded
+from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.runtime import Runtime
 from horizonx.core.types import (
     AgentConfig,
@@ -296,10 +297,16 @@ async def test_final_validator_pause_uses_durable_decision_flow(
                 await asyncio.sleep(0.01)
             assert requests
             request = requests[-1]
-            await store.resolve_hitl_event(
-                request["id"], action=action, actor="reviewer",
-                reason="final review", instruction="apply final guidance",
-                idempotency_key=f"final-{action}",
+            await store.submit_active_hitl_decision(
+                OperatorCommand(
+                    run_id=runs[0].id,
+                    kind=OperatorCommandKind.DECISION,
+                    actor="reviewer",
+                    reason="final review",
+                    instruction="apply final guidance",
+                    payload={"request_id": request["id"], "action": action},
+                    idempotency_key=f"final-{action}",
+                )
             )
             run = await asyncio.wait_for(execution, timeout=1)
 
