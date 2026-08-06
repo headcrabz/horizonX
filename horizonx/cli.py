@@ -119,6 +119,7 @@ async def _load_run_context(store: SqliteStore, run_id: str) -> tuple[Run, str |
     """Load a run and its most specific durable provider-session identity."""
     run = await store.load_run(run_id)
     attempts = await store.list_attempts(run_id)
+    sessions = await store.list_sessions(run_id)
     if attempts:
         latest = attempts[-1]
         recorded = next(
@@ -126,10 +127,19 @@ async def _load_run_context(store: SqliteStore, run_id: str) -> tuple[Run, str |
         )
         if recorded is not None:
             return run, recorded.provider, recorded.provider_session_id
+        recorded_session = next(
+            (session for session in reversed(sessions) if session.agent_session_id), None
+        )
+        if recorded_session is not None:
+            return run, latest.provider, recorded_session.agent_session_id
         return run, latest.provider, None
-    sessions = await store.list_sessions(run_id)
     if sessions:
-        return run, run.task.agent.type, sessions[-1].agent_session_id
+        recorded_session = next(
+            (session for session in reversed(sessions) if session.agent_session_id), None
+        )
+        return run, run.task.agent.type, (
+            recorded_session.agent_session_id if recorded_session is not None else None
+        )
     return run, run.task.agent.type, None
 
 

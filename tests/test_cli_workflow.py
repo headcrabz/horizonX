@@ -213,6 +213,33 @@ def test_attach_uses_latest_recorded_attempt_session_not_latest_null_attempt(tmp
     assert "codex exec resume saved-session" in result.output
 
 
+def test_attach_falls_back_to_durable_session_when_attempt_session_id_is_null(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path, agent_type="codex")
+
+    async def add_partial_attempt() -> None:
+        store = SqliteStore(db_path)
+        session = Session(run_id=run.id, sequence_index=1, agent_session_id="session-first")
+        await store.save_session(session)
+        await store.create_attempt(
+            AttemptRecord(
+                run_id=run.id, session_id=session.id, provider="codex", model="mock",
+                workspace_path=run.workspace_path, provider_session_id=None,
+            )
+        )
+        await store.close()
+
+    import asyncio
+
+    asyncio.run(add_partial_attempt())
+    result = CliRunner().invoke(main, ["--db", str(db_path), "attach", run.id])
+
+    assert result.exit_code == 0, result.output
+    assert "codex exec resume session-first" in result.output
+
+
 def test_evidence_exports_durable_run_bundle_as_json(tmp_path: Path) -> None:
     db_path = tmp_path / "horizonx.db"
     run = _seed_run(db_path)
