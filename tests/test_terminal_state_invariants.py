@@ -257,7 +257,20 @@ async def test_final_validator_rejection_prevents_completion(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_final_validator_pause_remains_nonterminal(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("approve", RunStatus.COMPLETED),
+        ("abort", RunStatus.ABORTED),
+        ("modify", RunStatus.FAILED),
+        ("re_decompose", RunStatus.FAILED),
+    ],
+)
+async def test_final_validator_pause_uses_durable_decision_flow(
+    tmp_path: Path, action: str, expected: RunStatus,
+) -> None:
+    import asyncio
+
     store = SqliteStore(tmp_path / "horizonx.db")
     runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
     pause = GateDecision(
@@ -272,13 +285,30 @@ async def test_final_validator_pause_remains_nonterminal(tmp_path: Path) -> None
                 runtime, "run_validators", new=AsyncMock(return_value=[pause])
             ),
         ):
-            run = await runtime.run(_task())
+            execution = asyncio.create_task(runtime.run(_task()))
+            for _ in range(100):
+                runs = await store.list_nonterminal_runs()
+                requests = (
+                    await store.list_hitl_events(runs[0].id) if runs else []
+                )
+                if requests:
+                    break
+                await asyncio.sleep(0.01)
+            assert requests
+            request = requests[-1]
+            await store.resolve_hitl_event(
+                request["id"], action=action, actor="reviewer",
+                reason="final review", instruction="apply final guidance",
+                idempotency_key=f"final-{action}",
+            )
+            run = await asyncio.wait_for(execution, timeout=1)
 
-        persisted = await store.load_run(run.id)
-        assert run.status == RunStatus.PAUSED_HITL
-        assert run.completed_at is None
-        assert persisted.status == RunStatus.PAUSED_HITL
-        assert persisted.completed_at is None
+        assert run.status == expected
+        assert (await store.load_run(run.id)).status == expected
+        [requested] = await store.list_events(run.id, event_type="hitl.requested")
+        assert requested.id == f"hitl.requested:{request['id']}"
+        [resolved] = await store.list_events(run.id, event_type="hitl.resolved")
+        assert resolved.payload["action"] == action
     finally:
         await store.close()
 
@@ -589,12 +619,27 @@ async def test_runtime_retries_same_strategy_once_after_hard_spin(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_runtime_pauses_for_hitl_after_hard_spin(tmp_path: Path) -> None:
+async def test_runtime_hard_spin_uses_authenticated_durable_hitl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    pytest.importorskip("httpx")
+    from httpx import ASGITransport, AsyncClient
+
+    from horizonx.core.event_bus import InMemoryBus
     from horizonx.core.types import SpinReport
+    from horizonx.dashboard.app import create_app
     from tests.test_attempt_executor import _RepeatingAgent
 
     store = SqliteStore(tmp_path / "horizonx.db")
-    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    bus = InMemoryBus()
+    runtime = Runtime(store=store, bus=bus, workspace_root=tmp_path / "workspaces")
+    app = create_app(tmp_path / "horizonx.db", tmp_path / "workspaces")
+    app.state.store = store
+    app.state.bus = bus
+    app.state.runtime = runtime
+    monkeypatch.setenv("HORIZONX_OPERATOR_TOKEN", "spin-review-token")
     runtime.check_spin = AsyncMock(  # type: ignore[method-assign]
         return_value=SpinReport(detected=True, layer="loop", action="terminate_and_hitl")
     )
@@ -603,32 +648,122 @@ async def test_runtime_pauses_for_hitl_after_hard_spin(tmp_path: Path) -> None:
             patch.object(runtime, "_load_strategy", return_value=_AttemptBackedStrategy),
             patch("horizonx.core.attempt_executor.build_agent", return_value=_RepeatingAgent()),
         ):
-            run = await runtime.run(_task())
-        assert run.status == RunStatus.PAUSED_HITL
-        assert run.completed_at is None
-        assert len(await store.list_attempts(run.id)) == 1
-        assert len(await store.list_events(run.id, event_type="run.paused_hitl")) == 1
-        assert not [
-            event for event in await store.list_events(run.id)
-            if event.type in {"run.completed", "run.failed"}
-        ]
+            execution = asyncio.create_task(runtime.run(_task()))
+            for _ in range(100):
+                runs = await store.list_nonterminal_runs()
+                requests = await store.list_hitl_events(runs[0].id) if runs else []
+                if requests:
+                    break
+                await asyncio.sleep(0.01)
+            assert requests
+            run_id = requests[-1]["run_id"]
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    f"/api/runs/{run_id}/hitl",
+                    headers={"authorization": "Bearer spin-review-token"},
+                    json={"action": "approve", "request_id": requests[-1]["id"]},
+                )
+            assert response.status_code == 200
+            run = await asyncio.wait_for(execution, timeout=1)
+        assert run.status in {RunStatus.FAILED, RunStatus.TIMED_OUT}
+        assert run.status != RunStatus.PAUSED_HITL
+        assert len(await store.list_events(run.id, event_type="hitl.requested")) == 1
+        assert (await store.list_hitl_events(run.id))[0]["resolved_at"] is not None
     finally:
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_spin_pause_does_not_publish_after_concurrent_terminalization(
+async def test_hard_spin_hitl_survives_runtime_crash_then_cancel(
     tmp_path: Path,
 ) -> None:
-    store = SqliteStore(tmp_path / "horizonx.db")
+    import asyncio
+
+    from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
+    from horizonx.core.types import SpinReport
+    from tests.test_attempt_executor import _RepeatingAgent
+
+    path = tmp_path / "horizonx.db"
+    store = SqliteStore(path)
     runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
-    stale = Run(task=_task(), status=RunStatus.RUNNING, workspace_path=tmp_path)
-    await store.save_run(stale)
-    await store.transition_run(stale.id, RunStatus.COMPLETED)
-    await runtime._pause_run_for_spin(stale)
-    assert stale.status == RunStatus.COMPLETED
-    assert await store.list_events(stale.id, event_type="run.paused_hitl") == []
+    runtime.check_spin = AsyncMock(  # type: ignore[method-assign]
+        return_value=SpinReport(detected=True, layer="loop", action="terminate_and_hitl")
+    )
+    with (
+        patch.object(runtime, "_load_strategy", return_value=_AttemptBackedStrategy),
+        patch("horizonx.core.attempt_executor.build_agent", return_value=_RepeatingAgent()),
+    ):
+        execution = asyncio.create_task(runtime.run(_task()))
+        for _ in range(100):
+            runs = await store.list_nonterminal_runs()
+            requests = await store.list_hitl_events(runs[0].id) if runs else []
+            if requests:
+                break
+            await asyncio.sleep(0.01)
+        assert requests
+        run_id = requests[-1]["run_id"]
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+    assert (await store.load_run(run_id)).status == RunStatus.PAUSED_HITL
+    assert len(await store.list_events(run_id, event_type="hitl.requested")) == 1
     await store.close()
+
+    restarted = SqliteStore(path)
+    try:
+        await restarted.submit_cancel_command(
+            OperatorCommand(
+                run_id=run_id, kind=OperatorCommandKind.CANCEL,
+                actor="restart-operator", reason="cancel after crash",
+                idempotency_key="spin-crash-cancel",
+            )
+        )
+        assert (await restarted.load_run(run_id)).status == RunStatus.ABORTED
+        [request] = await restarted.list_hitl_events(run_id)
+        assert request["decision"] == "abort"
+        assert request["resolved_at"] is not None
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["disabled", "unconfigured"])
+async def test_hard_spin_policy_skip_never_status_only_pauses(
+    tmp_path: Path, mode: str,
+) -> None:
+    from horizonx.core.types import SpinReport
+    from tests.test_attempt_executor import _RepeatingAgent
+
+    store = SqliteStore(tmp_path / f"{mode}.db")
+    runtime = Runtime(store=store, workspace_root=tmp_path / mode)
+    runtime.check_spin = AsyncMock(  # type: ignore[method-assign]
+        return_value=SpinReport(detected=True, layer="loop", action="terminate_and_hitl")
+    )
+    task = _task()
+    if mode == "disabled":
+        task.hitl.enabled = False
+    else:
+        task.hitl.triggers = ["validator_paused"]
+    try:
+        with (
+            patch.object(runtime, "_load_strategy", return_value=_AttemptBackedStrategy),
+            patch("horizonx.core.attempt_executor.build_agent", return_value=_RepeatingAgent()),
+        ):
+            run = await runtime.run(task)
+        assert run.status in {RunStatus.FAILED, RunStatus.TIMED_OUT}
+        assert run.status != RunStatus.PAUSED_HITL
+        assert await store.list_hitl_events(run.id) == []
+        assert await store.list_events(run.id, event_type="hitl.requested") == []
+    finally:
+        await store.close()
+
+
+def test_runtime_has_no_status_only_hitl_helpers(tmp_path: Path) -> None:
+    runtime = Runtime(object(), workspace_root=tmp_path)
+    assert not hasattr(runtime, "_pause_run_for_spin")
+    assert not hasattr(runtime, "_pause_run")
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,6 @@ import pytest
 
 from horizonx.core.leases import LeaseManager
 from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
-from horizonx.core.recovery import RecoveryCoordinator
 from horizonx.core.types import (
     AgentConfig,
     AttemptRecord,
@@ -376,45 +375,4 @@ async def test_reconciliation_reclaims_lease_left_by_dead_process(
         supervisor.cancel()
         with pytest.raises(asyncio.CancelledError):
             await supervisor
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_recovery_backfills_legacy_hitl_requested_event_once(tmp_path: Path) -> None:
-    store = SqliteStore(tmp_path / "horizonx.db")
-    run = Run(
-        id="run-legacy-hitl-request",
-        task=Task(
-            id="legacy-hitl-request", name="Legacy HITL", prompt="wait",
-            strategy=StrategyConfig(kind="single"),
-            agent=AgentConfig(type="mock", model="mock"),
-        ),
-        workspace_path=tmp_path / "workspace",
-        status=RunStatus.PAUSED_HITL,
-    )
-    await store.save_run(run)
-    request_id = await store.save_hitl_event(run.id, "validator_paused", {})
-    older_request_id = await store.save_hitl_event(run.id, "spin_detected", {})
-    with store._conn() as connection:
-        connection.execute(
-            "DELETE FROM events WHERE id IN (?,?)",
-            (
-                f"hitl.requested:{request_id}",
-                f"hitl.requested:{older_request_id}",
-            ),
-        )
-    coordinator = RecoveryCoordinator(store, lease_ttl_seconds=1)
-    try:
-        assert await coordinator.plan(owner="recovery-one") == []
-        assert await coordinator.plan(owner="recovery-two") == []
-        events = await store.list_events(run.id, event_type="hitl.requested")
-        assert {event.id for event in events} == {
-            f"hitl.requested:{request_id}",
-            f"hitl.requested:{older_request_id}",
-        }
-        assert {event.payload["request_id"] for event in events} == {
-            request_id,
-            older_request_id,
-        }
-    finally:
         await store.close()

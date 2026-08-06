@@ -318,8 +318,36 @@ class Runtime:
                             ].terminal_outcome_seen = False
                             continue
                         if request.action == "terminate_and_hitl":
-                            await self._pause_run_for_spin(run)
-                            return run
+                            decision = await self.request_hitl(
+                                run,
+                                reason="spin_detected",
+                                context={
+                                    "control": request.action,
+                                    "strategy": current_kind,
+                                },
+                            )
+                            if decision.action == "abort":
+                                await self._finish_run(
+                                    run,
+                                    StrategyOutcome(
+                                        status=RunStatus.ABORTED,
+                                        reason="spin_operator_aborted",
+                                    ),
+                                )
+                                return run
+                            if decision.action in {"modify", "re_decompose"}:
+                                self._recovery_contexts[run.id] = {
+                                    "provider_session_id": None,
+                                    "lineage_id": None,
+                                    "retry_cause": (
+                                        f"hitl_{decision.action}:"
+                                        f"{decision.instruction}"
+                                    ),
+                                }
+                            self._strategy_executions[
+                                run.id
+                            ].terminal_outcome_seen = False
+                            continue
                         raise RuntimeError(
                             f"unsupported spin control {request.action}"
                         ) from request
@@ -339,9 +367,33 @@ class Runtime:
                             raise RuntimeError(
                                 f"unexpected validator state: {validation_result.value}"
                             )
-                        await self._pause_run(run)
-                        return run
-                    outcome = validation_result
+                        decision = await self.request_hitl(
+                            run,
+                            reason="validator_paused",
+                            context={
+                                "phase": "final",
+                                "validated_outcome": outcome.model_dump(mode="json"),
+                            },
+                        )
+                        if decision.action == "abort":
+                            outcome = StrategyOutcome(
+                                status=RunStatus.ABORTED,
+                                reason="final_validator_operator_aborted",
+                            )
+                        elif decision.action in {"modify", "re_decompose"}:
+                            outcome = StrategyOutcome(
+                                status=RunStatus.FAILED,
+                                reason=(
+                                    "final_validator_operator_requested_"
+                                    f"{decision.action}"
+                                ),
+                                details={
+                                    "hitl_action": decision.action,
+                                    "instruction": decision.instruction,
+                                },
+                            )
+                    if not isinstance(validation_result, RunStatus):
+                        outcome = validation_result
                 await self._finish_run(run, outcome)
             except BudgetExceeded as exc:
                 await self._finish_run(
@@ -387,19 +439,6 @@ class Runtime:
         await self.bus.publish(event)
         return event, True
 
-    async def _pause_run_for_spin(self, run: Run) -> None:
-        persisted = await self.store.pause_run(run.id)
-        run.status = persisted.status
-        run.completed_at = persisted.completed_at
-        if run.status == RunStatus.PAUSED_HITL:
-            await self.bus.publish(
-                Event(
-                    type="run.paused_hitl",
-                    run_id=run.id,
-                    payload={"status": run.status.value, "reason": "spin_detected"},
-                )
-            )
-
     async def request_spin_control(self, run: Run, action: str) -> bool:
         context = self._strategy_executions.get(run.id)
         if context is None or context.terminal_outcome_seen:
@@ -409,7 +448,12 @@ class Runtime:
                 return False
             context.retry_used = True
             return True
-        return action == "terminate_and_hitl"
+        if action == "terminate_and_hitl":
+            if context.retry_used:
+                return False
+            context.retry_used = True
+            return True
+        return False
 
     async def _begin_strategy_execution(self, run: Run, strategy: str) -> str:
         switched_events = await self.store.list_events(
@@ -471,8 +515,9 @@ class Runtime:
         """Apply one final-validator policy for every strategy.
 
         No configured final validators is a vacuous pass. Otherwise every verdict must
-        continue; pause leaves the run paused, abort ends it as aborted, and a retry
-        request ends the current run as failed because a new attempt is required.
+        continue; pause delegates to the durable operator flow, abort ends it as
+        aborted, and a retry request ends the current run as failed because a new
+        attempt is required.
         """
         final_session = self._last_sessions.get(run.id)
         if final_session is None and hasattr(self.store, "list_sessions"):
@@ -496,26 +541,6 @@ class Runtime:
             reason="final_validator_requested_retry",
             details=details,
         )
-
-    async def _pause_run(self, run: Run) -> None:
-        """Persist a resumable operator pause without assigning a completion time."""
-        run.status = RunStatus.PAUSED_HITL
-        run.completed_at = None
-        await self.store.save_run(run)
-        persisted = await self.store.load_run(run.id)
-        run.status = persisted.status
-        run.completed_at = persisted.completed_at
-        if run.status == RunStatus.PAUSED_HITL:
-            await self.bus.publish(
-                Event(
-                    type="run.paused_hitl",
-                    run_id=run.id,
-                    payload={
-                        "status": run.status.value,
-                        "reason": "final_validator_requires_operator",
-                    },
-                )
-            )
 
     async def _finish_run(self, run: Run, outcome: StrategyOutcome) -> None:
         persisted = await self.store.transition_run(run.id, outcome.status)
