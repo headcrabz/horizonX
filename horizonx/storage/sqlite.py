@@ -2356,6 +2356,51 @@ class SqliteStore:
     async def create_operator_command(self, command: Any) -> tuple[Any, bool]:
         return await self._run_sync(self._sync_create_operator_command, command)
 
+    def _sync_submit_steer_command(self, candidate: Any) -> tuple[Any, bool]:
+        """Atomically accept a steer command only while its run is nonterminal."""
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            existing = c.execute(
+                "SELECT * FROM operator_commands WHERE run_id=? AND idempotency_key=?",
+                (candidate.run_id, candidate.idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                command = self._operator_command_from_row(existing)
+                if (
+                    existing["kind"] != candidate.kind.value
+                    or existing["actor"] != candidate.actor
+                    or existing["reason"] != candidate.reason
+                    or existing["instruction"] != candidate.instruction
+                    or json.loads(existing["payload"] or "{}") != candidate.payload
+                ):
+                    raise OperatorCommandConflict(
+                        "operator command idempotency key was reused with different content"
+                    )
+                return command, False
+            run = c.execute("SELECT status FROM runs WHERE id=?", (candidate.run_id,)).fetchone()
+            if run is None:
+                raise KeyError(f"run not found: {candidate.run_id}")
+            if run["status"] in {status.value for status in TERMINAL_RUN_STATUSES}:
+                raise StoreError(f"run is already terminal: {run['status']}")
+            c.execute(
+                "INSERT INTO operator_commands "
+                "(id, run_id, attempt_id, kind, actor, reason, instruction, payload, "
+                "idempotency_key, created_at, consumed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    candidate.id, candidate.run_id, candidate.attempt_id, candidate.kind.value,
+                    candidate.actor, candidate.reason, candidate.instruction,
+                    json.dumps(candidate.payload, default=str), candidate.idempotency_key,
+                    candidate.created_at.isoformat(),
+                    candidate.consumed_at.isoformat() if candidate.consumed_at else None,
+                ),
+            )
+            row = c.execute("SELECT * FROM operator_commands WHERE id=?", (candidate.id,)).fetchone()
+        assert row is not None
+        return self._operator_command_from_row(row), True
+
+    async def submit_steer_command(self, candidate: Any) -> tuple[Any, bool]:
+        return await self._run_sync(self._sync_submit_steer_command, candidate)
+
     @staticmethod
     def _decision_command_matches(row: sqlite3.Row, command: Any) -> bool:
         return bool(

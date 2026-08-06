@@ -15,8 +15,10 @@ from pydantic import ValidationError
 from horizonx import AttemptRecord, CumulativeMetrics, Run, RunStatus, Session, Task
 from horizonx.cli import main
 from horizonx.core.event_bus import Event
+from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.project import ProjectConfig
 from horizonx.storage import SqliteStore
+from horizonx.storage.sqlite import StoreError
 
 
 def _seed_run(
@@ -128,6 +130,9 @@ def test_initialized_example_runs_with_the_mock_provider(tmp_path: Path) -> None
     assert initialized.exit_code == 0, initialized.output
     assert result.exit_code == 0, result.output
     assert "status: completed" in result.output.lower()
+    assert "Provider session: mock mock-session-001" in result.output
+    assert "Cost: unknown" in result.output
+    assert "Attach: horizonx attach " in result.output
 
 
 def test_status_prints_compact_durable_summary(tmp_path: Path) -> None:
@@ -262,6 +267,51 @@ def test_cancel_uses_durable_idempotent_submission(tmp_path: Path) -> None:
     assert "accepted" in accepted.output.lower()
     assert duplicate.exit_code == 0, duplicate.output
     assert "duplicate" in duplicate.output.lower()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["resume", "missing"], ["watch", "missing", "--interval", "0"], ["steer", "missing", "focus"], ["cancel", "missing"]],
+)
+def test_operator_commands_report_missing_runs(tmp_path: Path, command: list[str]) -> None:
+    result = CliRunner().invoke(main, ["--db", str(tmp_path / "horizonx.db"), *command])
+
+    assert result.exit_code != 0
+    assert "run not found: missing" in result.output
+
+
+@pytest.mark.parametrize("command", [["steer", "durable-run", "focus"], ["cancel", "durable-run"]])
+def test_operator_commands_reject_terminal_runs(tmp_path: Path, command: list[str]) -> None:
+    db_path = tmp_path / "horizonx.db"
+    _seed_run(db_path, status=RunStatus.COMPLETED)
+
+    result = CliRunner().invoke(main, ["--db", str(db_path), *command])
+
+    assert result.exit_code != 0
+    assert "terminal" in result.output.lower()
+
+
+def test_atomic_steer_rejects_terminal_run_without_persisting_command(tmp_path: Path) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path, status=RunStatus.COMPLETED)
+
+    async def submit() -> list[OperatorCommand]:
+        store = SqliteStore(db_path)
+        try:
+            with pytest.raises(StoreError, match="terminal"):
+                await store.submit_steer_command(
+                    OperatorCommand(
+                        run_id=run.id, kind=OperatorCommandKind.STEER, actor="test",
+                        instruction="too late", idempotency_key="terminal-steer",
+                    )
+                )
+            return await store.list_operator_commands(run.id)
+        finally:
+            await store.close()
+
+    import asyncio
+
+    assert asyncio.run(submit()) == []
 
 
 def test_cli_uses_database_path_from_config_in_current_directory(
@@ -445,6 +495,37 @@ def test_watch_prints_durable_events_and_exits_on_terminal_status(tmp_path: Path
     assert result.exit_code == 0, result.output
     assert "[run.completed]" in result.output
     assert "Status: completed" in result.output
+
+
+def test_watch_observes_event_after_polling_starts_then_closes_store(tmp_path: Path) -> None:
+    run = _seed_run(tmp_path / "seed.db")
+    captured: dict[str, object] = {"loads": 0, "events": 0}
+
+    class StubStore:
+        def __init__(self, path: Path) -> None:
+            pass
+
+        async def load_run(self, run_id: str) -> Run:
+            captured["loads"] = int(captured["loads"]) + 1
+            return run.model_copy(
+                update={"status": RunStatus.RUNNING if captured["loads"] == 1 else RunStatus.COMPLETED}
+            )
+
+        async def list_events(self, run_id: str, *, after_sequence: int | None = None) -> list[Event]:
+            captured["events"] = int(captured["events"]) + 1
+            return [] if captured["events"] == 1 else [
+                Event(sequence=1, type="run.completed", run_id=run_id, payload={"durable": True})
+            ]
+
+        async def close(self) -> None:
+            captured["closed"] = True
+
+    with patch("horizonx.cli.SqliteStore", StubStore):
+        result = CliRunner().invoke(main, ["watch", run.id, "--interval", "0"])
+
+    assert result.exit_code == 0, result.output
+    assert "[run.completed]" in result.output
+    assert captured["closed"] is True
 
 
 def test_config_directory_is_reported_as_invalid_config(

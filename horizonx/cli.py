@@ -336,13 +336,10 @@ def evidence(ctx: click.Context, run_id: str, fmt: str) -> None:
 async def _submit_operator_command(
     store: SqliteStore, command: OperatorCommand, *, cancel: bool = False
 ) -> bool:
-    run = await store.load_run(command.run_id)
-    if not cancel and run.status in TERMINAL_RUN_STATUSES:
-        raise StoreError(f"run is already terminal: {run.status.value}")
     if cancel:
         _, created, _ = await store.submit_cancel_command(command)
     else:
-        _, created = await store.create_operator_command(command)
+        _, created = await store.submit_steer_command(command)
     return created
 
 
