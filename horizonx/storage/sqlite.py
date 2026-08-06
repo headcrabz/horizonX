@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -72,6 +73,16 @@ class GoalVersionConflict(StoreError):
 
 class OperatorCommandConflict(StoreError):
     """Raised when an idempotency key is reused for different command content."""
+
+
+@dataclass(frozen=True)
+class ActiveHITLDecisionResult:
+    """Authoritative result of winning or exactly replaying a HITL decision."""
+
+    command: Any
+    request: dict[str, Any]
+    event: Any
+    created: bool
 
 
 class HITLTransitionError(StoreError):
@@ -2344,6 +2355,180 @@ class SqliteStore:
 
     async def create_operator_command(self, command: Any) -> tuple[Any, bool]:
         return await self._run_sync(self._sync_create_operator_command, command)
+
+    @staticmethod
+    def _decision_command_matches(row: sqlite3.Row, command: Any) -> bool:
+        return bool(
+            row["kind"] == command.kind.value
+            and row["actor"] == command.actor
+            and row["reason"] == command.reason
+            and row["instruction"] == command.instruction
+            and json.loads(row["payload"] or "{}") == command.payload
+        )
+
+    def _sync_submit_active_hitl_decision(
+        self, candidate: Any
+    ) -> ActiveHITLDecisionResult:
+        from horizonx.core.event_bus import Event
+        from horizonx.core.operator_commands import OperatorCommandKind
+
+        request_id = candidate.payload.get("request_id")
+        action = candidate.payload.get("action")
+        if (
+            candidate.kind != OperatorCommandKind.DECISION
+            or not isinstance(request_id, str)
+            or action not in {"approve", "abort", "modify", "re_decompose"}
+        ):
+            raise OperatorCommandConflict(
+                "active HITL submission requires a valid decision command"
+            )
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            run = c.execute(
+                "SELECT status, active_hitl_request_id FROM runs WHERE id=?",
+                (candidate.run_id,),
+            ).fetchone()
+            request = c.execute(
+                "SELECT * FROM hitl_events WHERE id=?", (request_id,)
+            ).fetchone()
+            if (
+                run is None
+                or run["status"] != RunStatus.PAUSED_HITL.value
+                or run["active_hitl_request_id"] != request_id
+                or request is None
+                or request["run_id"] != candidate.run_id
+            ):
+                raise OperatorCommandConflict(
+                    "HITL request does not own the run's current pause"
+                )
+            existing = c.execute(
+                "SELECT * FROM operator_commands "
+                "WHERE run_id=? AND idempotency_key=?",
+                (candidate.run_id, candidate.idempotency_key),
+            ).fetchone()
+            if request["resolved_at"] is not None:
+                if (
+                    existing is None
+                    or not self._decision_command_matches(existing, candidate)
+                    or request["resolution_idempotency_key"]
+                    != candidate.idempotency_key
+                    or request["decision"] != action
+                    or request["operator"] != candidate.actor
+                    or (request["reason"] or "") != candidate.reason
+                    or (request["instruction"] or "") != candidate.instruction
+                ):
+                    raise OperatorCommandConflict(
+                        "active HITL request already has a different decision"
+                    )
+                command_row = existing
+                created = False
+            else:
+                if existing is not None and not self._decision_command_matches(
+                    existing, candidate
+                ):
+                    raise OperatorCommandConflict(
+                        "operator command idempotency key was reused with "
+                        "different decision content"
+                    )
+                if existing is None:
+                    c.execute(
+                        "INSERT INTO operator_commands "
+                        "(id, run_id, attempt_id, kind, actor, reason, instruction, "
+                        "payload, idempotency_key, created_at, consumed_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            candidate.id,
+                            candidate.run_id,
+                            candidate.attempt_id,
+                            candidate.kind.value,
+                            candidate.actor,
+                            candidate.reason,
+                            candidate.instruction,
+                            json.dumps(candidate.payload, default=str),
+                            candidate.idempotency_key,
+                            candidate.created_at.isoformat(),
+                            None,
+                        ),
+                    )
+                    command_row = c.execute(
+                        "SELECT * FROM operator_commands WHERE id=?",
+                        (candidate.id,),
+                    ).fetchone()
+                else:
+                    command_row = existing
+                changed = c.execute(
+                    "UPDATE hitl_events SET resolved_at=?, decision=?, operator=?, "
+                    "reason=?, instruction=?, resolution_idempotency_key=? "
+                    "WHERE id=? AND run_id=? AND resolved_at IS NULL",
+                    (
+                        utcnow().isoformat(),
+                        action,
+                        candidate.actor,
+                        candidate.reason,
+                        candidate.instruction,
+                        candidate.idempotency_key,
+                        request_id,
+                        candidate.run_id,
+                    ),
+                )
+                if changed.rowcount != 1:  # pragma: no cover - write lock fences races
+                    raise OperatorCommandConflict(
+                        "active HITL request was resolved concurrently"
+                    )
+                request = c.execute(
+                    "SELECT * FROM hitl_events WHERE id=?", (request_id,)
+                ).fetchone()
+                assert request is not None
+                created = True
+            assert command_row is not None
+            event_id = f"hitl-resolved:{request_id}"
+            c.execute(
+                "INSERT OR IGNORE INTO events "
+                "(id, type, run_id, timestamp, payload) VALUES (?,?,?,?,?)",
+                (
+                    event_id,
+                    "hitl.resolved",
+                    candidate.run_id,
+                    request["resolved_at"],
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "action": request["decision"],
+                            "actor": request["operator"],
+                            "instruction": request["instruction"] or "",
+                        }
+                    ),
+                ),
+            )
+            event_row = c.execute(
+                "SELECT * FROM events WHERE id=?", (event_id,)
+            ).fetchone()
+            assert event_row is not None
+            event = Event(
+                id=event_row["id"],
+                sequence=event_row["sequence"],
+                type=event_row["type"],
+                run_id=event_row["run_id"],
+                attempt_id=event_row["attempt_id"],
+                session_id=event_row["session_id"],
+                goal_id=event_row["goal_id"],
+                timestamp=event_row["timestamp"],
+                payload=json.loads(event_row["payload"] or "{}"),
+            )
+            return ActiveHITLDecisionResult(
+                command=self._operator_command_from_row(command_row),
+                request=dict(request),
+                event=event,
+                created=created,
+            )
+
+    async def submit_active_hitl_decision(
+        self, candidate: Any
+    ) -> ActiveHITLDecisionResult:
+        """Atomically accept one active decision or exactly replay its winner."""
+        return await self._run_sync(
+            self._sync_submit_active_hitl_decision, candidate
+        )
 
     def _sync_submit_cancel_command(self, candidate: Any) -> tuple[Any, bool, dict[str, Any]]:
         """Accept and apply cancellation atomically, fencing the active lease."""

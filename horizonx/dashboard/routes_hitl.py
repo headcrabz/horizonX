@@ -81,36 +81,11 @@ async def resolve_hitl(
             status_code=409,
             detail="HITL request does not own the run's current pause",
         )
-    try:
-        matching = await store.find_active_hitl_event(run_id, request_id)
-    except (HITLTransitionError, KeyError):
-        raise HTTPException(
-            status_code=409, detail="active HITL request is missing"
-        ) from None
-    if matching["run_id"] != run_id:
-        raise HTTPException(status_code=409, detail="active HITL request has wrong owner")
-    if matching["resolved_at"] is not None:
-        actor = decision.operator or "dashboard-operator"
-        if (
-            supplied_idempotency_key is not None
-            and matching["resolution_idempotency_key"] == supplied_idempotency_key
-            and matching["decision"] == decision.action
-            and matching["operator"] == actor
-            and (matching["reason"] or "") == body.reason
-            and (matching["instruction"] or "") == decision.instruction
-        ):
-            decision_path = Path(run.workspace_path) / ".hitl_decision.json"
-            return {
-                "status": "duplicate",
-                "path": str(decision_path),
-                "request_id": request_id,
-            }
-        raise HTTPException(status_code=409, detail="HITL request is already resolved")
     idempotency_key = (
         supplied_idempotency_key or f"web:{uuid4().hex}"
     )
     try:
-        command, _ = await store.create_operator_command(
+        result = await store.submit_active_hitl_decision(
             OperatorCommand(
                 run_id=run_id,
                 kind=OperatorCommandKind.DECISION,
@@ -121,32 +96,31 @@ async def resolve_hitl(
                 idempotency_key=idempotency_key,
             )
         )
-    except OperatorCommandConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from None
-    try:
-        resolved, changed, persisted_event = (
-            await store.resolve_active_hitl_event_and_event(
-                run_id,
-                request_id,
-                action=decision.action,
-                actor=command.actor,
-                reason=command.reason,
-                instruction=command.instruction,
-                idempotency_key=command.idempotency_key,
-            )
-        )
-    except HITLTransitionError as exc:
+    except (OperatorCommandConflict, HITLTransitionError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
     # Compatibility projection for older local CLI waiters; SQLite is authoritative.
+    resolved = result.request
+    authoritative = HITLDecision(
+        action=resolved["decision"],
+        instruction=resolved["instruction"] or "",
+        operator=resolved["operator"],
+        decided_at=resolved["resolved_at"],
+    )
     decision_path = Path(run.workspace_path) / ".hitl_decision.json"
-    decision_path.write_text(json.dumps(decision.model_dump(mode="json"), default=str))
+    decision_path.write_text(
+        json.dumps(authoritative.model_dump(mode="json"), default=str)
+    )
 
     # Publish SSE event so the dashboard updates immediately
-    if changed:
-        await bus.publish(persisted_event)
+    if result.created:
+        await bus.publish(result.event)
 
-    return {"status": "resolved", "path": str(decision_path), "request_id": request_id}
+    return {
+        "status": "resolved" if result.created else "duplicate",
+        "path": str(decision_path),
+        "request_id": request_id,
+    }
 
 
 def _slack_instruction(payload: dict[str, Any]) -> str:
@@ -260,17 +234,8 @@ async def slack_interaction(
         f"{action.get('action_id', '')}:{actor}"
     )
     command_key = f"slack:{callback_key}"
-    if events["resolved_at"] is not None:
-        if (
-            events["resolution_idempotency_key"] == command_key
-            and events["decision"] == decision
-            and events["operator"] == actor
-            and (events["instruction"] or "") == instruction
-        ):
-            return {"status": "duplicate", "request_id": request_id}
-        raise HTTPException(status_code=409, detail="HITL request is already resolved")
     try:
-        command, _ = await store.create_operator_command(
+        result = await store.submit_active_hitl_decision(
             OperatorCommand(
                 run_id=events["run_id"],
                 kind=OperatorCommandKind.DECISION,
@@ -281,22 +246,23 @@ async def slack_interaction(
                 idempotency_key=command_key,
             )
         )
-    except OperatorCommandConflict as exc:
+    except (OperatorCommandConflict, HITLTransitionError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    try:
-        resolved, changed, persisted_event = (
-            await store.resolve_active_hitl_event_and_event(
-                events["run_id"],
-                request_id,
-                action=decision,
-                actor=command.actor,
-                reason=command.reason,
-                instruction=command.instruction,
-                idempotency_key=command.idempotency_key,
-            )
-        )
-    except HITLTransitionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from None
-    if changed:
-        await bus.publish(persisted_event)
-    return {"status": "resolved" if changed else "duplicate", "request_id": request_id}
+    resolved = result.request
+    authoritative = HITLDecision(
+        action=resolved["decision"],
+        instruction=resolved["instruction"] or "",
+        operator=resolved["operator"],
+        decided_at=resolved["resolved_at"],
+    )
+    active_run = await store.load_run(events["run_id"])
+    decision_path = Path(active_run.workspace_path) / ".hitl_decision.json"
+    decision_path.write_text(
+        json.dumps(authoritative.model_dump(mode="json"), default=str)
+    )
+    if result.created:
+        await bus.publish(result.event)
+    return {
+        "status": "resolved" if result.created else "duplicate",
+        "request_id": request_id,
+    }

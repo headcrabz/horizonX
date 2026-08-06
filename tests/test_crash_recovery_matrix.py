@@ -17,6 +17,7 @@ import pytest
 from horizonx.core.event_bus import Event
 from horizonx.core.goal_graph import GoalGraph
 from horizonx.core.leases import LeaseLostError, LeaseManager
+from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.recovery import RecoveryAction, RecoveryCoordinator, RetryPolicy
 from horizonx.core.runtime import Runtime
 from horizonx.core.types import (
@@ -662,6 +663,51 @@ async def test_authenticated_recovery_resolution_never_replays_completed_attempt
         assert events[-1].payload["action"] == (
             "complete_run" if action == "approve" else "abort_run"
         )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_consumes_only_authoritative_hitl_decision(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    await _attempt(store, run, status=AttemptStatus.PAUSED_HITL)
+    request_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
+    created_at = datetime(2026, 8, 6, tzinfo=UTC)
+    winner = OperatorCommand(
+        id="decision-winner",
+        run_id=run.id,
+        kind=OperatorCommandKind.DECISION,
+        actor="operator-a",
+        reason="approve recovery",
+        payload={"request_id": request_id, "action": "approve"},
+        idempotency_key="decision-winner-key",
+        created_at=created_at,
+    )
+    loser = OperatorCommand(
+        id="decision-loser",
+        run_id=run.id,
+        kind=OperatorCommandKind.DECISION,
+        actor="operator-b",
+        reason="abort recovery",
+        payload={"request_id": request_id, "action": "abort"},
+        idempotency_key="decision-loser-key",
+        created_at=created_at + timedelta(seconds=1),
+    )
+    await store.create_operator_command(winner)
+    await store.create_operator_command(loser)
+    try:
+        await RecoveryCoordinator(store).plan(owner="recovery-worker")
+
+        [request] = await store.list_hitl_events(run.id)
+        commands = await store.list_operator_commands(run.id)
+        assert request["decision"] == "approve"
+        assert request["resolution_idempotency_key"] == winner.idempotency_key
+        assert next(item for item in commands if item.id == winner.id).consumed_at
+        assert next(item for item in commands if item.id == loser.id).consumed_at is None
     finally:
         await store.close()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -173,6 +174,100 @@ async def test_active_request_lookup_rejects_prior_generation(tmp_path: Path) ->
         assert (await store.find_active_hitl_event(run.id, second_id))["id"] == second_id
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_two_store_active_decision_race_has_one_command_and_exact_replay(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    first_store = SqliteStore(path)
+    second_store = SqliteStore(path)
+    run = _run(tmp_path)
+    await first_store.save_run(run)
+    request_id, _ = await first_store.enter_hitl(run.id, "validator_paused", {})
+    approve = OperatorCommand(
+        run_id=run.id,
+        kind=OperatorCommandKind.DECISION,
+        actor="alice",
+        reason="approve reason",
+        instruction="ship it",
+        payload={"request_id": request_id, "action": "approve"},
+        idempotency_key="race-approve",
+    )
+    abort = OperatorCommand(
+        run_id=run.id,
+        kind=OperatorCommandKind.DECISION,
+        actor="bob",
+        reason="abort reason",
+        instruction="stop it",
+        payload={"request_id": request_id, "action": "abort"},
+        idempotency_key="race-abort",
+    )
+    start = asyncio.Event()
+
+    async def submit(store: SqliteStore, command: OperatorCommand) -> object:
+        await start.wait()
+        try:
+            return await store.submit_active_hitl_decision(command)
+        except OperatorCommandConflict as exc:
+            return exc
+
+    first = asyncio.create_task(submit(first_store, approve))
+    second = asyncio.create_task(submit(second_store, abort))
+    start.set()
+    outcomes = await asyncio.gather(first, second)
+    try:
+        winners = [item for item in outcomes if not isinstance(item, Exception)]
+        conflicts = [item for item in outcomes if isinstance(item, Exception)]
+        assert len(winners) == 1
+        assert len(conflicts) == 1
+        winner = winners[0]
+        assert winner.created is True  # type: ignore[attr-defined]
+
+        [stored_command] = await first_store.list_operator_commands(run.id)
+        [resolved] = await first_store.list_hitl_events(run.id)
+        [event] = await first_store.list_events(run.id, event_type="hitl.resolved")
+        assert stored_command.id == winner.command.id  # type: ignore[attr-defined]
+        assert resolved["decision"] == stored_command.payload["action"]
+        assert resolved["resolution_idempotency_key"] == stored_command.idempotency_key
+        assert event.id == f"hitl-resolved:{request_id}"
+
+        replay = await second_store.submit_active_hitl_decision(
+            stored_command.model_copy(update={"id": "replay-command-id"})
+        )
+        assert replay.created is False
+        assert replay.command.id == stored_command.id
+        assert replay.request["decision"] == resolved["decision"]
+
+        conflicting_replays = [
+            stored_command.model_copy(update={"actor": "different-actor"}),
+            stored_command.model_copy(update={"reason": "different-reason"}),
+            stored_command.model_copy(update={"instruction": "different-instruction"}),
+            stored_command.model_copy(
+                update={"payload": {**stored_command.payload, "extra": True}}
+            ),
+            stored_command.model_copy(
+                update={
+                    "payload": {
+                        "request_id": request_id,
+                        "action": (
+                            "abort"
+                            if stored_command.payload["action"] == "approve"
+                            else "approve"
+                        ),
+                    }
+                }
+            ),
+            stored_command.model_copy(update={"idempotency_key": "different-key"}),
+        ]
+        for conflicting in conflicting_replays:
+            with pytest.raises(OperatorCommandConflict):
+                await second_store.submit_active_hitl_decision(conflicting)
+        assert len(await first_store.list_operator_commands(run.id)) == 1
+    finally:
+        await first_store.close()
+        await second_store.close()
 
 
 @pytest.mark.asyncio
@@ -710,6 +805,127 @@ async def test_slack_callback_authenticates_resolves_and_deduplicates(
             run.id, event_type="hitl.resolved"
         )
         assert len(events) == 1 and isinstance(events[0].sequence, int)
+    finally:
+        await app.state.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict_kind", ["approve_abort", "modify_instruction"])
+async def test_concurrent_slack_decisions_have_one_authoritative_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict_kind: str,
+) -> None:
+    pytest.importorskip("httpx")
+    from httpx import ASGITransport, AsyncClient
+
+    from horizonx.core.event_bus import InMemoryBus
+    from horizonx.dashboard.app import create_app
+
+    app = create_app(tmp_path / "state.db", tmp_path / "workspaces")
+    app.state.store = SqliteStore(tmp_path / "state.db")
+    app.state.bus = InMemoryBus()
+    app.state.runtime = Runtime(
+        store=app.state.store,
+        bus=app.state.bus,
+        workspace_root=tmp_path / "workspaces",
+    )
+    run = _run(tmp_path)
+    await app.state.store.save_run(run)
+    request_id, _ = await app.state.store.enter_hitl(
+        run.id, "validator_paused", {"race": conflict_kind}
+    )
+    if conflict_kind == "approve_abort":
+        payloads = [
+            {"type": "block_actions", "trigger_id": "race-approve",
+             "user": {"id": "U-approve"}, "actions": [{
+                 "action_id": "hitl_approve", "value": f"{request_id}:approve"
+             }]},
+            {"type": "block_actions", "trigger_id": "race-abort",
+             "user": {"id": "U-abort"}, "actions": [{
+                 "action_id": "hitl_abort", "value": f"{request_id}:abort"
+             }]},
+        ]
+    else:
+        payloads = [
+            {"type": "view_submission", "user": {"id": "U-modify"},
+             "view": {"id": "race-modify-a",
+                      "callback_id": "hitl_modify_submission",
+                      "private_metadata": request_id, "state": {"values": {
+                          "modify_instruction": {"instruction": {
+                              "value": "use path A"
+                          }}
+                      }}}},
+            {"type": "view_submission", "user": {"id": "U-modify"},
+             "view": {"id": "race-modify-b",
+                      "callback_id": "hitl_modify_submission",
+                      "private_metadata": request_id, "state": {"values": {
+                          "modify_instruction": {"instruction": {
+                              "value": "use path B"
+                          }}
+                      }}}},
+        ]
+    secret = "race-secret"
+    monkeypatch.setenv("HORIZONX_SLACK_SIGNING_SECRET", secret)
+
+    def signed(payload: dict[str, object]) -> tuple[bytes, dict[str, str]]:
+        body = urlencode({"payload": json.dumps(payload)}).encode()
+        timestamp = str(int(time.time()))
+        signature = "v0=" + hmac.new(
+            secret.encode(), f"v0:{timestamp}:".encode() + body, hashlib.sha256
+        ).hexdigest()
+        return body, {
+            "content-type": "application/x-www-form-urlencoded",
+            "x-slack-request-timestamp": timestamp,
+            "x-slack-signature": signature,
+        }
+
+    requests = [signed(payload) for payload in payloads]
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            responses = await asyncio.gather(
+                *[
+                    client.post(
+                        "/api/hitl/slack/interactions", content=body, headers=headers
+                    )
+                    for body, headers in requests
+                ]
+            )
+            assert sorted(response.status_code for response in responses) == [200, 409]
+
+            [command] = await app.state.store.list_operator_commands(run.id)
+            [resolved] = await app.state.store.list_hitl_events(run.id)
+            [event] = await app.state.store.list_events(
+                run.id, event_type="hitl.resolved"
+            )
+            assert command.payload["action"] == resolved["decision"]
+            assert command.actor == resolved["operator"]
+            assert command.instruction == resolved["instruction"]
+            assert event.id == f"hitl-resolved:{request_id}"
+
+            compatibility = json.loads(
+                (Path(run.workspace_path) / ".hitl_decision.json").read_text()
+            )
+            assert compatibility["action"] == resolved["decision"]
+            assert compatibility["operator"] == resolved["operator"]
+            assert compatibility["instruction"] == resolved["instruction"]
+
+            winner_index = next(
+                index
+                for index, response in enumerate(responses)
+                if response.status_code == 200
+            )
+            winner_body, winner_headers = requests[winner_index]
+            replay = await client.post(
+                "/api/hitl/slack/interactions",
+                content=winner_body,
+                headers=winner_headers,
+            )
+            assert replay.status_code == 200
+            assert replay.json()["status"] == "duplicate"
+        assert len(await app.state.store.list_operator_commands(run.id)) == 1
     finally:
         await app.state.store.close()
 

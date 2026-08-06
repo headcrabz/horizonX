@@ -21,6 +21,7 @@ from horizonx.core.types import (
     Task,
 )
 from horizonx.hitl.gate import _notify_slack, _notify_webhook, await_decision
+from horizonx.storage.sqlite import SqliteStore
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -359,6 +360,44 @@ async def test_await_decision_timeout_defaults_to_approve(tmp_path: Path) -> Non
 
     assert result.action == "approve"
     assert "timeout" in result.instruction.lower()
+
+
+async def test_store_timeout_persists_one_authoritative_decision_command(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    run = _make_run(tmp_path).model_copy(update={"status": RunStatus.RUNNING})
+    await store.save_run(run)
+    request_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
+    cfg = HITLConfig(timeout_minutes=1, escalation_action="abort")
+    calls = [0]
+
+    def patched_monotonic() -> float:
+        calls[0] += 1
+        return 0.0 if calls[0] == 1 else 61.0
+
+    try:
+        with (
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch("horizonx.hitl.gate.time") as mock_time,
+        ):
+            mock_time.monotonic = patched_monotonic
+            decision = await await_decision(
+                run,
+                "validator_paused",
+                {},
+                cfg,
+                store=store,
+                request_id=request_id,
+            )
+        assert decision.action == "abort"
+        [command] = await store.list_operator_commands(run.id)
+        assert command.kind.value == "decision"
+        assert command.payload == {"request_id": request_id, "action": "abort"}
+        [resolved] = await store.list_hitl_events(run.id)
+        assert resolved["resolution_idempotency_key"] == command.idempotency_key
+    finally:
+        await store.close()
 
 
 async def test_console_timeout_sends_secondary_slack_escalation(tmp_path: Path) -> None:

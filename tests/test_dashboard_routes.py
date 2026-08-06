@@ -392,6 +392,80 @@ async def test_hitl_stale_duplicate_is_rejected_after_new_pause_generation(
     assert (await app.state.store.find_hitl_event(second_id))["resolved_at"] is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submissions",
+    [
+        [
+            {"action": "approve", "operator": "alice", "reason": "ship",
+             "instruction": "approve output", "idempotency_key": "dash-approve"},
+            {"action": "abort", "operator": "bob", "reason": "unsafe",
+             "instruction": "stop output", "idempotency_key": "dash-abort"},
+        ],
+        [
+            {"action": "modify", "operator": "alice", "reason": "revise",
+             "instruction": "use path A", "idempotency_key": "dash-modify-a"},
+            {"action": "modify", "operator": "alice", "reason": "revise",
+             "instruction": "use path B", "idempotency_key": "dash-modify-b"},
+        ],
+    ],
+)
+async def test_concurrent_dashboard_decisions_have_one_authoritative_winner(
+    client: AsyncClient,
+    app,
+    seeded_run: Run,
+    submissions: list[dict[str, str]],
+) -> None:
+    run = seeded_run.model_copy(
+        update={"id": f"run-{submissions[0]['idempotency_key']}",
+                "status": RunStatus.RUNNING, "completed_at": None}
+    )
+    await app.state.store.save_run(run)
+    request_id, _ = await app.state.store.enter_hitl(
+        run.id, "validator_paused", {"race": True}
+    )
+    payloads = [{**submission, "request_id": request_id} for submission in submissions]
+
+    responses = await asyncio.gather(
+        *[
+            client.post(f"/api/runs/{run.id}/hitl", json=payload)
+            for payload in payloads
+        ]
+    )
+    assert sorted(response.status_code for response in responses) == [200, 409]
+
+    [command] = await app.state.store.list_operator_commands(run.id)
+    [resolved] = await app.state.store.list_hitl_events(run.id)
+    [event] = await app.state.store.list_events(run.id, event_type="hitl.resolved")
+    winner_payload = next(
+        payload for payload in payloads
+        if payload["idempotency_key"] == resolved["resolution_idempotency_key"]
+    )
+    assert command.payload == {
+        "request_id": request_id,
+        "action": winner_payload["action"],
+    }
+    assert resolved["decision"] == winner_payload["action"]
+    assert resolved["operator"] == winner_payload["operator"]
+    assert resolved["reason"] == winner_payload["reason"]
+    assert resolved["instruction"] == winner_payload["instruction"]
+    assert event.id == f"hitl-resolved:{request_id}"
+
+    compatibility = json.loads(
+        (Path(run.workspace_path) / ".hitl_decision.json").read_text()
+    )
+    assert compatibility["action"] == resolved["decision"]
+    assert compatibility["operator"] == resolved["operator"]
+    assert compatibility["instruction"] == resolved["instruction"]
+
+    replay = await client.post(
+        f"/api/runs/{run.id}/hitl", json=winner_payload
+    )
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "duplicate"
+    assert len(await app.state.store.list_operator_commands(run.id)) == 1
+
+
 # ---------------------------------------------------------------------------
 # Launch (POST /api/runs)
 # ---------------------------------------------------------------------------

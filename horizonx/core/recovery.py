@@ -376,22 +376,35 @@ class RecoveryCoordinator:
             if command.kind == OperatorCommandKind.DECISION
             and command.payload.get("request_id") == request["id"]
         ]
+        authoritative_command = None
         if request["resolved_at"] is None and decision_commands:
             command = decision_commands[0]
-            request, _, _ = await self.store.resolve_active_hitl_event_and_event(
-                run.id,
-                request["id"],
-                action=str(command.payload["action"]),
-                actor=command.actor,
-                reason=command.reason,
-                instruction=command.instruction,
-                idempotency_key=command.idempotency_key,
-            )
+            result = await self.store.submit_active_hitl_decision(command)
+            request = result.request
+            authoritative_command = result.command
         if request["resolved_at"] is None:
             return None
-        for command in decision_commands:
+        if authoritative_command is None:
+            authoritative_command = next(
+                (
+                    command
+                    for command in decision_commands
+                    if command.idempotency_key
+                    == request["resolution_idempotency_key"]
+                    and command.payload
+                    == {
+                        "request_id": request["id"],
+                        "action": request["decision"],
+                    }
+                    and command.actor == request["operator"]
+                    and command.reason == request["reason"]
+                    and command.instruction == request["instruction"]
+                ),
+                None,
+            )
+        if authoritative_command is not None:
             await self.store.consume_operator_command(
-                command.id, attempt_id=latest.id if latest else None
+                authoritative_command.id, attempt_id=latest.id if latest else None
             )
         if request["decision"] == "abort":
             if latest is not None and latest.status not in TERMINAL_ATTEMPT_STATUSES:

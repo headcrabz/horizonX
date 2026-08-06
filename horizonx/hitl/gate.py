@@ -13,7 +13,7 @@ import sys
 import time
 from typing import Any, Literal, cast
 
-from horizonx.core.operator_commands import OperatorCommandKind
+from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.types import (
     HITLConfig,
     HITLDecision,
@@ -92,12 +92,26 @@ async def await_decision(
             if request is None:
                 raise RuntimeError(f"HITL request disappeared: {request_id}")
             if request["resolved_at"] is not None:
-                for command in commands:
-                    if (
-                        command.kind.value == "decision"
-                        and command.payload.get("request_id") == request_id
-                    ):
-                        await store.consume_operator_command(command.id)
+                authoritative = next(
+                    (
+                        command
+                        for command in commands
+                        if command.kind == OperatorCommandKind.DECISION
+                        and command.idempotency_key
+                        == request["resolution_idempotency_key"]
+                        and command.payload
+                        == {
+                            "request_id": request_id,
+                            "action": request["decision"],
+                        }
+                        and command.actor == request["operator"]
+                        and command.reason == request["reason"]
+                        and command.instruction == request["instruction"]
+                    ),
+                    None,
+                )
+                if authoritative is not None:
+                    await store.consume_operator_command(authoritative.id)
                 return HITLDecision(
                     action=request["decision"],
                     instruction=request["instruction"] or "",
@@ -119,15 +133,19 @@ async def await_decision(
                 )
                 actor = "system:timeout"
                 instruction = f"auto-{action} after {cfg.timeout_minutes}m timeout"
-                resolved, _, _ = await store.resolve_active_hitl_event_and_event(
-                    run.id,
-                    request_id,
-                    action=action,
-                    actor=actor,
-                    reason="HITL timeout",
-                    instruction=instruction,
-                    idempotency_key=f"timeout:{request_id}",
+                result = await store.submit_active_hitl_decision(
+                    OperatorCommand(
+                        run_id=run.id,
+                        kind=OperatorCommandKind.DECISION,
+                        actor=actor,
+                        reason="HITL timeout",
+                        instruction=instruction,
+                        payload={"request_id": request_id, "action": action},
+                        idempotency_key=f"timeout:{request_id}",
+                    )
                 )
+                await store.consume_operator_command(result.command.id)
+                resolved = result.request
                 return HITLDecision(
                     action=resolved["decision"],
                     instruction=resolved["instruction"],
