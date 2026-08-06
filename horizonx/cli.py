@@ -28,6 +28,30 @@ from horizonx.storage.sqlite import StoreError
 console = Console()
 
 
+def _git_root(directory: Path) -> Path | None:
+    """Return the nearest Git worktree root without invoking Git."""
+    for candidate in (directory.resolve(), *directory.resolve().parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _externalize_git_project_state(
+    directory: Path, db_path: Path, workspace_root: Path
+) -> tuple[Path, Path]:
+    """Move unchanged init defaults beside, rather than inside, a Git checkout."""
+    project_directory = directory.resolve()
+    repository = _git_root(project_directory)
+    if repository is None:
+        return db_path, workspace_root
+    sibling_workspace_root = repository.parent / f".{repository.name}-horizonx-workspaces"
+    if db_path.resolve() == project_directory / "horizonx.db":
+        db_path = sibling_workspace_root / "horizonx.db"
+    if workspace_root.resolve() == project_directory / "horizonx-workspaces":
+        workspace_root = sibling_workspace_root
+    return db_path, workspace_root
+
+
 @click.group()
 @click.option(
     "--db",
@@ -50,8 +74,18 @@ def main(ctx: click.Context, db: str | None) -> None:
         raise click.ClickException(
             f"invalid {CONFIG_FILENAME}: {exc}. Fix the file or run horizonx init --force."
         ) from None
-    ctx.obj["db"] = db or (project.db_path if project else Path("horizonx.db"))
-    ctx.obj["workspace_root"] = project.workspace_root if project else None
+    if project is not None:
+        configured_db = project.db_path
+        configured_workspace_root = project.workspace_root
+        if project.generated_state_paths:
+            configured_db, configured_workspace_root = _externalize_git_project_state(
+                Path.cwd(), configured_db, configured_workspace_root
+            )
+        ctx.obj["db"] = db or configured_db
+        ctx.obj["workspace_root"] = configured_workspace_root
+    else:
+        ctx.obj["db"] = db or Path("horizonx.db")
+        ctx.obj["workspace_root"] = None
 
 
 @main.command()
@@ -73,7 +107,7 @@ def init(directory: Path, force: bool) -> None:
 
     directory.mkdir(parents=True, exist_ok=True)
     example_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(ProjectConfig().to_yaml())
+    config_path.write_text(ProjectConfig(generated_state_paths=True).to_yaml())
     example_path.write_text(_example_task_yaml())
     click.echo(f"Initialized HorizonX project in {directory.resolve()}")
 

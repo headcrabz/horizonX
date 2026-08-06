@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +20,20 @@ from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.project import ProjectConfig
 from horizonx.storage import SqliteStore
 from horizonx.storage.sqlite import StoreError
+
+
+@pytest.fixture
+def local_git_repository(tmp_path: Path) -> Path:
+    """Create a real, locally configured Git repository for CLI workflow coverage."""
+    repository = tmp_path / "source-repository"
+    repository.mkdir()
+    for command in (
+        ("git", "init"),
+        ("git", "config", "user.name", "HorizonX test"),
+        ("git", "config", "user.email", "horizonx-test@example.invalid"),
+    ):
+        subprocess.run(command, cwd=repository, check=True, capture_output=True, text=True)
+    return repository
 
 
 def _seed_run(
@@ -65,6 +80,7 @@ def test_init_creates_valid_config_and_runnable_mock_task(tmp_path: Path) -> Non
     assert config.version == 1
     assert config.db_path == project_dir / "horizonx.db"
     assert config.workspace_root == project_dir / "horizonx-workspaces"
+    assert config.generated_state_paths is True
     task = Task.model_validate(yaml.safe_load(task_path.read_text()))
     assert task.agent.type == "mock"
 
@@ -136,6 +152,132 @@ def test_initialized_example_runs_with_the_mock_provider(
     assert "Provider session: mock mock-session-001" in result.output
     assert "Cost: unknown" in result.output
     assert "Attach: horizonx attach " in result.output
+
+
+def test_local_git_repository_mock_workflow_keeps_source_checkout_unchanged(
+    local_git_repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the documented local-repository operator flow against real Git state."""
+    repository = local_git_repository
+    runner = CliRunner()
+    initialized = runner.invoke(main, ["init", str(repository)])
+    subprocess.run(("git", "add", "."), cwd=repository, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ("git", "commit", "-m", "Initialize HorizonX test project"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.chdir(repository)
+
+    run_result = runner.invoke(main, ["run", "tasks/example.yaml", "--repo", "."])
+
+    assert initialized.exit_code == 0, initialized.output
+    assert run_result.exit_code == 0, run_result.output
+    run_id = next(line.split(":", 1)[1].strip() for line in run_result.output.splitlines() if line.startswith("Run:"))
+    assert "Status: completed" in run_result.output
+    assert subprocess.run(
+        ("git", "status", "--porcelain"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+    status_result = runner.invoke(main, ["status", run_id])
+    evidence_result = runner.invoke(main, ["evidence", run_id])
+    watch_result = runner.invoke(main, ["watch", run_id, "--interval", "0"])
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    doctor_result = runner.invoke(main, ["doctor", "--task", "tasks/example.yaml"])
+
+    assert status_result.exit_code == 0, status_result.output
+    assert "Status: completed" in status_result.output
+    assert json.loads(evidence_result.output)["run"]["id"] == run_id
+    assert watch_result.exit_code == 0, watch_result.output
+    assert "Status: completed" in watch_result.output
+    assert doctor_result.exit_code == 0, doctor_result.output
+    assert "Provider binary: mock" in doctor_result.output
+
+    cancel_result = runner.invoke(main, ["cancel", run_id])
+    resume_result = runner.invoke(main, ["resume", run_id])
+    fork_result = runner.invoke(main, ["fork", run_id])
+
+    assert cancel_result.exit_code != 0
+    assert "terminal" in cancel_result.output.lower()
+    assert resume_result.exit_code != 0
+    assert "terminal" in resume_result.output.lower()
+    assert fork_result.exit_code == 0, fork_result.output
+    assert subprocess.run(
+        ("git", "status", "--porcelain"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+
+def test_explicit_git_project_workspace_root_is_not_redirected(
+    local_git_repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit workspace root remains subject to the Git containment check."""
+    repository = local_git_repository
+    runner = CliRunner()
+    initialized = runner.invoke(main, ["init", str(repository)])
+    (repository / "horizonx.yaml").write_text(
+        "version: 1\ndb_path: horizonx.db\nworkspace_root: operator-workspaces\n"
+        "generated_state_paths: true\n"
+    )
+    subprocess.run(("git", "add", "."), cwd=repository, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ("git", "commit", "-m", "Configure explicit workspace root"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.chdir(repository)
+
+    result = runner.invoke(main, ["run", "tasks/example.yaml", "--repo", "."])
+
+    assert initialized.exit_code == 0, initialized.output
+    assert result.exit_code != 0
+    assert "workspace root must be outside the source repository" in result.output
+
+
+def test_explicit_run_workspace_root_is_not_redirected(
+    local_git_repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The command-line workspace root also remains subject to containment checks."""
+    repository = local_git_repository
+    runner = CliRunner()
+    initialized = runner.invoke(main, ["init", str(repository)])
+    subprocess.run(("git", "add", "."), cwd=repository, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ("git", "commit", "-m", "Initialize HorizonX test project"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.chdir(repository)
+
+    result = runner.invoke(
+        main,
+        [
+            "run",
+            "tasks/example.yaml",
+            "--repo",
+            ".",
+            "--workspace-root",
+            str(repository / "command-workspaces"),
+        ],
+    )
+
+    assert initialized.exit_code == 0, initialized.output
+    assert result.exit_code != 0
+    assert "workspace root must be outside the source repository" in result.output
 
 
 def test_status_prints_compact_durable_summary(tmp_path: Path) -> None:

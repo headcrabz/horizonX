@@ -14,7 +14,7 @@ hardened. It is suitable for local evaluation and development—not unattended o
 [![CI](https://github.com/headcrabz/horizonX/actions/workflows/ci.yml/badge.svg)](https://github.com/headcrabz/horizonX/actions)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Tests: 478 passing](https://img.shields.io/badge/tests-478%20passing-brightgreen.svg)](tests/)
+[![Tests: 699 passing](https://img.shields.io/badge/tests-699%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -48,8 +48,8 @@ See the [support matrix](#project-status) before relying on a capability.
 
 ## Quick start
 
-Prerequisites: Python 3.11+ and one supported agent CLI. This repository is not yet
-published as a stable package, so install it from source:
+Prerequisites: Python 3.11+. Git is also required when a task uses a local repository. This
+repository is not yet published as a stable package, so install it from source:
 
 ```bash
 git clone https://github.com/headcrabz/horizonX.git
@@ -62,37 +62,58 @@ python -m pip install -e .
 horizonx --help
 ```
 
-Install and authenticate one of the [supported agent harnesses](#agent-harness-setup), then run
-the smallest example:
+Create a local project and run the built-in mock smoke test. It needs no provider binary or API
+secret:
 
 ```bash
-horizonx run examples/demo_word_counter/task.yaml
+horizonx init .
+horizonx run tasks/example.yaml
 
-# Inspect the run ID and persisted status
-horizonx list
-horizonx show <run-id>
+# The command prints a run ID; inspect the durable record.
+horizonx status <run-id>
 ```
 
-To run against an existing Git repository, pass its local path. HorizonX checks out the requested
-ref into an isolated worktree and leaves the source checkout unchanged:
+For a task against an existing Git repository, initialize HorizonX at the repository root, then
+pass the local source path. HorizonX checks out the requested ref into an isolated worktree and
+leaves the source checkout unchanged:
 
 ```bash
+horizonx init .
 horizonx run path/to/task.yaml --repo . --ref HEAD
 ```
 
-By default, orchestration state is written to `./horizonx.db`. From-scratch runs use
-`./horizonx-workspaces/`; local repository runs use a hidden sibling directory so the source tree
-does not become dirty. The CLI prints the exact run ID, status, and workspace path. Keep the
-database on a local filesystem and use one HorizonX process. To choose explicit locations, use
-`--db path/to/horizonx.db` before the command and `--workspace-root` after `run`.
+For an initialized Git project, the default database and workspaces live in the hidden sibling
+`.repo-horizonx-workspaces/` directory, so operator commands do not dirty the source checkout.
+For a non-Git project, the defaults are `./horizonx.db` and `./horizonx-workspaces/`. The CLI
+prints the exact run ID and workspace path. Keep the database on a local filesystem and use one
+HorizonX process. To choose an explicit database, put `--db path/to/horizonx.db` before a command.
 
-Optional operator views:
+Use these durable operator commands from another terminal:
 
 ```bash
-# Follow a run from another terminal
+horizonx status <run-id>
+horizonx attach <run-id>       # workspace and any provider-specific resume hint
+horizonx evidence <run-id>     # JSON evidence bundle
 horizonx watch <run-id>
+horizonx doctor --task tasks/example.yaml  # mock preflight; no provider secrets required
+```
 
-# Install and launch the dashboard
+`watch` exits after a terminal run status. `attach` reports persisted context only: it cannot
+reattach a lost local process. Cancellation and resume requests are durable commands for
+non-terminal runs:
+
+```bash
+horizonx cancel <active-run-id> --reason "operator requested stop"
+horizonx resume <non-terminal-run-id>
+
+# Terminal runs cannot be cancelled or resumed; fork one to start new work.
+horizonx fork <terminal-run-id>
+```
+
+The dashboard is optional:
+
+```bash
+# Install and launch the optional local dashboard
 pip install -e ".[dashboard]"
 horizonx serve
 ```
@@ -101,13 +122,7 @@ horizonx serve
 `HORIZONX_OPERATOR_TOKEN` so dashboard launch, HITL, cancellation, and command-writing endpoints
 require a bearer token. This remains a local, single-daemon alpha service.
 
-Resume is experimental and operates at supported attempt/session boundaries. Startup reconciliation
-can continue a captured provider thread when its adapter supports it; it cannot reattach a lost
-local process. Terminal runs cannot be resumed; fork them to begin new work:
-`horizonx run task.yaml --resume <run-id>`.
-
 The checked-in Compose file is currently a development stub, not a supported quick start. Image
-packaging, container binding, and health checks remain under hardening.
 
 ### Examples to try
 
@@ -450,7 +465,7 @@ focused tests; it does not imply a verified production guarantee.
 | Local workspace execution | Implemented, local-only | Local paths use isolated Git worktrees; setup and agent subprocess trees are terminated as one owned session. Attempt metadata records the boundary. Host filesystem, network, CPU, memory, child-count, and workspace-disk isolation are not enforced. |
 | Docker, Podman, and E2B execution | Not supported | Unimplemented backend values are rejected by configuration instead of being silently treated as local execution. |
 | Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |
-| Automated verification | Implemented | 511 tests pass on the current baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
+| Automated verification | Implemented | 699 tests pass on the current baseline; Ruff and Mypy pass. This is component coverage, not a production certification. |
 | Docker distribution | Not yet supported | The Compose file is a development stub; a real image, binding, health, install, and smoke-test path are planned. |
 
 Until the “under hardening” rows have end-to-end recovery and invariant evidence, do not market or
