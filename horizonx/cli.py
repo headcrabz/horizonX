@@ -19,6 +19,7 @@ from rich.table import Table
 from horizonx import RepositoryConfig, Run, RunStatus, Runtime, Task
 from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.types import TERMINAL_RUN_STATUSES
+from horizonx.doctor import run_doctor
 from horizonx.environments.base import WorkspaceError
 from horizonx.project import CONFIG_FILENAME, ProjectConfig
 from horizonx.storage import SqliteStore
@@ -113,6 +114,20 @@ def _load_task_from_path(path: Path) -> Task:
                 update={"path": (path.parent / repository_path).resolve()}
             )
     return task
+
+
+def _unsupported_doctor_backend_error(error: ValidationError) -> str | None:
+    """Describe known unsupported backend requests without displaying task values."""
+    for issue in error.errors():
+        if tuple(issue.get("loc", ())) != ("environment", "type"):
+            continue
+        backend = issue.get("input")
+        if isinstance(backend, str) and backend.lower() in {"container", "remote"}:
+            return (
+                f"unsupported workspace backend: {backend.lower()}. "
+                "Use environment.type: local."
+            )
+    return None
 
 
 async def _load_run_context(store: SqliteStore, run_id: str) -> tuple[Run, str | None, str | None]:
@@ -560,30 +575,40 @@ def export(ctx: click.Context, run_id: str, fmt: str) -> None:
 
 
 @main.command()
+@click.option("--task", "task_path", type=click.Path(path_type=Path))
+@click.option("--port", type=click.IntRange(1, 65535))
 @click.pass_context
-def doctor(ctx: click.Context) -> None:
-    """Check the local database schema, integrity, and connection policy."""
-
-    async def _doctor() -> tuple[int, list[str], dict[str, int | str]]:
-        store = SqliteStore(ctx.obj["db"])
+def doctor(ctx: click.Context, task_path: Path | None, port: int | None) -> None:
+    """Check local prerequisites, SQLite health, and workspace readiness."""
+    task: Task | None = None
+    if task_path is not None:
         try:
-            return (
-                await store.schema_version(),
-                await store.integrity_check(),
-                await store.connection_settings(),
-            )
-        finally:
-            await store.close()
+            task = _load_task_from_path(task_path)
+        except ValidationError as exc:
+            backend_error = _unsupported_doctor_backend_error(exc)
+            if backend_error is not None:
+                raise click.ClickException(backend_error) from None
+            raise click.ClickException(
+                "could not load task; check the path and task YAML before retrying"
+            ) from None
+        except (OSError, yaml.YAMLError):
+            raise click.ClickException(
+                "could not load task; check the path and task YAML before retrying"
+            ) from None
 
-    version, integrity, settings = asyncio.run(_doctor())
-    console.print(f"Schema version: {version}")
-    console.print(f"Integrity: {', '.join(integrity)}")
-    console.print(
-        "Connection policy: "
-        f"WAL={settings['journal_mode'] == 'wal'}, "
-        f"foreign keys={bool(settings['foreign_keys'])}, "
-        f"busy timeout={settings['busy_timeout']}ms"
+    workspace_root = ctx.obj["workspace_root"] or Path("horizonx-workspaces")
+    report = asyncio.run(
+        run_doctor(
+            db_path=Path(ctx.obj["db"]),
+            workspace_root=Path(workspace_root),
+            task=task,
+            port=port,
+        )
     )
+    for line in report.lines():
+        click.echo(line)
+    if report.has_failures:
+        raise click.ClickException("doctor found required prerequisites that need attention")
 
 
 @main.command()
