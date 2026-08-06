@@ -591,7 +591,7 @@ def doctor(ctx: click.Context, task_path: Path | None, port: int | None) -> None
             raise click.ClickException(
                 "could not load task; check the path and task YAML before retrying"
             ) from None
-        except (OSError, yaml.YAMLError):
+        except (OSError, UnicodeError, yaml.YAMLError):
             raise click.ClickException(
                 "could not load task; check the path and task YAML before retrying"
             ) from None

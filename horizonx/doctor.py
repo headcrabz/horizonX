@@ -7,12 +7,15 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 from horizonx import Task
 from horizonx.storage import SqliteStore
@@ -21,6 +24,9 @@ DoctorStatus = Literal["pass", "fail", "info", "unsupported"]
 
 # Doctor is an interactive preflight command, so version probes stay bounded.
 _VERSION_TIMEOUT_SECONDS = 2.0
+_PROBE_STREAM_LIMIT_BYTES = 8 * 1024
+_PROBE_TERMINATION_GRACE_SECONDS = 0.2
+_PROBE_DRAIN_JOIN_TIMEOUT_SECONDS = 0.2
 
 
 @dataclass(frozen=True)
@@ -84,24 +90,125 @@ _VERSION_PATTERN = re.compile(r"\b[vV]?(\d+(?:\.\d+){1,3})\b")
 
 
 def _probe_command_version(binary: str) -> tuple[bool, str]:
-    """Return a short version description without inheriting secret-bearing env vars."""
+    """Run a bounded, owned process-group version probe without secret-bearing env vars."""
     try:
-        result = subprocess.run(
-            [binary, "--version"],
-            check=False,
-            capture_output=True,
-            env={"PATH": os.environ.get("PATH", "")},
-            text=True,
-            timeout=_VERSION_TIMEOUT_SECONDS,
+        process = _start_probe_process(binary)
+    except OSError:
+        return False, "version probe failed"
+
+    output: dict[str, bytes] = {}
+    stdout_thread = threading.Thread(
+        target=lambda: output.setdefault("stdout", _drain_probe_stream(process.stdout)),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=lambda: output.setdefault("stderr", _drain_probe_stream(process.stderr)),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=_VERSION_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_probe_process_group(process)
+        returncode = None
+    finally:
+        _join_probe_drainers(
+            (stdout_thread, stderr_thread),
+            (process.stdout, process.stderr),
+            timed_out=timed_out,
         )
-    except (OSError, subprocess.TimeoutExpired):
+
+    if timed_out or returncode != 0:
         return False, "version probe failed"
-    if result.returncode != 0:
-        return False, "version probe failed"
-    match = _VERSION_PATTERN.search(result.stdout)
+    match = _VERSION_PATTERN.search(output.get("stdout", b"").decode(errors="replace"))
     if match is None:
         return False, "version could not be safely parsed"
     return True, f"version {match.group(1)}"
+
+
+def _start_probe_process(binary: str) -> subprocess.Popen[bytes]:
+    """Start a probe in an owned POSIX session for bounded group cleanup."""
+    kwargs: dict[str, object] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "env": {"PATH": os.environ.get("PATH", "")},
+    }
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    return subprocess.Popen([binary, "--version"], **kwargs)
+
+
+def _drain_probe_stream(
+    stream: BinaryIO | None, *, max_bytes: int = _PROBE_STREAM_LIMIT_BYTES
+) -> bytes:
+    """Drain a probe pipe while retaining only its bounded tail."""
+    retained = bytearray()
+    if stream is None:
+        return bytes(retained)
+    while True:
+        try:
+            chunk = stream.read(_PROBE_STREAM_LIMIT_BYTES)
+        except (OSError, ValueError):
+            break
+        if not chunk:
+            break
+        retained.extend(chunk)
+        if len(retained) > max_bytes:
+            del retained[:-max_bytes]
+    return bytes(retained)
+
+
+def _join_probe_drainers(
+    drainers: tuple[threading.Thread, threading.Thread],
+    streams: tuple[BinaryIO | None, BinaryIO | None],
+    *,
+    timed_out: bool,
+) -> None:
+    """Bound pipe-drainer cleanup even when a descendant keeps a pipe open."""
+    if timed_out:
+        for stream in streams:
+            if stream is not None:
+                stream.close()
+    for drainer in drainers:
+        drainer.join(timeout=_PROBE_DRAIN_JOIN_TIMEOUT_SECONDS)
+
+
+def _terminate_probe_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Mirror the owned-session cleanup used by agent subprocesses."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + _PROBE_TERMINATION_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                try:
+                    process.wait(timeout=_PROBE_TERMINATION_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+                return
+            time.sleep(0.01)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    else:  # pragma: no cover - Windows falls back to direct process cleanup.
+        process.terminate()
+        try:
+            process.wait(timeout=_PROBE_TERMINATION_GRACE_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            process.kill()
+    try:
+        process.wait(timeout=_PROBE_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return
 
 
 def _provider_checks(task: Task | None) -> list[DoctorCheck]:

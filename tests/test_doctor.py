@@ -2,21 +2,37 @@
 
 from __future__ import annotations
 
+import io
 import shutil
+import signal
 import socket
+import subprocess
 from pathlib import Path
-from subprocess import TimeoutExpired
-from types import SimpleNamespace
 
 from click.testing import CliRunner
 
 from horizonx.cli import main
 from horizonx.doctor import (
-    _VERSION_TIMEOUT_SECONDS,
+    _PROBE_DRAIN_JOIN_TIMEOUT_SECONDS,
+    _PROBE_STREAM_LIMIT_BYTES,
     DoctorCheck,
     DoctorReport,
+    _drain_probe_stream,
+    _join_probe_drainers,
     _probe_command_version,
 )
+
+
+class _VersionProcess:
+    pid = 1
+
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        self.stdout = io.BytesIO(stdout.encode())
+        self.stderr = io.BytesIO()
+        self.returncode = returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
 
 
 def _task(path: Path, *, provider: str = "codex") -> Path:
@@ -107,8 +123,8 @@ def test_doctor_constrains_untrusted_provider_version_output(
     monkeypatch.setenv("OPENAI_API_KEY", "configured")
     monkeypatch.setattr("horizonx.doctor.shutil.which", lambda _: "/pretend/codex")
     monkeypatch.setattr(
-        "horizonx.doctor.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=f"Codex 9.8.7 {secret}"),
+        "horizonx.doctor._start_probe_process",
+        lambda _: _VersionProcess(f"Codex 9.8.7 {secret}"),
     )
 
     result = CliRunner().invoke(
@@ -184,8 +200,8 @@ def test_doctor_treats_missing_claude_api_key_as_local_login_information(
         lambda binary: "/pretend/claude" if binary == "claude" else original_which(binary),
     )
     monkeypatch.setattr(
-        "horizonx.doctor.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="Claude 2.1.0"),
+        "horizonx.doctor._start_probe_process",
+        lambda _: _VersionProcess("Claude 2.1.0"),
     )
 
     result = CliRunner().invoke(
@@ -208,8 +224,8 @@ def test_doctor_treats_missing_codex_api_key_as_local_login_information(
         lambda binary: "/pretend/codex" if binary == "codex" else original_which(binary),
     )
     monkeypatch.setattr(
-        "horizonx.doctor.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="Codex 1.2.3"),
+        "horizonx.doctor._start_probe_process",
+        lambda _: _VersionProcess("Codex 1.2.3"),
     )
 
     result = CliRunner().invoke(
@@ -222,10 +238,16 @@ def test_doctor_treats_missing_codex_api_key_as_local_login_information(
 
 
 def test_version_probe_times_out_with_a_bounded_safe_failure(monkeypatch) -> None:
-    def timeout(*args: object, **kwargs: object) -> None:
-        raise TimeoutExpired("provider", _VERSION_TIMEOUT_SECONDS)
+    class TimedOutProcess:
+        pid = 123
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
 
-    monkeypatch.setattr("horizonx.doctor.subprocess.run", timeout)
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired("provider", timeout)
+
+    monkeypatch.setattr("horizonx.doctor._start_probe_process", lambda _: TimedOutProcess())
+    monkeypatch.setattr("horizonx.doctor.os.killpg", lambda *args, **kwargs: None)
 
     successful, detail = _probe_command_version("provider")
 
@@ -233,10 +255,83 @@ def test_version_probe_times_out_with_a_bounded_safe_failure(monkeypatch) -> Non
     assert detail == "version probe failed"
 
 
+def test_version_probe_retains_only_a_bounded_tail_when_output_floods() -> None:
+    payload = b"x" * (_PROBE_STREAM_LIMIT_BYTES * 2) + b"tail"
+
+    retained = _drain_probe_stream(io.BytesIO(payload))
+
+    assert retained == b"x" * (_PROBE_STREAM_LIMIT_BYTES - 4) + b"tail"
+
+
+def test_timed_out_version_probe_closes_pipes_and_bounds_drain_joins() -> None:
+    calls: list[float | None] = []
+
+    class BlockingDrain:
+        def join(self, timeout: float | None = None) -> None:
+            calls.append(timeout)
+
+    class ProbePipe:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    stdout = ProbePipe()
+    stderr = ProbePipe()
+
+    _join_probe_drainers((BlockingDrain(), BlockingDrain()), (stdout, stderr), timed_out=True)
+
+    assert stdout.closed and stderr.closed
+    assert calls == [_PROBE_DRAIN_JOIN_TIMEOUT_SECONDS] * 2
+
+
+def test_version_probe_terminates_the_owned_process_group_on_timeout(monkeypatch) -> None:
+    calls: list[tuple[int, int]] = []
+
+    class TimedOutProcess:
+        pid = 456
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise subprocess.TimeoutExpired("provider", timeout)
+            return 1
+
+    def killpg(pid: int, sig: int) -> None:
+        calls.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr("horizonx.doctor._start_probe_process", lambda _: TimedOutProcess())
+    monkeypatch.setattr("horizonx.doctor.os.killpg", killpg)
+
+    successful, detail = _probe_command_version("provider")
+
+    assert not successful
+    assert detail == "version probe failed"
+    assert calls == [(456, signal.SIGTERM), (456, 0)]
+
+
 def test_doctor_rejects_unloadable_task_with_an_actionable_error(tmp_path: Path) -> None:
     missing = tmp_path / "missing-task.yaml"
 
     result = CliRunner().invoke(main, ["doctor", "--task", str(missing)])
+
+    assert result.exit_code != 0
+    assert "could not load task" in result.output.lower()
+    assert "check the path" in result.output.lower()
+
+
+def test_doctor_rejects_a_non_utf8_task_with_an_actionable_error(tmp_path: Path) -> None:
+    task_path = tmp_path / "task.yaml"
+    task_path.write_bytes(b"\xff\xfe")
+
+    result = CliRunner().invoke(main, ["doctor", "--task", str(task_path)])
 
     assert result.exit_code != 0
     assert "could not load task" in result.output.lower()
