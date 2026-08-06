@@ -44,6 +44,7 @@ from horizonx.storage.migrations import (
     prepare_schema,
     read_schema_version,
     record_current_schema,
+    repair_hitl_requested_events,
 )
 
 _T = TypeVar("_T")
@@ -70,6 +71,15 @@ class GoalVersionConflict(StoreError):
 
 class OperatorCommandConflict(StoreError):
     """Raised when an idempotency key is reused for different command content."""
+
+
+class HITLTransitionError(StoreError):
+    """Raised when a run is no longer eligible to enter HITL."""
+
+    def __init__(self, run_id: str, status: str) -> None:
+        self.run_id = run_id
+        self.status = status
+        super().__init__(f"run {run_id!r} cannot enter HITL from status {status!r}")
 
 
 _ALLOWED_GOAL_TRANSITIONS: dict[GoalStatus, frozenset[GoalStatus]] = {
@@ -476,6 +486,7 @@ class SqliteStore:
             prepare_schema(c)
             c.executescript(SCHEMA)
             ensure_additive_schema(c)
+            repair_hitl_requested_events(c)
             record_current_schema(c)
 
     async def _run_sync(self, fn: Callable[..., _T], *args: Any) -> _T:
@@ -1848,55 +1859,45 @@ class SqliteStore:
     ) -> tuple[str, Any]:
         from uuid import uuid4
 
+        with self._conn() as c:
+            return self._insert_hitl_request(
+                c, run_id, trigger, context, hitl_id or str(uuid4()), actor,
+                instruction,
+            )
+
+    def _insert_hitl_request(
+        self, c: sqlite3.Connection, run_id: str, trigger: str,
+        context: dict[str, Any], event_id: str, actor: str, instruction: str,
+    ) -> tuple[str, Any]:
         from horizonx.core.event_bus import Event
 
-        event_id = hitl_id or str(uuid4())
-        triggered_at = utcnow().isoformat()
-        with self._conn() as c:
-            c.execute(
-                "INSERT OR IGNORE INTO hitl_events "
-                "(id, run_id, triggered_at, trigger, context, request_actor, "
-                "request_reason, request_instruction) VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    event_id,
-                    run_id,
-                    triggered_at,
-                    trigger,
-                    json.dumps(context, default=str),
-                    actor,
-                    trigger,
-                    instruction,
-                ),
-            )
-            request = c.execute(
-                "SELECT * FROM hitl_events WHERE id=?", (event_id,)
-            ).fetchone()
-            if request is None:  # pragma: no cover
-                raise StoreError(f"HITL request disappeared after insert: {event_id}")
-            requested_id = f"hitl.requested:{event_id}"
-            c.execute(
-                "INSERT OR IGNORE INTO events "
-                "(id, type, run_id, timestamp, payload) VALUES (?,?,?,?,?)",
-                (
-                    requested_id,
-                    "hitl.requested",
-                    request["run_id"],
-                    request["triggered_at"],
-                    json.dumps(
-                        {
-                            "request_id": event_id,
-                            "reason": request["trigger"],
-                            "context": json.loads(request["context"] or "{}"),
-                            "actor": request["request_actor"],
-                            "instruction": request["request_instruction"] or "",
-                        },
-                        default=str,
-                    ),
-                ),
-            )
-            event_row = c.execute(
-                "SELECT * FROM events WHERE id=?", (requested_id,)
-            ).fetchone()
+        c.execute(
+            "INSERT OR IGNORE INTO hitl_events "
+            "(id, run_id, triggered_at, trigger, context, request_actor, "
+            "request_reason, request_instruction) VALUES (?,?,?,?,?,?,?,?)",
+            (event_id, run_id, utcnow().isoformat(), trigger,
+             json.dumps(context, default=str), actor, trigger, instruction),
+        )
+        request = c.execute(
+            "SELECT * FROM hitl_events WHERE id=?", (event_id,)
+        ).fetchone()
+        if request is None:  # pragma: no cover
+            raise StoreError(f"HITL request disappeared after insert: {event_id}")
+        requested_id = f"hitl.requested:{event_id}"
+        c.execute(
+            "INSERT OR IGNORE INTO events "
+            "(id, type, run_id, timestamp, payload) VALUES (?,?,?,?,?)",
+            (requested_id, "hitl.requested", request["run_id"],
+             request["triggered_at"], json.dumps({
+                 "request_id": event_id, "reason": request["trigger"],
+                 "context": json.loads(request["context"] or "{}"),
+                 "actor": request["request_actor"],
+                 "instruction": request["request_instruction"] or "",
+             }, default=str)),
+        )
+        event_row = c.execute(
+            "SELECT * FROM events WHERE id=?", (requested_id,)
+        ).fetchone()
         assert event_row is not None
         return event_id, Event(
             id=event_row["id"], sequence=event_row["sequence"],
@@ -1904,6 +1905,43 @@ class SqliteStore:
             attempt_id=event_row["attempt_id"], session_id=event_row["session_id"],
             goal_id=event_row["goal_id"], timestamp=event_row["timestamp"],
             payload=json.loads(event_row["payload"] or "{}"),
+        )
+
+    def _sync_enter_hitl(
+        self, run_id: str, trigger: str, context: dict[str, Any],
+        hitl_id: str | None, actor: str, instruction: str,
+    ) -> tuple[str, Any]:
+        from uuid import uuid4
+
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            run = c.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError(f"run not found: {run_id}")
+            if run["status"] != RunStatus.RUNNING.value:
+                raise HITLTransitionError(run_id, run["status"])
+            changed = c.execute(
+                "UPDATE runs SET status=? WHERE id=? AND status=?",
+                (RunStatus.PAUSED_HITL.value, run_id, RunStatus.RUNNING.value),
+            )
+            if changed.rowcount != 1:  # pragma: no cover - write lock fences races
+                current = c.execute(
+                    "SELECT status FROM runs WHERE id=?", (run_id,)
+                ).fetchone()
+                raise HITLTransitionError(run_id, current["status"])
+            return self._insert_hitl_request(
+                c, run_id, trigger, context, hitl_id or str(uuid4()), actor,
+                instruction,
+            )
+
+    async def enter_hitl(
+        self, run_id: str, trigger: str, context: dict[str, Any],
+        hitl_id: str | None = None, actor: str = "system", instruction: str = "",
+    ) -> tuple[str, Any]:
+        """Fence pause transition, audit insertion, and event insertion together."""
+        return await self._run_sync(
+            self._sync_enter_hitl, run_id, trigger, context, hitl_id, actor,
+            instruction,
         )
 
     async def save_hitl_event(

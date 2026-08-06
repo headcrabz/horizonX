@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from horizonx.core.types import GoalNode
+from horizonx.core.types import AgentConfig, GoalNode, Run, RunStatus, StrategyConfig, Task
 from horizonx.storage.migrations import SchemaMigrationError
 from horizonx.storage.sqlite import SqliteStore, StoreBusyError
 
@@ -274,6 +274,62 @@ def test_newer_schema_version_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(SchemaMigrationError, match="newer schema version"):
         SqliteStore(path)
+
+
+@pytest.mark.asyncio
+async def test_startup_repairs_requested_events_for_every_legacy_run_status(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-hitl-request-events.db"
+    store = SqliteStore(path)
+    request_ids: dict[str, str] = {}
+    statuses = {
+        "terminal": RunStatus.ABORTED,
+        "running": RunStatus.RUNNING,
+        "paused": RunStatus.PAUSED_HITL,
+    }
+    for suffix, status in statuses.items():
+        run = Run(
+            id=f"run-{suffix}",
+            task=Task(
+                id=f"task-{suffix}", name=suffix, prompt="wait",
+                strategy=StrategyConfig(kind="single"),
+                agent=AgentConfig(type="mock", model="mock"),
+            ),
+            workspace_path=tmp_path / suffix,
+            status=status,
+        )
+        await store.save_run(run)
+        request_ids[suffix] = await store.save_hitl_event(
+            run.id, "validator_paused", {"status": suffix}
+        )
+    with store._conn() as connection:
+        connection.execute("DELETE FROM events WHERE type='hitl.requested'")
+    await store.close()
+
+    repaired = SqliteStore(path)
+    try:
+        assert await repaired.schema_version() == 6
+        first = await repaired.list_all_events(limit=100)
+        requested = [event for event in first if event.type == "hitl.requested"]
+        assert {event.id for event in requested} == {
+            f"hitl.requested:{request_id}" for request_id in request_ids.values()
+        }
+        first_sequences = {event.id: event.sequence for event in requested}
+    finally:
+        await repaired.close()
+
+    reopened = SqliteStore(path)
+    try:
+        assert await reopened.schema_version() == 6
+        second = [
+            event for event in await reopened.list_all_events(limit=100)
+            if event.type == "hitl.requested"
+        ]
+        assert len(second) == 3
+        assert {event.id: event.sequence for event in second} == first_sequences
+    finally:
+        await reopened.close()
 
 
 def test_incomplete_composite_schema_is_rejected(tmp_path: Path) -> None:

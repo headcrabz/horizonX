@@ -249,8 +249,6 @@ class RecoveryCoordinator:
     ) -> RecoveryDecision | None:
         """Apply durable operator state left behind when a HITL waiter died."""
         requests = await self.store.list_hitl_events(run.id)
-        for stored_request in requests:
-            await self.store.ensure_hitl_requested_event(stored_request["id"])
         request = requests[-1] if requests else None
         commands = await self.store.list_operator_commands(
             run.id, unconsumed_only=True

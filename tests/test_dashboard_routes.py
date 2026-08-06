@@ -275,7 +275,9 @@ async def test_hitl_resolve_writes_file(
         run_id=seeded_run.id,
         after_sequence=0,
     )
+    requested = await anext(replay)
     replayed = await anext(replay)
+    assert requested["event"] == "hitl.requested"
     assert replayed["id"] == str(events[0].sequence)
     await replay.aclose()
     await store.close()

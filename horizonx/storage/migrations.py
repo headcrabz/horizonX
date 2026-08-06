@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 CURRENT_SCHEMA_VERSION = 6
@@ -280,6 +281,34 @@ def ensure_additive_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_commands_idempotency "
             "ON operator_commands(run_id, idempotency_key)"
+        )
+
+
+def repair_hitl_requested_events(conn: sqlite3.Connection) -> None:
+    """Idempotently restore stable request ledger rows for every legacy audit."""
+    if not _table_exists(conn, "hitl_events") or not _table_exists(conn, "events"):
+        return
+    requests = conn.execute("SELECT * FROM hitl_events ORDER BY triggered_at, id").fetchall()
+    for request in requests:
+        conn.execute(
+            "INSERT OR IGNORE INTO events "
+            "(id, type, run_id, timestamp, payload) VALUES (?,?,?,?,?)",
+            (
+                f"hitl.requested:{request['id']}",
+                "hitl.requested",
+                request["run_id"],
+                request["triggered_at"],
+                json.dumps(
+                    {
+                        "request_id": request["id"],
+                        "reason": request["trigger"],
+                        "context": json.loads(request["context"] or "{}"),
+                        "actor": request["request_actor"],
+                        "instruction": request["request_instruction"] or "",
+                    },
+                    default=str,
+                ),
+            ),
         )
 
 

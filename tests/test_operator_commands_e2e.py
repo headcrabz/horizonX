@@ -253,7 +253,7 @@ async def test_attempt_consumes_steer_then_cancel_commands(tmp_path: Path) -> No
     store = SqliteStore(tmp_path / "state.db")
     runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
     run = _run(tmp_path / "workspace")
-    run.workspace_path.mkdir()
+    run.workspace_path.mkdir(exist_ok=True)
     await store.save_run(run)
     agent = _CommandAwareAgent()
     leases = LeaseManager(store)
@@ -679,6 +679,122 @@ async def test_hitl_request_and_requested_event_survive_before_publish_crash(
         events = await restarted.list_events(run.id, event_type="hitl.requested")
         assert [event.id for event in events] == [requested.id]
         assert events[0].sequence == requested.sequence
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_winning_before_hitl_entry_aborts_without_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import threading
+
+    store = SqliteStore(tmp_path / "state.db")
+    competing = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path / "workspace")
+    run.workspace_path.mkdir()
+    await store.save_run(run)
+    entered = threading.Event()
+    release = threading.Event()
+    original_enter = store._sync_enter_hitl
+
+    def blocked_enter(*args):  # type: ignore[no-untyped-def]
+        entered.set()
+        assert release.wait(timeout=1)
+        return original_enter(*args)
+
+    monkeypatch.setattr(store, "_sync_enter_hitl", blocked_enter)
+    runtime = Runtime(store, workspace_root=tmp_path / "workspaces")
+    request_task = asyncio.create_task(
+        runtime.request_hitl(run, reason="validator_paused", context={})
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+    await competing.submit_cancel_command(
+        OperatorCommand(
+            run_id=run.id, kind=OperatorCommandKind.CANCEL, actor="alice",
+            reason="cancel won", idempotency_key="cancel-before-hitl",
+        )
+    )
+    release.set()
+    try:
+        decision = await asyncio.wait_for(request_task, timeout=0.5)
+        assert decision.action == "abort"
+        assert (await store.load_run(run.id)).status == RunStatus.ABORTED
+        assert await store.list_hitl_events(run.id) == []
+        assert await store.list_events(run.id, event_type="hitl.requested") == []
+    finally:
+        await store.close()
+        await competing.close()
+
+
+@pytest.mark.asyncio
+async def test_hitl_entry_winning_before_cancel_is_resolved_atomically_on_restart(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    from horizonx.core.event_bus import Event, InMemoryBus
+
+    class BlockingRequestedBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.request_committed = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def publish(self, event: Event) -> None:
+            if event.type == "hitl.requested":
+                self.request_committed.set()
+                await self.release.wait()
+            await super().publish(event)
+
+    path = tmp_path / "state.db"
+    hitl_store = SqliteStore(path)
+    cancel_store = SqliteStore(path)
+    run = _run(tmp_path)
+    run.workspace_path.mkdir(exist_ok=True)
+    await hitl_store.save_run(run)
+    downstream = BlockingRequestedBus()
+    runtime = Runtime(hitl_store, downstream, tmp_path / "workspaces")
+    request_task = asyncio.create_task(
+        runtime.request_hitl(
+            run, reason="validator_paused", context={"risk": "high"}
+        )
+    )
+    assert await asyncio.wait_for(downstream.request_committed.wait(), timeout=0.5)
+    assert (await hitl_store.load_run(run.id)).status == RunStatus.PAUSED_HITL
+    [request] = await hitl_store.list_hitl_events(run.id)
+    request_id = request["id"]
+    [requested] = await hitl_store.list_events(run.id, event_type="hitl.requested")
+    await cancel_store.submit_cancel_command(
+        OperatorCommand(
+            run_id=run.id, kind=OperatorCommandKind.CANCEL, actor="alice",
+            reason="cancel after pause", idempotency_key="cancel-after-hitl",
+        )
+    )
+    downstream.release.set()
+    decision = await asyncio.wait_for(request_task, timeout=0.5)
+    assert decision.action == "abort"
+    await hitl_store.close()
+    await cancel_store.close()
+
+    restarted = SqliteStore(path)
+    try:
+        assert (await restarted.load_run(run.id)).status == RunStatus.ABORTED
+        [request] = await restarted.list_hitl_events(run.id)
+        assert request["id"] == request_id
+        assert request["decision"] == "abort"
+        assert request["resolved_at"] is not None
+        requested_events = await restarted.list_events(
+            run.id, event_type="hitl.requested"
+        )
+        resolved_events = await restarted.list_events(
+            run.id, event_type="hitl.resolved"
+        )
+        assert [event.id for event in requested_events] == [requested.id]
+        assert [event.id for event in resolved_events] == [
+            f"hitl-resolved:{request_id}"
+        ]
     finally:
         await restarted.close()
 

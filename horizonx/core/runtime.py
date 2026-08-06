@@ -723,14 +723,22 @@ class Runtime:
                 instruction=f"HITL skipped for unconfigured trigger: {reason}",
                 operator="system:policy",
             )
+        from horizonx.storage.sqlite import HITLTransitionError
+
+        try:
+            request_id, requested_event = await self.store.enter_hitl(
+                run.id, reason, context, actor="system"
+            )
+        except HITLTransitionError:
+            persisted = await self.store.load_run(run.id)
+            run.status = persisted.status
+            run.completed_at = persisted.completed_at
+            return HITLDecision(
+                action="abort",
+                instruction=f"run became {persisted.status.value} before HITL entry",
+                operator="system:operator-control",
+            )
         run.status = RunStatus.PAUSED_HITL
-        await self.store.save_run(run)
-        request_id, requested_event = await self.store.save_hitl_event_and_event(
-            run.id,
-            reason,
-            context,
-            actor="system",
-        )
         if isinstance(self.bus, DurableEventBus):
             await self.bus.downstream.publish(requested_event)
         else:
