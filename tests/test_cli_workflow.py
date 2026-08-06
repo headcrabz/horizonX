@@ -120,11 +120,14 @@ def test_force_init_repairs_malformed_config_in_current_directory(
     assert ProjectConfig.load(tmp_path / "horizonx.yaml").version == 1
 
 
-def test_initialized_example_runs_with_the_mock_provider(tmp_path: Path) -> None:
+def test_initialized_example_runs_with_the_mock_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
     project_dir = tmp_path / "project"
     runner = CliRunner()
 
     initialized = runner.invoke(main, ["init", str(project_dir)])
+    monkeypatch.chdir(project_dir)
     result = runner.invoke(main, ["run", str(project_dir / "tasks" / "example.yaml")])
 
     assert initialized.exit_code == 0, initialized.output
