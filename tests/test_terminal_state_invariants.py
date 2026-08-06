@@ -683,6 +683,100 @@ async def test_runtime_hard_spin_uses_authenticated_durable_hitl(
 
 
 @pytest.mark.asyncio
+async def test_hard_spin_cancel_winner_starts_no_more_work(tmp_path: Path) -> None:
+    import asyncio
+
+    from horizonx.core.types import SpinReport
+    from tests.test_attempt_executor import _RepeatingAgent
+
+    path = tmp_path / "horizonx.db"
+    store = SqliteStore(path)
+    cancel_store = SqliteStore(path)
+    runtime = Runtime(store=store, workspace_root=tmp_path / "workspaces")
+    runtime.check_spin = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            SpinReport(detected=True, layer="loop", action="terminate_and_hitl"),
+            None,
+        ]
+    )
+    apply_started = asyncio.Event()
+    allow_apply = asyncio.Event()
+    original_apply = store.apply_hitl_decision
+    original_register = runtime.register_cancel_token
+    registered_tokens: list[object] = []
+
+    async def apply_after_cancel(*args: object, **kwargs: object):
+        apply_started.set()
+        await allow_apply.wait()
+        return await original_apply(*args, **kwargs)
+
+    def track_cancel_token(run_id: str, token: object) -> None:
+        registered_tokens.append(token)
+        original_register(run_id, token)
+
+    store.apply_hitl_decision = apply_after_cancel  # type: ignore[method-assign]
+    runtime.register_cancel_token = track_cancel_token  # type: ignore[method-assign]
+    _AttemptBackedStrategy.executions = 0
+    execution: asyncio.Task[Run] | None = None
+    try:
+        with (
+            patch.object(runtime, "_load_strategy", return_value=_AttemptBackedStrategy),
+            patch(
+                "horizonx.core.attempt_executor.build_agent",
+                return_value=_RepeatingAgent(),
+            ),
+        ):
+            execution = asyncio.create_task(runtime.run(_task()))
+            for _ in range(100):
+                runs = await store.list_nonterminal_runs()
+                requests = await store.list_hitl_events(runs[0].id) if runs else []
+                if requests:
+                    break
+                await asyncio.sleep(0.01)
+            assert requests
+            run_id = requests[-1]["run_id"]
+            await store.submit_active_hitl_decision(
+                OperatorCommand(
+                    run_id=run_id,
+                    kind=OperatorCommandKind.DECISION,
+                    actor="human-operator",
+                    instruction="continue after spin",
+                    payload={
+                        "request_id": requests[-1]["id"],
+                        "action": "modify",
+                    },
+                    idempotency_key="spin-human-modify",
+                )
+            )
+            await asyncio.wait_for(apply_started.wait(), timeout=1)
+            await cancel_store.submit_cancel_command(
+                OperatorCommand(
+                    run_id=run_id,
+                    kind=OperatorCommandKind.CANCEL,
+                    actor="cancel-operator",
+                    reason="stop after hard spin",
+                    idempotency_key="spin-terminal-cancel",
+                )
+            )
+            allow_apply.set()
+            run = await asyncio.wait_for(execution, timeout=1)
+
+        assert run.status == RunStatus.ABORTED
+        assert (await cancel_store.load_run(run.id)).status == RunStatus.ABORTED
+        assert _AttemptBackedStrategy.executions == 1
+        assert len(await store.list_attempts(run.id)) == 1
+        assert len(registered_tokens) == 1
+        assert await store.list_events(run.id, event_type="goals.re_decomposed") == []
+    finally:
+        allow_apply.set()
+        if execution is not None and not execution.done():
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+        await store.close()
+        await cancel_store.close()
+
+
+@pytest.mark.asyncio
 async def test_hard_spin_hitl_survives_runtime_crash_then_cancel(
     tmp_path: Path,
 ) -> None:

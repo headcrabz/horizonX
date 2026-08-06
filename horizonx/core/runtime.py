@@ -802,7 +802,16 @@ class Runtime:
             )
         except HITLTransitionError:
             persisted = await self.store.load_run(run.id)
-            if persisted.status not in TERMINAL_RUN_STATUSES:
+            if persisted.status in TERMINAL_RUN_STATUSES:
+                decision = HITLDecision(
+                    action="abort",
+                    instruction=(
+                        f"run became {persisted.status.value} before "
+                        "HITL decision application"
+                    ),
+                    operator="system:operator-control",
+                )
+            else:
                 persisted = await self.store.transition_run(run.id, RunStatus.FAILED)
                 decision = HITLDecision(
                     action="abort",

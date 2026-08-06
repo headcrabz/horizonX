@@ -1622,6 +1622,81 @@ async def test_acknowledgement_requirement_fails_closed_on_timeout(
         await store.close()
 
 
+@pytest.mark.parametrize("human_action", ["approve", "modify"])
+@pytest.mark.parametrize(
+    "winner_status", [RunStatus.ABORTED, RunStatus.FAILED, RunStatus.COMPLETED]
+)
+async def test_request_hitl_normalizes_concurrent_terminal_winner(
+    tmp_path: Path,
+    human_action: str,
+    winner_status: RunStatus,
+) -> None:
+    path = tmp_path / "state.db"
+    runtime_store = SqliteStore(path)
+    cancel_store = SqliteStore(path)
+    runtime = Runtime(store=runtime_store, workspace_root=tmp_path / "workspaces")
+    run = _run(tmp_path)
+    await runtime_store.save_run(run)
+    apply_started = asyncio.Event()
+    allow_apply = asyncio.Event()
+    original_apply = runtime_store.apply_hitl_decision
+
+    async def apply_after_cancel(*args: object, **kwargs: object):
+        apply_started.set()
+        await allow_apply.wait()
+        return await original_apply(*args, **kwargs)
+
+    runtime_store.apply_hitl_decision = apply_after_cancel  # type: ignore[method-assign]
+    request_task = asyncio.create_task(
+        runtime.request_hitl(run, reason="validator_paused", context={})
+    )
+    try:
+        for _ in range(100):
+            requests = await runtime_store.list_hitl_events(run.id)
+            if requests:
+                break
+            await asyncio.sleep(0.01)
+        assert requests
+        request_id = requests[-1]["id"]
+        await runtime_store.submit_active_hitl_decision(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.DECISION,
+                actor="human-operator",
+                instruction="continue stale work",
+                payload={"request_id": request_id, "action": human_action},
+                idempotency_key=f"human-{human_action}",
+            )
+        )
+        await asyncio.wait_for(apply_started.wait(), timeout=1)
+        if winner_status == RunStatus.ABORTED:
+            await cancel_store.submit_cancel_command(
+                OperatorCommand(
+                    run_id=run.id,
+                    kind=OperatorCommandKind.CANCEL,
+                    actor="cancel-operator",
+                    reason="terminal cancel won",
+                    idempotency_key=f"cancel-{human_action}",
+                )
+            )
+        else:
+            await cancel_store.transition_run(run.id, winner_status)
+        allow_apply.set()
+        decision = await asyncio.wait_for(request_task, timeout=1)
+        assert decision.action == "abort"
+        assert decision.operator == "system:operator-control"
+        assert winner_status.value in decision.instruction
+        assert run.status == winner_status
+        assert (await cancel_store.load_run(run.id)).status == winner_status
+    finally:
+        allow_apply.set()
+        if not request_task.done():
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+        await runtime_store.close()
+        await cancel_store.close()
+
+
 @pytest.mark.asyncio
 async def test_live_cancel_stops_unbounded_hitl_wait_and_releases_lease(
     tmp_path: Path,
