@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
@@ -13,12 +14,15 @@ from horizonx.core.leases import LeaseManager
 from horizonx.core.operator_commands import OperatorCommandKind
 from horizonx.core.types import (
     TERMINAL_ATTEMPT_STATUSES,
+    TERMINAL_RUN_STATUSES,
     AttemptRecord,
     AttemptStatus,
     LeaseRecord,
     Run,
     RunStatus,
 )
+
+_RECOVERY_AMBIGUITY_TRIGGER = "recovery_ambiguous_completion"
 
 
 class RecoveryAction(str, Enum):
@@ -154,9 +158,49 @@ class RecoveryCoordinator:
                         lease_handed_off = True
                     continue
                 if latest is not None and latest.status == AttemptStatus.COMPLETED:
-                    run.status = RunStatus.PAUSED_HITL
-                    run.completed_at = None
-                    await self.store.save_run(run)
+                    if (
+                        not run.task.hitl.enabled
+                        or _RECOVERY_AMBIGUITY_TRIGGER not in run.task.hitl.triggers
+                    ):
+                        await self.store.transition_run(run.id, RunStatus.FAILED)
+                        await self.store.append_event(
+                            Event(
+                                id=f"recovery-{run.id}-{lease.version}",
+                                type="recovery.planned",
+                                run_id=run.id,
+                                attempt_id=latest.id,
+                                payload={
+                                    "action": "fail_run",
+                                    "reason": (
+                                        "completed_attempt_reconciliation_unavailable"
+                                    ),
+                                    "lease_owner": lease.owner,
+                                    "lease_version": lease.version,
+                                },
+                            )
+                        )
+                        continue
+                    try:
+                        await self.store.enter_hitl(
+                            run.id,
+                            _RECOVERY_AMBIGUITY_TRIGGER,
+                            {
+                                "attempt_id": latest.id,
+                                "reason": "completed_attempt_without_terminal_run",
+                            },
+                            actor="recovery-coordinator",
+                            instruction=(
+                                "Approve to accept the completed attempt, or abort the run."
+                            ),
+                        )
+                    except Exception as exc:
+                        if (
+                            getattr(exc, "run_id", None) == run.id
+                            and getattr(exc, "status", None)
+                            in {status.value for status in TERMINAL_RUN_STATUSES}
+                        ):
+                            continue
+                        raise
                     await self.store.append_event(
                         Event(
                             id=f"recovery-{run.id}-{lease.version}",
@@ -254,6 +298,21 @@ class RecoveryCoordinator:
             run.id, unconsumed_only=True
         )
         if request is None:
+            await self.store.transition_run(run.id, RunStatus.FAILED)
+            await self.store.append_event(
+                Event(
+                    id=f"recovery-{run.id}-{lease.version}",
+                    type="recovery.planned",
+                    run_id=run.id,
+                    attempt_id=latest.id if latest else None,
+                    payload={
+                        "action": "fail_run",
+                        "reason": "paused_hitl_missing_request",
+                        "lease_owner": lease.owner,
+                        "lease_version": lease.version,
+                    },
+                )
+            )
             return None
         decision_commands = [
             command
@@ -294,6 +353,45 @@ class RecoveryCoordinator:
                     payload={
                         "action": "abort_run",
                         "reason": "hitl_resolution_aborted",
+                        "lease_owner": lease.owner,
+                        "lease_version": lease.version,
+                    },
+                )
+            )
+            return None
+        if request["trigger"] == _RECOVERY_AMBIGUITY_TRIGGER:
+            context = request.get("context") or {}
+            if isinstance(context, str):
+                context = json.loads(context)
+            request_attempt_id = context.get("attempt_id")
+            if (
+                latest is None
+                or latest.status != AttemptStatus.COMPLETED
+                or request_attempt_id != latest.id
+            ):
+                status = RunStatus.FAILED
+                action = "fail_run"
+                reason = "recovery_ambiguity_request_stale"
+            elif request["decision"] == "approve":
+                status = RunStatus.COMPLETED
+                action = "complete_run"
+                reason = "completed_attempt_approved"
+            else:
+                status = RunStatus.FAILED
+                action = "fail_run"
+                reason = "unsupported_recovery_ambiguity_resolution"
+            await self.store.transition_run(run.id, status)
+            await self.store.append_event(
+                Event(
+                    id=f"recovery-{run.id}-{lease.version}",
+                    type="recovery.planned",
+                    run_id=run.id,
+                    attempt_id=latest.id if latest else None,
+                    payload={
+                        "action": action,
+                        "reason": reason,
+                        "decision": request["decision"],
+                        "instruction": request.get("instruction") or "",
                         "lease_owner": lease.owner,
                         "lease_version": lease.version,
                     },

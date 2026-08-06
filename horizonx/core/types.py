@@ -320,6 +320,7 @@ class HITLConfig(BaseModel):
             "validator_paused",
             "subgoal_max_attempts",
             "budget_threshold_75",
+            "recovery_ambiguous_completion",
         ]
     )
     notification_type: Literal["slack", "email", "webhook", "console"] = "console"
