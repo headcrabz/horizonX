@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from uuid import uuid4
 
 import click
 import yaml
@@ -16,9 +17,12 @@ from rich.console import Console
 from rich.table import Table
 
 from horizonx import RepositoryConfig, Run, RunStatus, Runtime, Task
+from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
+from horizonx.core.types import TERMINAL_RUN_STATUSES
 from horizonx.environments.base import WorkspaceError
 from horizonx.project import CONFIG_FILENAME, ProjectConfig
 from horizonx.storage import SqliteStore
+from horizonx.storage.sqlite import StoreError
 
 console = Console()
 
@@ -111,6 +115,31 @@ def _load_task_from_path(path: Path) -> Task:
     return task
 
 
+async def _load_run_context(store: SqliteStore, run_id: str) -> tuple[Run, str | None, str | None]:
+    """Load a run and its most specific durable provider-session identity."""
+    run = await store.load_run(run_id)
+    attempts = await store.list_attempts(run_id)
+    if attempts:
+        latest = attempts[-1]
+        return run, latest.provider, latest.provider_session_id
+    sessions = await store.list_sessions(run_id)
+    if sessions:
+        return run, run.task.agent.type, sessions[-1].agent_session_id
+    return run, run.task.agent.type, None
+
+
+def _cost_text(run: Run) -> str:
+    if not run.cumulative.cost_known or run.cumulative.usd is None:
+        return "unknown"
+    return f"${run.cumulative.usd:.2f}"
+
+
+def _provider_session_text(provider: str | None, session_id: str | None) -> str:
+    if not session_id:
+        return "not recorded"
+    return f"{provider or 'provider'} {session_id}"
+
+
 @main.command()
 @click.argument("task_path", type=click.Path(exists=True, path_type=Path))
 @click.option("--resume", default=None, help="Resume from existing run id")
@@ -157,19 +186,26 @@ def run(
     runtime = Runtime(store=store, workspace_root=workspace_root)
     console.print(f"[bold cyan]HorizonX[/]  starting run for task [yellow]{task.id}[/]")
 
-    async def _run_task() -> Run:
+    async def _run_task() -> tuple[Run, str | None, str | None]:
         try:
-            return await runtime.run(task, resume_from=resume)
+            completed = await runtime.run(task, resume_from=resume)
+            _, provider, session_id = await _load_run_context(store, completed.id)
+            return completed, provider, session_id
         finally:
+            if hasattr(runtime, "shutdown"):
+                await runtime.shutdown(close_store=False)
             await store.close()
 
     try:
-        completed_run = asyncio.run(_run_task())
+        completed_run, provider, session_id = asyncio.run(_run_task())
     except WorkspaceError as exc:
         raise click.ClickException(str(exc)) from None
     console.print(f"Run: [bold]{completed_run.id}[/bold]")
     console.print(f"Status: {completed_run.status.value}")
     console.print(f"Workspace: {completed_run.workspace_path}")
+    console.print(f"Provider session: {_provider_session_text(provider, session_id)}")
+    console.print(f"Cost: {_cost_text(completed_run)}")
+    console.print(f"Attach: horizonx attach {completed_run.id}")
     if completed_run.status in {
         RunStatus.FAILED,
         RunStatus.ABORTED,
@@ -186,9 +222,215 @@ def run(
 @click.pass_context
 def show(ctx: click.Context, run_id: str) -> None:
     """Show details for a run."""
-    store = SqliteStore(ctx.obj["db"])
-    run_data = asyncio.run(store.load_run(run_id))
+    async def _show() -> Run:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return await store.load_run(run_id)
+        finally:
+            await store.close()
+
+    try:
+        run_data = asyncio.run(_show())
+    except KeyError:
+        raise click.ClickException(f"run not found: {run_id}") from None
     console.print_json(run_data.model_dump_json())
+
+
+@main.command()
+@click.argument("run_id")
+@click.pass_context
+def status(ctx: click.Context, run_id: str) -> None:
+    """Show a compact durable summary of a run."""
+
+    async def _status() -> tuple[Run, str | None, str | None]:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return await _load_run_context(store, run_id)
+        finally:
+            await store.close()
+
+    try:
+        run, provider, session_id = asyncio.run(_status())
+    except KeyError:
+        raise click.ClickException(f"run not found: {run_id}") from None
+    click.echo(f"Status: {run.status.value}")
+    click.echo(f"Workspace: {run.workspace_path}")
+    click.echo(f"Provider session: {_provider_session_text(provider, session_id)}")
+    click.echo(f"Cost: {_cost_text(run)}")
+
+
+@main.command()
+@click.argument("run_id")
+@click.pass_context
+def attach(ctx: click.Context, run_id: str) -> None:
+    """Print durable context and a provider resume hint, when available."""
+
+    async def _attach() -> tuple[Run, str | None, str | None]:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return await _load_run_context(store, run_id)
+        finally:
+            await store.close()
+
+    try:
+        run, provider, session_id = asyncio.run(_attach())
+    except KeyError:
+        raise click.ClickException(f"run not found: {run_id}") from None
+    click.echo(f"Workspace: {run.workspace_path}")
+    if not session_id:
+        click.echo("No provider session is recorded; cannot reattach a lost process.")
+        return
+    click.echo(f"Provider session: {_provider_session_text(provider, session_id)}")
+    normalized = (provider or "").lower()
+    if normalized in {"claude", "claude_code"}:
+        click.echo(f"Resume hint: cd {run.workspace_path} && claude --resume {session_id}")
+    elif normalized == "codex":
+        click.echo(f"Resume hint: cd {run.workspace_path} && codex exec resume {session_id}")
+    else:
+        click.echo("No provider-specific resume hint is available; cannot reattach a lost process.")
+
+
+@main.command()
+@click.argument("run_id")
+@click.option("--format", "fmt", default="json", type=click.Choice(["json", "yaml"]))
+@click.pass_context
+def evidence(ctx: click.Context, run_id: str, fmt: str) -> None:
+    """Export durable evidence recorded for a run."""
+
+    async def _evidence() -> dict[str, object]:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            run = await store.load_run(run_id)
+            goals, validations, sessions, attempts, spin_reports, events = await asyncio.gather(
+                store.list_goals(run_id), store.list_validations(run_id),
+                store.list_sessions(run_id), store.list_attempts(run_id),
+                store.list_spin_reports(run_id), store.list_events(run_id),
+            )
+            return {
+                "run": run.model_dump(mode="json"),
+                "goals": [item.model_dump(mode="json") for item in goals],
+                "validations": validations,
+                "sessions": [item.model_dump(mode="json") for item in sessions],
+                "attempts": [item.model_dump(mode="json") for item in attempts],
+                "spin_reports": spin_reports,
+                "events": [item.model_dump(mode="json") for item in events],
+            }
+        finally:
+            await store.close()
+
+    try:
+        bundle = asyncio.run(_evidence())
+    except KeyError:
+        raise click.ClickException(f"run not found: {run_id}") from None
+    if fmt == "json":
+        click.echo(json.dumps(bundle, indent=2, default=str))
+    else:
+        click.echo(yaml.safe_dump(bundle, sort_keys=False))
+
+
+async def _submit_operator_command(
+    store: SqliteStore, command: OperatorCommand, *, cancel: bool = False
+) -> bool:
+    run = await store.load_run(command.run_id)
+    if not cancel and run.status in TERMINAL_RUN_STATUSES:
+        raise StoreError(f"run is already terminal: {run.status.value}")
+    if cancel:
+        _, created, _ = await store.submit_cancel_command(command)
+    else:
+        _, created = await store.create_operator_command(command)
+    return created
+
+
+@main.command()
+@click.argument("run_id")
+@click.argument("instruction")
+@click.option("--reason", default="")
+@click.option("--idempotency-key", default=None)
+@click.pass_context
+def steer(
+    ctx: click.Context, run_id: str, instruction: str, reason: str, idempotency_key: str | None
+) -> None:
+    """Durably submit a steering instruction for a nonterminal run."""
+
+    async def _steer() -> bool:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return await _submit_operator_command(
+                store,
+                OperatorCommand(
+                    run_id=run_id, kind=OperatorCommandKind.STEER, actor="cli",
+                    reason=reason, instruction=instruction,
+                    idempotency_key=idempotency_key or f"steer-{uuid4().hex}",
+                ),
+            )
+        finally:
+            await store.close()
+
+    try:
+        created = asyncio.run(_steer())
+    except (KeyError, StoreError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo("Steer command accepted." if created else "Steer command duplicate.")
+
+
+@main.command()
+@click.argument("run_id")
+@click.option("--reason", default="")
+@click.option("--idempotency-key", default=None)
+@click.pass_context
+def cancel(ctx: click.Context, run_id: str, reason: str, idempotency_key: str | None) -> None:
+    """Durably submit and apply a cancellation command."""
+
+    async def _cancel() -> bool:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return await _submit_operator_command(
+                store,
+                OperatorCommand(
+                    run_id=run_id, kind=OperatorCommandKind.CANCEL, actor="cli",
+                    reason=reason, idempotency_key=idempotency_key or f"cancel-{run_id}",
+                ),
+                cancel=True,
+            )
+        finally:
+            await store.close()
+
+    try:
+        created = asyncio.run(_cancel())
+    except (KeyError, StoreError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo("Cancel command accepted." if created else "Cancel command duplicate.")
+
+
+@main.command()
+@click.argument("run_id")
+@click.pass_context
+def resume(ctx: click.Context, run_id: str) -> None:
+    """Resume execution from a durable task snapshot; no process is reattached."""
+    store = SqliteStore(ctx.obj["db"])
+    runtime = Runtime(
+        store=store,
+        workspace_root=ctx.obj["workspace_root"] or Path("horizonx-workspaces"),
+    )
+
+    async def _resume() -> Run:
+        try:
+            snapshot = await store.load_run(run_id)
+            if snapshot.status in TERMINAL_RUN_STATUSES:
+                raise StoreError(f"run is already terminal: {snapshot.status.value}")
+            return await runtime.run(snapshot.task, resume_from=run_id)
+        finally:
+            if hasattr(runtime, "shutdown"):
+                await runtime.shutdown(close_store=False)
+            await store.close()
+
+    try:
+        resumed = asyncio.run(_resume())
+    except (KeyError, StoreError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(f"Run: {resumed.id}")
+    click.echo(f"Status: {resumed.status.value}")
+    click.echo("Resumed from durable snapshot; no lost process was reattached.")
 
 
 @main.command(name="list")
@@ -196,8 +438,14 @@ def show(ctx: click.Context, run_id: str) -> None:
 @click.pass_context
 def list_cmd(ctx: click.Context, limit: int) -> None:
     """List recent runs."""
-    store = SqliteStore(ctx.obj["db"])
-    rows = asyncio.run(store.list_runs(limit=limit))
+    async def _list() -> list[dict[str, object]]:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return await store.list_runs(limit=limit)
+        finally:
+            await store.close()
+
+    rows = asyncio.run(_list())
     t = Table(title="HorizonX runs")
     t.add_column("id")
     t.add_column("status")
@@ -210,29 +458,34 @@ def list_cmd(ctx: click.Context, limit: int) -> None:
 
 @main.command()
 @click.argument("run_id")
+@click.option("--interval", default=0.1, type=float, show_default=True)
 @click.pass_context
-def watch(ctx: click.Context, run_id: str) -> None:
-    """Live-watch a run by tailing trajectory.jsonl."""
-    store = SqliteStore(ctx.obj["db"])
-    r = asyncio.run(store.load_run(run_id))
-    path = Path(r.workspace_path) / "trajectory.jsonl"
-    if not path.exists():
-        click.echo(f"trajectory not yet at {path}; waiting...")
-    import time
+def watch(ctx: click.Context, run_id: str, interval: float) -> None:
+    """Watch durable events until the run reaches a terminal status."""
 
-    pos = 0
-    while True:
-        if path.exists():
-            with path.open("r") as f:
-                f.seek(pos)
-                for line in f:
-                    try:
-                        evt = json.loads(line)
-                        click.echo(f"[{evt.get('type','?')}] {evt.get('tool_name','')} {str(evt.get('content',''))[:120]}")
-                    except json.JSONDecodeError:
-                        pass
-                pos = f.tell()
-        time.sleep(1.0)
+    async def _poll() -> None:
+        store = SqliteStore(ctx.obj["db"])
+        cursor: int | None = None
+        try:
+            while True:
+                run = await store.load_run(run_id)
+                events = await store.list_events(run_id, after_sequence=cursor)
+                for event in events:
+                    cursor = event.sequence
+                    click.echo(f"[{event.type}] {json.dumps(event.payload, default=str)}")
+                if run.status in TERMINAL_RUN_STATUSES:
+                    click.echo(f"Status: {run.status.value}")
+                    return
+                await asyncio.sleep(interval)
+        finally:
+            await store.close()
+
+    if interval < 0:
+        raise click.BadParameter("must be non-negative", param_hint="--interval")
+    try:
+        asyncio.run(_poll())
+    except KeyError:
+        raise click.ClickException(f"run not found: {run_id}") from None
 
 
 @main.command()
@@ -254,6 +507,8 @@ def fork(ctx: click.Context, run_id: str, mutation: str | None) -> None:
             console.print(f"[green]Forked[/green] {run_id} → [bold]{forked.id}[/bold]")
             console.print(f"  workspace: {forked.workspace_path}")
         finally:
+            if hasattr(rt, "shutdown"):
+                await rt.shutdown(close_store=False)
             await store.close()
 
     asyncio.run(_fork())
@@ -265,8 +520,17 @@ def fork(ctx: click.Context, run_id: str, mutation: str | None) -> None:
 @click.pass_context
 def export(ctx: click.Context, run_id: str, fmt: str) -> None:
     """Export a run as JSON/YAML."""
-    store = SqliteStore(ctx.obj["db"])
-    r = asyncio.run(store.load_run(run_id))
+    async def _export() -> Run:
+        store = SqliteStore(ctx.obj["db"])
+        try:
+            return await store.load_run(run_id)
+        finally:
+            await store.close()
+
+    try:
+        r = asyncio.run(_export())
+    except KeyError:
+        raise click.ClickException(f"run not found: {run_id}") from None
     data = r.model_dump(mode="json")
     if fmt == "json":
         click.echo(json.dumps(data, default=str, indent=2))

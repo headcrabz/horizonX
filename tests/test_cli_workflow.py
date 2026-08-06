@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,9 +12,38 @@ import yaml
 from click.testing import CliRunner
 from pydantic import ValidationError
 
-from horizonx import Task
+from horizonx import CumulativeMetrics, Run, RunStatus, Task
 from horizonx.cli import main
+from horizonx.core.event_bus import Event
 from horizonx.project import ProjectConfig
+from horizonx.storage import SqliteStore
+
+
+def _seed_run(db_path: Path, *, status: RunStatus = RunStatus.RUNNING) -> Run:
+    async def seed() -> Run:
+        store = SqliteStore(db_path)
+        run = Run(
+            id="durable-run",
+            task=Task.model_validate(
+                {
+                    "id": "task",
+                    "name": "Durable task",
+                    "prompt": "do it",
+                    "strategy": {"kind": "single"},
+                    "agent": {"type": "mock", "model": "mock"},
+                }
+            ),
+            status=status,
+            workspace_path=db_path.parent / "workspace",
+            cumulative=CumulativeMetrics(usd=1.25),
+        )
+        await store.save_run(run)
+        await store.close()
+        return run
+
+    import asyncio
+
+    return asyncio.run(seed())
 
 
 def test_init_creates_valid_config_and_runnable_mock_task(tmp_path: Path) -> None:
@@ -96,6 +126,86 @@ def test_initialized_example_runs_with_the_mock_provider(tmp_path: Path) -> None
     assert initialized.exit_code == 0, initialized.output
     assert result.exit_code == 0, result.output
     assert "status: completed" in result.output.lower()
+
+
+def test_status_prints_compact_durable_summary(tmp_path: Path) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path)
+
+    result = CliRunner().invoke(main, ["--db", str(db_path), "status", run.id])
+
+    assert result.exit_code == 0, result.output
+    assert "Status: running" in result.output
+    assert f"Workspace: {run.workspace_path}" in result.output
+    assert "Cost: $1.25" in result.output
+    assert "Provider session: not recorded" in result.output
+
+
+def test_attach_reports_workspace_without_claiming_process_reattachment(tmp_path: Path) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path)
+
+    result = CliRunner().invoke(main, ["--db", str(db_path), "attach", run.id])
+
+    assert result.exit_code == 0, result.output
+    assert str(run.workspace_path) in result.output
+    assert "no provider session is recorded" in result.output.lower()
+    assert "cannot reattach" in result.output.lower()
+
+
+def test_evidence_exports_durable_run_bundle_as_json(tmp_path: Path) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path)
+
+    async def add_event() -> None:
+        store = SqliteStore(db_path)
+        await store.append_event(Event(type="run.started", run_id=run.id))
+        await store.close()
+
+    import asyncio
+
+    asyncio.run(add_event())
+    result = CliRunner().invoke(main, ["--db", str(db_path), "evidence", run.id])
+
+    assert result.exit_code == 0, result.output
+    bundle = json.loads(result.output)
+    assert bundle["run"]["id"] == run.id
+    assert bundle["events"][0]["type"] == "run.started"
+    assert {"goals", "validations", "sessions", "attempts", "spin_reports"} <= bundle.keys()
+
+
+def test_steer_persists_command_and_reports_idempotent_duplicate(tmp_path: Path) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path)
+    runner = CliRunner()
+
+    accepted = runner.invoke(
+        main,
+        ["--db", str(db_path), "steer", run.id, "Focus on tests", "--idempotency-key", "steer-1"],
+    )
+    duplicate = runner.invoke(
+        main,
+        ["--db", str(db_path), "steer", run.id, "Focus on tests", "--idempotency-key", "steer-1"],
+    )
+
+    assert accepted.exit_code == 0, accepted.output
+    assert "accepted" in accepted.output.lower()
+    assert duplicate.exit_code == 0, duplicate.output
+    assert "duplicate" in duplicate.output.lower()
+
+
+def test_cancel_uses_durable_idempotent_submission(tmp_path: Path) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path)
+    runner = CliRunner()
+
+    accepted = runner.invoke(main, ["--db", str(db_path), "cancel", run.id])
+    duplicate = runner.invoke(main, ["--db", str(db_path), "cancel", run.id])
+
+    assert accepted.exit_code == 0, accepted.output
+    assert "accepted" in accepted.output.lower()
+    assert duplicate.exit_code == 0, duplicate.output
+    assert "duplicate" in duplicate.output.lower()
 
 
 def test_cli_uses_database_path_from_config_in_current_directory(
