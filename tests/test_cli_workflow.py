@@ -164,6 +164,36 @@ def test_fork_uses_project_workspace_root_and_closes_store(
     assert captured["closed"] is True
 
 
+def test_fork_uses_legacy_workspace_default_without_project_config(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+
+    class StubStore:
+        def __init__(self, path: Path) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    class StubRuntime:
+        def __init__(self, *, store: StubStore, workspace_root: Path) -> None:
+            captured["workspace_root"] = workspace_root
+
+        async def fork_run(
+            self, run_id: str, strategy_override: dict[str, object] | None = None
+        ) -> SimpleNamespace:
+            return SimpleNamespace(id="forked-run", workspace_path=tmp_path / "forked")
+
+    with (
+        patch("horizonx.cli.SqliteStore", StubStore),
+        patch("horizonx.cli.Runtime", StubRuntime),
+    ):
+        result = CliRunner().invoke(main, ["fork", "source-run"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["workspace_root"] == Path("horizonx-workspaces")
+
+
 def test_config_directory_is_reported_as_invalid_config(
     tmp_path: Path, monkeypatch
 ) -> None:
