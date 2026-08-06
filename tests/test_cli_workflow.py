@@ -12,14 +12,16 @@ import yaml
 from click.testing import CliRunner
 from pydantic import ValidationError
 
-from horizonx import CumulativeMetrics, Run, RunStatus, Task
+from horizonx import AttemptRecord, CumulativeMetrics, Run, RunStatus, Session, Task
 from horizonx.cli import main
 from horizonx.core.event_bus import Event
 from horizonx.project import ProjectConfig
 from horizonx.storage import SqliteStore
 
 
-def _seed_run(db_path: Path, *, status: RunStatus = RunStatus.RUNNING) -> Run:
+def _seed_run(
+    db_path: Path, *, status: RunStatus = RunStatus.RUNNING, agent_type: str = "mock"
+) -> Run:
     async def seed() -> Run:
         store = SqliteStore(db_path)
         run = Run(
@@ -30,7 +32,7 @@ def _seed_run(db_path: Path, *, status: RunStatus = RunStatus.RUNNING) -> Run:
                     "name": "Durable task",
                     "prompt": "do it",
                     "strategy": {"kind": "single"},
-                    "agent": {"type": "mock", "model": "mock"},
+                    "agent": {"type": agent_type, "model": "mock"},
                 }
             ),
             status=status,
@@ -153,6 +155,59 @@ def test_attach_reports_workspace_without_claiming_process_reattachment(tmp_path
     assert "cannot reattach" in result.output.lower()
 
 
+@pytest.mark.parametrize(
+    ("provider", "expected_hint"),
+    [("claude_code", "claude --resume provider-session"), ("codex", "codex exec resume provider-session")],
+)
+def test_attach_prints_provider_specific_resume_hint(
+    tmp_path: Path, provider: str, expected_hint: str
+) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path, agent_type=provider)
+
+    async def add_session() -> None:
+        store = SqliteStore(db_path)
+        await store.save_session(
+            Session(run_id=run.id, sequence_index=1, agent_session_id="provider-session")
+        )
+        await store.close()
+
+    import asyncio
+
+    asyncio.run(add_session())
+    result = CliRunner().invoke(main, ["--db", str(db_path), "attach", run.id])
+
+    assert result.exit_code == 0, result.output
+    assert expected_hint in result.output
+
+
+def test_attach_uses_latest_recorded_attempt_session_not_latest_null_attempt(tmp_path: Path) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path, agent_type="codex")
+
+    async def add_attempts() -> None:
+        store = SqliteStore(db_path)
+        for ordinal, provider_session_id in ((1, "saved-session"), (2, None)):
+            session = Session(run_id=run.id, sequence_index=ordinal)
+            await store.save_session(session)
+            await store.create_attempt(
+                AttemptRecord(
+                    run_id=run.id, session_id=session.id, provider="codex", model="mock",
+                    workspace_path=run.workspace_path, ordinal=ordinal,
+                    provider_session_id=provider_session_id,
+                )
+            )
+        await store.close()
+
+    import asyncio
+
+    asyncio.run(add_attempts())
+    result = CliRunner().invoke(main, ["--db", str(db_path), "attach", run.id])
+
+    assert result.exit_code == 0, result.output
+    assert "codex exec resume saved-session" in result.output
+
+
 def test_evidence_exports_durable_run_bundle_as_json(tmp_path: Path) -> None:
     db_path = tmp_path / "horizonx.db"
     run = _seed_run(db_path)
@@ -171,7 +226,8 @@ def test_evidence_exports_durable_run_bundle_as_json(tmp_path: Path) -> None:
     bundle = json.loads(result.output)
     assert bundle["run"]["id"] == run.id
     assert bundle["events"][0]["type"] == "run.started"
-    assert {"goals", "validations", "sessions", "attempts", "spin_reports"} <= bundle.keys()
+    assert {"goals", "validations", "sessions", "attempts", "spins"} <= bundle.keys()
+    assert "spin_reports" not in bundle
 
 
 def test_steer_persists_command_and_reports_idempotent_duplicate(tmp_path: Path) -> None:
@@ -302,6 +358,93 @@ def test_fork_uses_legacy_workspace_default_without_project_config(tmp_path: Pat
 
     assert result.exit_code == 0, result.output
     assert captured["workspace_root"] == Path("horizonx-workspaces")
+
+
+def test_fork_rejects_malformed_mutation_before_creating_resources(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    constructed = False
+
+    class StubStore:
+        def __init__(self, path: Path) -> None:
+            nonlocal constructed
+            constructed = True
+
+    with patch("horizonx.cli.SqliteStore", StubStore):
+        result = CliRunner().invoke(main, ["fork", "source-run", "--mutation", "{"])
+
+    assert result.exit_code != 0
+    assert constructed is False
+
+
+def test_resume_uses_snapshot_project_workspace_and_closes_resources(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "horizonx.yaml").write_text(
+        "version: 1\ndb_path: state/project.db\nworkspace_root: custom-workspaces\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    snapshot = _seed_run(tmp_path / "state" / "project.db")
+    captured: dict[str, object] = {}
+
+    class StubStore:
+        def __init__(self, path: Path) -> None:
+            captured["db"] = path
+
+        async def load_run(self, run_id: str) -> Run:
+            return snapshot
+
+        async def close(self) -> None:
+            captured["store_closed"] = True
+
+    class StubRuntime:
+        def __init__(self, *, store: StubStore, workspace_root: Path) -> None:
+            captured["workspace_root"] = workspace_root
+
+        async def run(self, task: Task, *, resume_from: str) -> Run:
+            captured["task"] = task
+            captured["resume_from"] = resume_from
+            return snapshot
+
+        async def shutdown(self, *, close_store: bool) -> None:
+            captured["runtime_closed"] = True
+
+    with patch("horizonx.cli.SqliteStore", StubStore), patch("horizonx.cli.Runtime", StubRuntime):
+        result = CliRunner().invoke(main, ["resume", snapshot.id])
+
+    assert result.exit_code == 0, result.output
+    assert captured["workspace_root"] == tmp_path / "custom-workspaces"
+    assert captured["resume_from"] == snapshot.id
+    assert captured["store_closed"] is True and captured["runtime_closed"] is True
+
+
+@pytest.mark.parametrize("status", [RunStatus.COMPLETED])
+def test_resume_rejects_terminal_snapshot(tmp_path: Path, status: RunStatus) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path, status=status)
+
+    result = CliRunner().invoke(main, ["--db", str(db_path), "resume", run.id])
+
+    assert result.exit_code != 0
+    assert "terminal" in result.output.lower()
+
+
+def test_watch_prints_durable_events_and_exits_on_terminal_status(tmp_path: Path) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path, status=RunStatus.COMPLETED)
+
+    async def add_event() -> None:
+        store = SqliteStore(db_path)
+        await store.append_event(Event(type="run.completed", run_id=run.id))
+        await store.close()
+
+    import asyncio
+
+    asyncio.run(add_event())
+    result = CliRunner().invoke(main, ["--db", str(db_path), "watch", run.id, "--interval", "0"])
+
+    assert result.exit_code == 0, result.output
+    assert "[run.completed]" in result.output
+    assert "Status: completed" in result.output
 
 
 def test_config_directory_is_reported_as_invalid_config(

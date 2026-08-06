@@ -121,7 +121,12 @@ async def _load_run_context(store: SqliteStore, run_id: str) -> tuple[Run, str |
     attempts = await store.list_attempts(run_id)
     if attempts:
         latest = attempts[-1]
-        return run, latest.provider, latest.provider_session_id
+        recorded = next(
+            (attempt for attempt in reversed(attempts) if attempt.provider_session_id), None
+        )
+        if recorded is not None:
+            return run, recorded.provider, recorded.provider_session_id
+        return run, latest.provider, None
     sessions = await store.list_sessions(run_id)
     if sessions:
         return run, run.task.agent.type, sessions[-1].agent_session_id
@@ -312,7 +317,7 @@ def evidence(ctx: click.Context, run_id: str, fmt: str) -> None:
                 "validations": validations,
                 "sessions": [item.model_dump(mode="json") for item in sessions],
                 "attempts": [item.model_dump(mode="json") for item in attempts],
-                "spin_reports": spin_reports,
+                "spins": spin_reports,
                 "events": [item.model_dump(mode="json") for item in events],
             }
         finally:
@@ -494,12 +499,15 @@ def watch(ctx: click.Context, run_id: str, interval: float) -> None:
 @click.pass_context
 def fork(ctx: click.Context, run_id: str, mutation: str | None) -> None:
     """Fork an existing run, optionally overriding its strategy."""
+    try:
+        strategy_override = json.loads(mutation) if mutation else None
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"invalid --mutation JSON: {exc.msg}") from None
     store = SqliteStore(ctx.obj["db"])
     rt = Runtime(
         store=store,
         workspace_root=ctx.obj["workspace_root"] or Path("horizonx-workspaces"),
     )
-    strategy_override = json.loads(mutation) if mutation else None
 
     async def _fork() -> None:
         try:
