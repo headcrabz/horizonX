@@ -39,7 +39,8 @@ The current alpha includes:
   monitor, and ralph. Their agent calls share one session, recording, limit, charging, spin,
   validation, and cleanup lifecycle.
 - **Operator and observability components** — Slack HITL, dashboard SSE, and CLI watch exist.
-  Durable commands, real cancellation, authenticated callbacks, and event replay are planned.
+  Durable authenticated operator controls, callback handling, restart-safe HITL decisions and
+  cancellation, and cursor-replay SSE are implemented for the local single-daemon alpha.
 
 See the [support matrix](#project-status) before relying on a capability.
 
@@ -95,6 +96,10 @@ horizonx watch <run-id>
 pip install -e ".[dashboard]"
 horizonx serve
 ```
+
+`serve` binds to `127.0.0.1` by default. If you use a non-loopback `serve --host`, configure
+`HORIZONX_OPERATOR_TOKEN` so dashboard launch, HITL, cancellation, and command-writing endpoints
+require a bearer token. This remains a local, single-daemon alpha service.
 
 Resume is experimental and operates at supported attempt/session boundaries. Startup reconciliation
 can continue a captured provider thread when its adapter supports it; it cannot reattach a lost
@@ -440,8 +445,8 @@ focused tests; it does not imply a verified production guarantee.
 | Seven spin-detection components | Under hardening | All built-in strategy attempts use the combined detector path; durable retry, strategy-switch, and operator-response actions are not complete. |
 | Resource governor and usage store | Implemented, local-only | Every built-in attempt uses run-scoped token, session, step, time, and known-cost limits. Workspace concurrency is enforced within one daemon. Unknown provider cost is shown as unavailable and requires token limits. |
 | FTS5 knowledge store and handoff sync | Components only | The store and sync modules are not yet connected to the normal runtime/strategy lifecycle. Automatic cross-run memory is not claimed. |
-| Slack HITL and dashboard controls | Under hardening | Durable decisions, authenticated callbacks, restart-safe waits, and process-tree cancellation are not complete. |
-| SSE dashboard and JSONL trajectory | Experimental | Runtime events have a durable SQLite sequence, while the current SSE endpoint remains live/in-memory and does not yet expose cursor replay. |
+| Slack HITL and dashboard controls | Implemented, local-only | Durable authenticated operator controls and callback handling persist HITL decisions and cancellation; restart-safe HITL waits and cancellation are supported within one local daemon. |
+| SSE dashboard and JSONL trajectory | Implemented, local-only | Runtime events use a durable SQLite sequence and SSE supports cursor replay after restart within one local daemon. |
 | Local workspace execution | Implemented, local-only | Local paths use isolated Git worktrees; setup and agent subprocess trees are terminated as one owned session. Attempt metadata records the boundary. Host filesystem, network, CPU, memory, child-count, and workspace-disk isolation are not enforced. |
 | Docker, Podman, and E2B execution | Not supported | Unimplemented backend values are rejected by configuration instead of being silently treated as local execution. |
 | Multi-run/multi-worker concurrency | Not supported | The SQLite backend is intentionally single-daemon; durable leases, worker coordination, and a server database are required for distributed execution. |

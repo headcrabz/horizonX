@@ -32,9 +32,11 @@ class OperatorCommandBody(BaseModel):
 @router.post("/runs", status_code=202)
 async def launch_run(
     body: LaunchBody,
+    request: Request,
     runtime: Runtime = Depends(get_runtime),
     store: SqliteStore = Depends(get_store),
 ) -> dict[str, str]:
+    _authenticate_operator(request)
     from horizonx.core.types import Task
 
     try:

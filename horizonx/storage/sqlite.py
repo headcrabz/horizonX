@@ -2632,6 +2632,7 @@ class SqliteStore:
         """Accept and apply cancellation atomically, fencing the active lease."""
         now = utcnow().isoformat()
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             existing = c.execute(
                 "SELECT * FROM operator_commands WHERE run_id=? AND idempotency_key=?",
                 (candidate.run_id, candidate.idempotency_key),

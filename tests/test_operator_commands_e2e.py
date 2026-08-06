@@ -6,6 +6,7 @@ import hmac
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -34,6 +35,7 @@ from horizonx.storage.sqlite import (
     HITLTransitionError,
     OperatorCommandConflict,
     SqliteStore,
+    StoreError,
 )
 
 
@@ -1080,12 +1082,81 @@ async def test_cancel_acceptance_atomically_wins_and_fences_lease(tmp_path: Path
             candidate.model_copy(update={"id": "another-id"})
         )
         assert not duplicate_created and duplicate.id == command.id
-        with pytest.raises(Exception, match="already terminal"):
+        with pytest.raises(StoreError, match="already terminal"):
             await store.submit_cancel_command(
                 candidate.model_copy(update={"idempotency_key": "new-cancel"})
             )
+        assert len(await store.list_operator_commands(run.id)) == 1
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_transaction_claims_terminal_winner_before_inspecting_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completion racing after cancel's write claim cannot leave a stray command."""
+    cancel_store = SqliteStore(tmp_path / "state.db")
+    completion_store = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path)
+    await cancel_store.save_run(run)
+    write_claimed = asyncio.Event()
+    release_cancel = asyncio.Event()
+    original_conn = cancel_store._conn
+
+    class BarrierConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+            cursor = self._connection.execute(sql, parameters)
+            if sql == "BEGIN IMMEDIATE":
+                write_claimed.set()
+                # The competing store is now attempting its terminal transition.
+                # The cancel transaction must retain the terminal write until it commits.
+                while not release_cancel.is_set():
+                    time.sleep(0.001)
+            return cursor
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(self._connection, name)
+
+    @contextmanager
+    def barrier_conn():  # type: ignore[no-untyped-def]
+        with original_conn() as connection:
+            yield BarrierConnection(connection)
+
+    monkeypatch.setattr(cancel_store, "_conn", barrier_conn)
+    candidate = OperatorCommand(
+        run_id=run.id,
+        kind=OperatorCommandKind.CANCEL,
+        actor="alice",
+        reason="race cancellation",
+        idempotency_key="cancel-write-claim",
+    )
+    cancel_task = asyncio.create_task(cancel_store.submit_cancel_command(candidate))
+    completion_task: asyncio.Task[Run] | None = None
+    try:
+        assert await asyncio.wait_for(write_claimed.wait(), timeout=0.5)
+        completion_task = asyncio.create_task(
+            completion_store.transition_run(run.id, RunStatus.COMPLETED)
+        )
+        await asyncio.sleep(0.02)
+        assert not completion_task.done()
+        release_cancel.set()
+        command, created, _ = await asyncio.wait_for(cancel_task, timeout=0.5)
+        completed = await asyncio.wait_for(completion_task, timeout=0.5)
+        assert created and command.consumed_at is not None
+        assert completed.status == RunStatus.ABORTED
+        assert (await completion_store.load_run(run.id)).status == RunStatus.ABORTED
+    finally:
+        release_cancel.set()
+        if not cancel_task.done():
+            await asyncio.gather(cancel_task, return_exceptions=True)
+        if completion_task is not None and not completion_task.done():
+            await asyncio.gather(completion_task, return_exceptions=True)
+        await cancel_store.close()
+        await completion_store.close()
 
 
 @pytest.mark.asyncio

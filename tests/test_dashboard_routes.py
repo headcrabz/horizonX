@@ -483,6 +483,54 @@ async def test_launch_valid_task(client: AsyncClient, sample_task: Task) -> None
 
 
 @pytest.mark.asyncio
+async def test_launch_without_operator_token_remains_compatible(
+    client: AsyncClient, sample_task: Task, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HORIZONX_OPERATOR_TOKEN", raising=False)
+
+    response = await client.post(
+        "/api/runs", json={"task": sample_task.model_dump(mode="json")}
+    )
+
+    assert response.status_code == 202
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorization", [None, "Bearer wrong-token"])
+async def test_launch_requires_valid_operator_token_when_configured(
+    client: AsyncClient,
+    sample_task: Task,
+    monkeypatch: pytest.MonkeyPatch,
+    authorization: str | None,
+) -> None:
+    monkeypatch.setenv("HORIZONX_OPERATOR_TOKEN", "launch-secret")
+    headers = {"authorization": authorization} if authorization else {}
+
+    response = await client.post(
+        "/api/runs",
+        headers=headers,
+        json={"task": sample_task.model_dump(mode="json")},
+    )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_launch_accepts_valid_operator_token(
+    client: AsyncClient, sample_task: Task, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HORIZONX_OPERATOR_TOKEN", "launch-secret")
+
+    response = await client.post(
+        "/api/runs",
+        headers={"authorization": "Bearer launch-secret"},
+        json={"task": sample_task.model_dump(mode="json")},
+    )
+
+    assert response.status_code == 202
+
+
+@pytest.mark.asyncio
 async def test_launch_invalid_task_returns_422(client: AsyncClient) -> None:
     r = await client.post("/api/runs", json={"task": {"id": "bad", "prompt": "x"}})
     assert r.status_code == 422
@@ -581,3 +629,22 @@ async def test_cancel_run(client: AsyncClient, app, seeded_run: Run) -> None:
     )
     assert after_terminal.status_code == 200
     assert after_terminal.json()["status"] == "duplicate"
+
+
+@pytest.mark.asyncio
+async def test_cancel_rejects_completion_winner_without_creating_command(
+    client: AsyncClient, app, seeded_run: Run,
+) -> None:
+    completed = seeded_run.model_copy(
+        update={"id": "run-completion-winner", "status": RunStatus.RUNNING}
+    )
+    await app.state.store.save_run(completed)
+    await app.state.store.transition_run(completed.id, RunStatus.COMPLETED)
+
+    response = await client.post(
+        f"/api/runs/{completed.id}/cancel",
+        headers={"idempotency-key": "cancel-after-completion"},
+    )
+
+    assert response.status_code == 409
+    assert await app.state.store.list_operator_commands(completed.id) == []
