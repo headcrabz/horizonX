@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
 import yaml
 from click.testing import CliRunner
 from pydantic import ValidationError
@@ -123,3 +126,68 @@ def test_explicit_database_option_takes_precedence_over_project_config(
     assert result.exit_code == 0, result.output
     assert explicit_db.is_file()
     assert not (tmp_path / "state" / "project.db").exists()
+
+
+def test_fork_uses_project_workspace_root_and_closes_store(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "horizonx.yaml").write_text(
+        "version: 1\ndb_path: state/project.db\nworkspace_root: custom-workspaces\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+
+    class StubStore:
+        def __init__(self, path: Path) -> None:
+            captured["db_path"] = path
+
+        async def close(self) -> None:
+            captured["closed"] = True
+
+    class StubRuntime:
+        def __init__(self, *, store: StubStore, workspace_root: Path | None = None) -> None:
+            captured["workspace_root"] = workspace_root
+
+        async def fork_run(
+            self, run_id: str, strategy_override: dict[str, object] | None = None
+        ) -> SimpleNamespace:
+            return SimpleNamespace(id="forked-run", workspace_path=tmp_path / "forked")
+
+    with (
+        patch("horizonx.cli.SqliteStore", StubStore),
+        patch("horizonx.cli.Runtime", StubRuntime),
+    ):
+        result = CliRunner().invoke(main, ["fork", "source-run"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["workspace_root"] == tmp_path / "custom-workspaces"
+    assert captured["closed"] is True
+
+
+def test_config_directory_is_reported_as_invalid_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "horizonx.yaml").mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "invalid horizonx.yaml" in result.output.lower()
+
+
+@pytest.mark.parametrize("db_path", ["", "database-directory"])
+def test_project_config_rejects_blank_or_directory_database_path(
+    tmp_path: Path, db_path: str
+) -> None:
+    if db_path == "database-directory":
+        (tmp_path / db_path).mkdir()
+    config_path = tmp_path / "horizonx.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {"version": 1, "db_path": db_path, "workspace_root": "workspaces"}
+        )
+    )
+
+    with pytest.raises(ValidationError, match="db_path"):
+        ProjectConfig.load(config_path)

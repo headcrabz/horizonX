@@ -242,13 +242,16 @@ def watch(ctx: click.Context, run_id: str) -> None:
 def fork(ctx: click.Context, run_id: str, mutation: str | None) -> None:
     """Fork an existing run, optionally overriding its strategy."""
     store = SqliteStore(ctx.obj["db"])
-    rt = Runtime(store=store)
+    rt = Runtime(store=store, workspace_root=ctx.obj["workspace_root"])
     strategy_override = json.loads(mutation) if mutation else None
 
     async def _fork() -> None:
-        forked = await rt.fork_run(run_id, strategy_override=strategy_override)
-        console.print(f"[green]Forked[/green] {run_id} → [bold]{forked.id}[/bold]")
-        console.print(f"  workspace: {forked.workspace_path}")
+        try:
+            forked = await rt.fork_run(run_id, strategy_override=strategy_override)
+            console.print(f"[green]Forked[/green] {run_id} → [bold]{forked.id}[/bold]")
+            console.print(f"  workspace: {forked.workspace_path}")
+        finally:
+            await store.close()
 
     asyncio.run(_fork())
 
