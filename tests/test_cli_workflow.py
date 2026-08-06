@@ -240,6 +240,39 @@ def test_attach_falls_back_to_durable_session_when_attempt_session_id_is_null(
     assert "codex exec resume session-first" in result.output
 
 
+def test_attach_prefers_newer_session_identity_over_older_attempt_identity(tmp_path: Path) -> None:
+    db_path = tmp_path / "horizonx.db"
+    run = _seed_run(db_path, agent_type="codex")
+
+    async def add_crash_window_sessions() -> None:
+        store = SqliteStore(db_path)
+        first = Session(run_id=run.id, sequence_index=1)
+        second = Session(run_id=run.id, sequence_index=2, agent_session_id="session-2")
+        await store.save_session(first)
+        await store.save_session(second)
+        await store.create_attempt(
+            AttemptRecord(
+                run_id=run.id, session_id=first.id, provider="codex", model="mock",
+                workspace_path=run.workspace_path, ordinal=1, provider_session_id="attempt-1",
+            )
+        )
+        await store.create_attempt(
+            AttemptRecord(
+                run_id=run.id, session_id=second.id, provider="codex", model="mock",
+                workspace_path=run.workspace_path, ordinal=2, provider_session_id=None,
+            )
+        )
+        await store.close()
+
+    import asyncio
+
+    asyncio.run(add_crash_window_sessions())
+    result = CliRunner().invoke(main, ["--db", str(db_path), "attach", run.id])
+
+    assert result.exit_code == 0, result.output
+    assert "codex exec resume session-2" in result.output
+
+
 def test_evidence_exports_durable_run_bundle_as_json(tmp_path: Path) -> None:
     db_path = tmp_path / "horizonx.db"
     run = _seed_run(db_path)

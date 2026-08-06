@@ -120,26 +120,32 @@ async def _load_run_context(store: SqliteStore, run_id: str) -> tuple[Run, str |
     run = await store.load_run(run_id)
     attempts = await store.list_attempts(run_id)
     sessions = await store.list_sessions(run_id)
-    if attempts:
-        latest = attempts[-1]
-        recorded = next(
-            (attempt for attempt in reversed(attempts) if attempt.provider_session_id), None
-        )
-        if recorded is not None:
-            return run, recorded.provider, recorded.provider_session_id
-        recorded_session = next(
-            (session for session in reversed(sessions) if session.agent_session_id), None
-        )
-        if recorded_session is not None:
-            return run, latest.provider, recorded_session.agent_session_id
-        return run, latest.provider, None
-    if sessions:
-        recorded_session = next(
-            (session for session in reversed(sessions) if session.agent_session_id), None
-        )
-        return run, run.task.agent.type, (
-            recorded_session.agent_session_id if recorded_session is not None else None
-        )
+    sessions_by_id = {session.id: session for session in sessions}
+    latest_attempt = attempts[-1] if attempts else None
+    candidates: list[tuple[int, int, str | None, str]] = []
+    for attempt in attempts:
+        if attempt.provider_session_id:
+            sequence = sessions_by_id.get(attempt.session_id)
+            candidates.append(
+                (sequence.sequence_index if sequence else attempt.ordinal, 0,
+                 attempt.provider, attempt.provider_session_id)
+            )
+    for session in sessions:
+        if session.agent_session_id:
+            matching_attempt = next(
+                (attempt for attempt in reversed(attempts) if attempt.session_id == session.id),
+                None,
+            )
+            candidates.append(
+                (session.sequence_index, 1,
+                 matching_attempt.provider if matching_attempt else run.task.agent.type,
+                 session.agent_session_id)
+            )
+    if candidates:
+        _, _, provider, session_id = max(candidates, key=lambda item: item[:2])
+        return run, provider, session_id
+    if latest_attempt is not None:
+        return run, latest_attempt.provider, None
     return run, run.task.agent.type, None
 
 
