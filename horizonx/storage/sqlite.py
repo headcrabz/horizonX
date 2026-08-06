@@ -327,6 +327,18 @@ CREATE INDEX IF NOT EXISTS idx_events_attempt_sequence ON events(attempt_id, seq
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_one_strategy_switch
     ON events(run_id) WHERE type='strategy.switched';
 
+CREATE TABLE IF NOT EXISTS graph_snapshots (
+    run_id          TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    digest          TEXT NOT NULL,
+    snapshot        TEXT NOT NULL,
+    event_sequence  INTEGER,
+    recorded_at     TEXT NOT NULL,
+    PRIMARY KEY (run_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_snapshots_playback
+    ON graph_snapshots(run_id, event_sequence, version);
+
 CREATE TABLE IF NOT EXISTS leases (
     resource_id  TEXT PRIMARY KEY,
     owner        TEXT NOT NULL,
@@ -1229,9 +1241,26 @@ class SqliteStore:
         )
 
     def _sync_save_goal(self, run_id: str, g: GoalNode) -> None:
+        from horizonx.core.event_bus import Event
+        from horizonx.core.goal_graph import GoalGraphError
+
         with self._conn() as c:
+            try:
+                before = self._graph_from_connection(c, run_id)
+            except GoalGraphError:
+                before = None
             self._upsert_goal_row(c, run_id, g)
             self._replace_goal_edges(c, run_id, g)
+            try:
+                after = self._graph_from_connection(c, run_id)
+            except GoalGraphError:
+                after = None
+            if after is not None:
+                self._append_graph_change_event(
+                    c, run_id, before, after, Event(
+                        type="goals.graph_changed", run_id=run_id, goal_id=g.id
+                    )
+                )
 
     async def save_goal(self, run_id: str, g: GoalNode) -> None:
         return await self._run_sync(self._sync_save_goal, run_id, g)
@@ -1265,7 +1294,13 @@ class SqliteStore:
 
     def _sync_create_graph(self, run_id: str, graph: GoalGraph) -> None:
         with self._conn() as c:
+            before = self._graph_from_connection(c, run_id)
+            before_digest = self._graph_snapshot(before)[1] if before is not None else None
+            after_digest = self._graph_snapshot(graph)[1]
+            if before_digest == after_digest:
+                return
             self._replace_graph_rows(c, run_id, graph)
+            self._append_graph_change_event(c, run_id, before, graph)
 
     async def create_graph(self, run_id: str, graph: GoalGraph) -> None:
         """Atomically replace a run's complete graph in the authoritative store."""
@@ -1273,35 +1308,250 @@ class SqliteStore:
 
     def _sync_replace_pending_subgraph(self, run_id: str, graph: GoalGraph) -> None:
         with self._conn() as c:
-            existing_nodes = self._list_goals_from_connection(c, run_id)
-            if not existing_nodes:
+            before = self._graph_from_connection(c, run_id)
+            if before is None:
                 raise KeyError(f"goal graph not found for run: {run_id}")
-            candidates = {node.id: node for node in graph.all_nodes()}
-            for completed in (
-                node for node in existing_nodes if node.status == GoalStatus.DONE
+            self._replace_pending_subgraph_rows(c, run_id, graph)
+            self._append_graph_change_event(c, run_id, before, graph)
+
+    def _replace_pending_subgraph_rows(
+        self, c: sqlite3.Connection, run_id: str, graph: GoalGraph
+    ) -> None:
+        existing_nodes = self._list_goals_from_connection(c, run_id)
+        if not existing_nodes:
+            raise KeyError(f"goal graph not found for run: {run_id}")
+        candidates = {node.id: node for node in graph.all_nodes()}
+        for completed in (node for node in existing_nodes if node.status == GoalStatus.DONE):
+            candidate = candidates.get(completed.id)
+            if (
+                candidate is None
+                or candidate.model_dump(mode="json") != completed.model_dump(mode="json")
             ):
-                candidate = candidates.get(completed.id)
-                if (
-                    candidate is None
-                    or candidate.model_dump(mode="json")
-                    != completed.model_dump(mode="json")
-                ):
-                    raise GoalTransitionError(
-                        f"completed goal cannot be removed or rewritten: {completed.id}"
-                    )
-            self._replace_graph_rows(c, run_id, graph)
+                raise GoalTransitionError(
+                    f"completed goal cannot be removed or rewritten: {completed.id}"
+                )
+        self._replace_graph_rows(c, run_id, graph)
+
+    @staticmethod
+    def _graph_snapshot(graph: GoalGraph) -> tuple[str, str]:
+        snapshot = {
+            "version": 1,
+            "root": graph.ROOT_ID,
+            "nodes": {
+                node.id: node.model_dump(mode="json") for node in graph.all_nodes()
+            },
+        }
+        serialized = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
+        return serialized, hashlib.sha256(serialized.encode()).hexdigest()
+
+    def _graph_from_connection(
+        self, c: sqlite3.Connection, run_id: str
+    ) -> GoalGraph | None:
+        from horizonx.core.goal_graph import GoalGraph
+
+        nodes = self._list_goals_from_connection(c, run_id)
+        if not nodes:
+            return None
+        return GoalGraph({node.id: node for node in nodes})
+
+    def _ensure_initial_graph_snapshot(
+        self, c: sqlite3.Connection, run_id: str, graph: GoalGraph
+    ) -> None:
+        row = c.execute(
+            "SELECT 1 FROM graph_snapshots WHERE run_id=? LIMIT 1", (run_id,)
+        ).fetchone()
+        if row is not None:
+            return
+        snapshot, digest = self._graph_snapshot(graph)
+        c.execute(
+            "INSERT INTO graph_snapshots "
+            "(run_id, version, digest, snapshot, event_sequence, recorded_at) "
+            "VALUES (?, 1, ?, ?, NULL, ?)",
+            (run_id, digest, snapshot, utcnow().isoformat()),
+        )
+
+    def _latest_graph_snapshot_from_connection(
+        self, c: sqlite3.Connection, run_id: str
+    ) -> dict[str, Any] | None:
+        row = c.execute(
+            "SELECT version, digest, snapshot, event_sequence FROM graph_snapshots "
+            "WHERE run_id=? ORDER BY version DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "version": row["version"],
+            "digest": row["digest"],
+            "graph": json.loads(row["snapshot"]),
+            "event_sequence": row["event_sequence"],
+        }
+
+    def _sync_latest_graph_snapshot(self, run_id: str) -> dict[str, Any] | None:
+        with self._conn() as c:
+            return self._latest_graph_snapshot_from_connection(c, run_id)
+
+    async def latest_graph_snapshot(self, run_id: str) -> dict[str, Any] | None:
+        return await self._run_sync(self._sync_latest_graph_snapshot, run_id)
+
+    def _sync_graph_snapshot_at_sequence(
+        self, run_id: str, sequence: int
+    ) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT version, digest, snapshot, event_sequence FROM graph_snapshots "
+                "WHERE run_id=? AND event_sequence<=? "
+                "ORDER BY version DESC LIMIT 1",
+                (run_id, sequence),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "version": row["version"], "digest": row["digest"],
+            "graph": json.loads(row["snapshot"]), "event_sequence": row["event_sequence"],
+        }
+
+    async def graph_snapshot_at_sequence(
+        self, run_id: str, sequence: int
+    ) -> dict[str, Any] | None:
+        return await self._run_sync(self._sync_graph_snapshot_at_sequence, run_id, sequence)
+
+    def _capture_graph_snapshot_for_event(
+        self, c: sqlite3.Connection, event: Any, sequence: int
+    ) -> dict[str, Any] | None:
+        """Store the graph state observed at a newly persisted event sequence."""
+        if event.run_id is None:
+            return None
+        graph = self._graph_from_connection(c, event.run_id)
+        if graph is None:
+            return None
+        before = self._latest_graph_snapshot_from_connection(c, event.run_id)
+        if before is None:
+            snapshot, digest = self._graph_snapshot(graph)
+            c.execute(
+                "INSERT INTO graph_snapshots "
+                "(run_id, version, digest, snapshot, event_sequence, recorded_at) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                (event.run_id, digest, snapshot, sequence, utcnow().isoformat()),
+            )
+            return {
+                "graph_after_version": 1,
+                "graph_after_digest": digest,
+            }
+        snapshot, digest = self._graph_snapshot(graph)
+        if digest == before["digest"]:
+            return None
+        after_version = int(before["version"]) + 1
+        c.execute(
+            "INSERT INTO graph_snapshots "
+            "(run_id, version, digest, snapshot, event_sequence, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (event.run_id, after_version, digest, snapshot, sequence, utcnow().isoformat()),
+        )
+        return {
+            "graph_before_version": before["version"],
+            "graph_before_digest": before["digest"],
+            "graph_after_version": after_version,
+            "graph_after_digest": digest,
+        }
+
+    def _append_graph_change_event(
+        self,
+        c: sqlite3.Connection,
+        run_id: str,
+        before: GoalGraph | None,
+        after: GoalGraph,
+        event: Any | None = None,
+    ) -> Any | None:
+        """Atomically bind one graph mutation to its own durable event/snapshot."""
+        from horizonx.core.event_bus import Event
+
+        latest = self._latest_graph_snapshot_from_connection(c, run_id)
+        before_digest = self._graph_snapshot(before)[1] if before is not None else None
+        after_snapshot, after_digest = self._graph_snapshot(after)
+        if before is None and latest is not None:
+            raise StoreError("graph mutation has no durable snapshot baseline")
+        if before is not None and latest is None:
+            raise StoreError("existing graph has no durable snapshot baseline")
+        if latest is not None and before_digest != latest["digest"]:
+            raise StoreError("graph mutation is not based on the latest durable snapshot")
+        if before is not None and before_digest == after_digest:
+            return None
+        before_version = latest["version"] if latest is not None else None
+        after_version = (int(before_version) if before_version is not None else 0) + 1
+        graph_event = event or Event(type="goals.graph_changed", run_id=run_id)
+        payload = dict(graph_event.payload)
+        payload.update(
+            {
+                "graph_before_version": before_version,
+                "graph_before_digest": before_digest,
+                "graph_after_version": after_version,
+                "graph_after_digest": after_digest,
+            }
+        )
+        c.execute(
+            "INSERT INTO events "
+            "(id, type, run_id, attempt_id, session_id, goal_id, timestamp, payload) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                graph_event.id,
+                graph_event.type,
+                run_id,
+                graph_event.attempt_id,
+                graph_event.session_id,
+                graph_event.goal_id,
+                graph_event.timestamp.isoformat(),
+                json.dumps(payload, default=str),
+            ),
+        )
+        row = c.execute("SELECT * FROM events WHERE id=?", (graph_event.id,)).fetchone()
+        if row is None:  # pragma: no cover
+            raise StoreError("graph change event disappeared after append")
+        c.execute(
+            "INSERT INTO graph_snapshots "
+            "(run_id, version, digest, snapshot, event_sequence, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                after_version,
+                after_digest,
+                after_snapshot,
+                row["sequence"],
+                utcnow().isoformat(),
+            ),
+        )
+        return Event(
+            id=row["id"], sequence=row["sequence"], type=row["type"],
+            run_id=row["run_id"], attempt_id=row["attempt_id"],
+            session_id=row["session_id"], goal_id=row["goal_id"],
+            timestamp=row["timestamp"], payload=payload,
+        )
+
+    def _sync_replace_pending_subgraph_and_append_event(
+        self, run_id: str, graph: GoalGraph, event: Any
+    ) -> Any | None:
+        with self._conn() as c:
+            current = self._graph_from_connection(c, run_id)
+            if current is None:
+                raise KeyError(f"goal graph not found for run: {run_id}")
+            self._replace_pending_subgraph_rows(c, run_id, graph)
+            return self._append_graph_change_event(c, run_id, current, graph, event)
+
+    async def replace_pending_subgraph_and_append_event(
+        self, run_id: str, graph: GoalGraph, event: Any
+    ) -> Any | None:
+        """Atomically record a graph transition and its durable timeline event."""
+        return await self._run_sync(
+            self._sync_replace_pending_subgraph_and_append_event, run_id, graph, event
+        )
 
     async def replace_pending_subgraph(self, run_id: str, graph: GoalGraph) -> None:
         """Replace unfinished planning while preserving completed nodes exactly."""
         return await self._run_sync(self._sync_replace_pending_subgraph, run_id, graph)
 
     def _sync_load_graph(self, run_id: str) -> GoalGraph | None:
-        from horizonx.core.goal_graph import GoalGraph
-
-        nodes = self._sync_list_goals(run_id)
-        if not nodes:
-            return None
-        return GoalGraph({node.id: node for node in nodes})
+        with self._conn() as c:
+            return self._graph_from_connection(c, run_id)
 
     async def load_graph(self, run_id: str) -> GoalGraph | None:
         return await self._run_sync(self._sync_load_graph, run_id)
@@ -1339,7 +1589,15 @@ class SqliteStore:
         to_status: GoalStatus,
         session_id: str | None,
     ) -> GoalNode:
+        from horizonx.core.event_bus import Event
+        from horizonx.core.goal_graph import GoalGraphError
+
+        goal: GoalNode | None
         with self._conn() as c:
+            try:
+                before_graph = self._graph_from_connection(c, run_id)
+            except GoalGraphError:
+                before_graph = None
             row = c.execute(
                 "SELECT status, version FROM goals WHERE run_id=? AND id=?",
                 (run_id, goal_id),
@@ -1395,7 +1653,24 @@ class SqliteStore:
                 raise GoalVersionConflict(
                     f"goal version changed while transitioning {run_id}/{goal_id}"
                 )
-        goal = self._sync_load_goal(run_id, goal_id)
+            try:
+                after_graph = self._graph_from_connection(c, run_id)
+            except GoalGraphError:
+                after_graph = None
+            if before_graph is not None and after_graph is not None:
+                self._append_graph_change_event(
+                    c,
+                    run_id,
+                    before_graph,
+                    after_graph,
+                    Event(type="goals.graph_changed", run_id=run_id, goal_id=goal_id),
+                )
+                goal = after_graph.get(goal_id)
+            else:
+                goal = next(
+                    (node for node in self._list_goals_from_connection(c, run_id) if node.id == goal_id),
+                    None,
+                )
         if goal is None:  # pragma: no cover - protected by the transaction above
             raise KeyError(f"goal not found after transition: {run_id}/{goal_id}")
         return goal
@@ -1426,10 +1701,14 @@ class SqliteStore:
         same leaf. Returns True if this session won the claim, False if another
         session already claimed or the goal is no longer PENDING.
         """
+        from horizonx.core.event_bus import Event
+
         conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000)
+        conn.row_factory = sqlite3.Row
         _configure_connection(conn, self.busy_timeout_ms)
         try:
             conn.execute("BEGIN IMMEDIATE")
+            before_graph = self._graph_from_connection(conn, run_id)
             cur = conn.execute(
                 "UPDATE goals SET assigned_to_session=?, status='in_progress', "
                 "attempts=attempts + 1, version=version + 1, "
@@ -1438,6 +1717,22 @@ class SqliteStore:
                 (session_id, utcnow().isoformat(), session_id, goal_id, run_id),
             )
             claimed = cur.rowcount == 1
+            if claimed:
+                after_graph = self._graph_from_connection(conn, run_id)
+                if before_graph is None or after_graph is None:  # pragma: no cover
+                    raise KeyError(f"goal graph not found for run: {run_id}")
+                self._append_graph_change_event(
+                    conn,
+                    run_id,
+                    before_graph,
+                    after_graph,
+                    Event(
+                        type="goals.graph_changed",
+                        run_id=run_id,
+                        goal_id=goal_id,
+                        session_id=session_id,
+                    ),
+                )
             conn.commit()
             return claimed
         except sqlite3.OperationalError as exc:
@@ -1458,11 +1753,26 @@ class SqliteStore:
 
     def _sync_release_goal(self, run_id: str, goal_id: str) -> None:
         """Clear the assignment when a goal completes or fails."""
+        from horizonx.core.event_bus import Event
+
         with self._conn() as c:
-            c.execute(
-                "UPDATE goals SET assigned_to_session=NULL WHERE id=? AND run_id=?",
+            before_graph = self._graph_from_connection(c, run_id)
+            changed = c.execute(
+                "UPDATE goals SET assigned_to_session=NULL WHERE id=? AND run_id=? "
+                "AND assigned_to_session IS NOT NULL",
                 (goal_id, run_id),
             )
+            if changed.rowcount:
+                after_graph = self._graph_from_connection(c, run_id)
+                if before_graph is None or after_graph is None:  # pragma: no cover
+                    raise KeyError(f"goal graph not found for run: {run_id}")
+                self._append_graph_change_event(
+                    c,
+                    run_id,
+                    before_graph,
+                    after_graph,
+                    Event(type="goals.graph_changed", run_id=run_id, goal_id=goal_id),
+                )
 
     async def release_goal(self, run_id: str, goal_id: str) -> None:
         return await self._run_sync(self._sync_release_goal, run_id, goal_id)
@@ -1471,7 +1781,10 @@ class SqliteStore:
         self, run_id: str, goal_id: str, session_id: str
     ) -> bool:
         """Release only the exact orphaned assignment observed by recovery."""
+        from horizonx.core.event_bus import Event
+
         with self._conn() as c:
+            before_graph = self._graph_from_connection(c, run_id)
             cur = c.execute(
                 "UPDATE goals SET status='pending', assigned_to_session=NULL, "
                 "version=version+1, last_updated_at=?, last_updated_by_session=? "
@@ -1485,6 +1798,17 @@ class SqliteStore:
                     session_id,
                 ),
             )
+            if cur.rowcount:
+                after_graph = self._graph_from_connection(c, run_id)
+                if before_graph is None or after_graph is None:  # pragma: no cover
+                    raise KeyError(f"goal graph not found for run: {run_id}")
+                self._append_graph_change_event(
+                    c,
+                    run_id,
+                    before_graph,
+                    after_graph,
+                    Event(type="goals.graph_changed", run_id=run_id, goal_id=goal_id),
+                )
         return int(cur.rowcount) == 1
 
     async def recover_goal_claim(
@@ -1559,7 +1883,7 @@ class SqliteStore:
 
     def _sync_save_validation(
         self, run: Run, session: Session | None, decision: GateDecision
-    ) -> None:
+    ) -> str:
         from uuid import uuid4
 
         with self._conn() as c:
@@ -1593,13 +1917,14 @@ class SqliteStore:
                 f"{identity}:{goal_id or '-'}:{decision.validator_name}:"
                 f"{decision_digest}"
             )
+            validation_id = str(uuid4())
             c.execute(
                 """INSERT OR IGNORE INTO validations
                    (id, run_id, session_id, validator, decision, reason, score,
                     details, started_at, duration_ms, idempotency_key)
                    VALUES (?,?,?,?,?,?,?,?,datetime('now'),?,?)""",
                 (
-                    str(uuid4()),
+                    validation_id,
                     run.id,
                     session_id,
                     decision.validator_name,
@@ -1611,27 +1936,36 @@ class SqliteStore:
                     idempotency_key,
                 ),
             )
+            row = c.execute(
+                "SELECT id FROM validations WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+        assert row is not None
+        return str(row["id"])
 
-    async def save_validation(self, run: Run, session: Session | None, decision: GateDecision) -> None:
+    async def save_validation(
+        self, run: Run, session: Session | None, decision: GateDecision
+    ) -> str:
         return await self._run_sync(self._sync_save_validation, run, session, decision)
 
-    def _sync_save_spin_report(self, session: Session, report: SpinReport) -> None:
+    def _sync_save_spin_report(self, session: Session, report: SpinReport) -> str:
         from uuid import uuid4
 
         with self._conn() as c:
+            report_id = str(uuid4())
             c.execute(
                 """INSERT INTO spin_reports (id, session_id, layer, detected_at, detail, action_taken)
                    VALUES (?,?,?,datetime('now'),?,?)""",
                 (
-                    str(uuid4()),
+                    report_id,
                     session.id,
                     report.layer or "unknown",
                     json.dumps(report.detail, default=str),
                     report.action,
                 ),
             )
+        return report_id
 
-    async def save_spin_report(self, session: Session, report: SpinReport) -> None:
+    async def save_spin_report(self, session: Session, report: SpinReport) -> str:
         return await self._run_sync(self._sync_save_spin_report, session, report)
 
     def _sync_list_runs(self, limit: int) -> list[dict[str, Any]]:
@@ -2538,6 +2872,7 @@ class SqliteStore:
                     json.dumps(
                         {
                             "request_id": request_id,
+                            "command_id": command_row["id"],
                             "action": request["decision"],
                             "actor": request["operator"],
                             "instruction": request["instruction"] or "",
@@ -2633,6 +2968,7 @@ class SqliteStore:
             ).fetchone()
             expected_event_payload = {
                 "request_id": request_id,
+                "command_id": matching_commands[0]["id"],
                 "action": request["decision"],
                 "actor": request["operator"],
                 "instruction": request["instruction"] or "",
@@ -2811,7 +3147,7 @@ class SqliteStore:
                 "INSERT OR IGNORE INTO events "
                 "(id, type, run_id, timestamp, payload) VALUES (?,?,?,?,?)",
                 (event_id, "hitl.resolved", command["run_id"], now,
-                 json.dumps({"request_id": request["id"], "action": "abort",
+                 json.dumps({"request_id": request["id"], "command_id": command["id"], "action": "abort",
                              "actor": command["actor"],
                              "instruction": command["instruction"] or ""})),
             )
@@ -2880,43 +3216,41 @@ class SqliteStore:
     # Append-only events
     # ------------------------------------------------------------------
 
-    def _sync_append_event(self, event: Any) -> Any:
+    def _append_event_in_connection(self, c: sqlite3.Connection, event: Any) -> Any:
         from horizonx.core.event_bus import Event
 
         attempt_id = event.attempt_id
-        goal_id = event.goal_id
+        goal_id = event.goal_id or event.payload.get("goal_id")
         if attempt_id is None and event.session_id is not None:
-            with self._conn() as c:
-                attempt_row = c.execute(
-                    "SELECT id, goal_id FROM attempts WHERE session_id=? "
-                    "ORDER BY ordinal DESC LIMIT 1",
-                    (event.session_id,),
-                ).fetchone()
+            attempt_row = c.execute(
+                "SELECT id, goal_id FROM attempts WHERE session_id=? "
+                "ORDER BY ordinal DESC LIMIT 1",
+                (event.session_id,),
+            ).fetchone()
             if attempt_row is not None:
                 attempt_id = attempt_row["id"]
                 goal_id = goal_id or attempt_row["goal_id"]
-        with self._conn() as c:
-            c.execute(
-                "INSERT OR IGNORE INTO events "
-                "(id, type, run_id, attempt_id, session_id, goal_id, timestamp, payload) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    event.id,
-                    event.type,
-                    event.run_id,
-                    attempt_id,
-                    event.session_id,
-                    goal_id,
-                    event.timestamp.isoformat(),
-                    json.dumps(event.payload, default=str),
-                ),
-            )
-            row = c.execute("SELECT * FROM events WHERE id=?", (event.id,)).fetchone()
-            if row is None and event.type == "strategy.switched":
-                row = c.execute(
-                    "SELECT * FROM events WHERE run_id=? AND type='strategy.switched'",
-                    (event.run_id,),
-                ).fetchone()
+        c.execute(
+            "INSERT OR IGNORE INTO events "
+            "(id, type, run_id, attempt_id, session_id, goal_id, timestamp, payload) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                event.id,
+                event.type,
+                event.run_id,
+                attempt_id,
+                event.session_id,
+                goal_id,
+                event.timestamp.isoformat(),
+                json.dumps(event.payload, default=str),
+            ),
+        )
+        row = c.execute("SELECT * FROM events WHERE id=?", (event.id,)).fetchone()
+        if row is None and event.type == "strategy.switched":
+            row = c.execute(
+                "SELECT * FROM events WHERE run_id=? AND type='strategy.switched'",
+                (event.run_id,),
+            ).fetchone()
         if row is None:  # pragma: no cover - insert or existing row must be visible
             raise StoreError(f"event disappeared after append: {event.id}")
         return Event(
@@ -2930,6 +3264,10 @@ class SqliteStore:
             timestamp=row["timestamp"],
             payload=json.loads(row["payload"] or "{}"),
         )
+
+    def _sync_append_event(self, event: Any) -> Any:
+        with self._conn() as c:
+            return self._append_event_in_connection(c, event)
 
     async def append_event(self, event: Any) -> Any:
         return await self._run_sync(self._sync_append_event, event)
@@ -2989,6 +3327,51 @@ class SqliteStore:
             limit,
             event_type,
         )
+
+    def _sync_list_event_summaries(
+        self, run_id: str, after_sequence: int, limit: int
+    ) -> list[dict[str, Any]]:
+        """Read a bounded event page without deserializing diagnostic payloads."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT sequence, id, type, run_id, attempt_id, session_id, "
+                "COALESCE(goal_id, json_extract(payload, '$.goal_id')) AS goal_id, timestamp, "
+                "json_extract(payload, '$.validation_id') AS validation_id, "
+                "json_extract(payload, '$.evidence_id') AS evidence_id, "
+                "COALESCE(json_extract(payload, '$.hitl_id'), "
+                "json_extract(payload, '$.request_id')) AS hitl_id, "
+                "json_extract(payload, '$.spin_report_id') AS spin_report_id, "
+                "json_extract(payload, '$.command_id') AS command_id "
+                "FROM events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?",
+                (run_id, after_sequence, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def list_event_summaries(
+        self, run_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        return await self._run_sync(
+            self._sync_list_event_summaries, run_id, after_sequence, limit
+        )
+
+    def _sync_get_event(self, run_id: str, sequence: int) -> Any | None:
+        from horizonx.core.event_bus import Event
+
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM events WHERE run_id=? AND sequence=?", (run_id, sequence)
+            ).fetchone()
+        if row is None:
+            return None
+        return Event(
+            id=row["id"], sequence=row["sequence"], type=row["type"],
+            run_id=row["run_id"], attempt_id=row["attempt_id"],
+            session_id=row["session_id"], goal_id=row["goal_id"],
+            timestamp=row["timestamp"], payload=json.loads(row["payload"] or "{}"),
+        )
+
+    async def get_event(self, run_id: str, sequence: int) -> Any | None:
+        return await self._run_sync(self._sync_get_event, run_id, sequence)
 
     def _sync_list_all_events(
         self, after_sequence: int | None, limit: int

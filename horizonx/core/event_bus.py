@@ -45,6 +45,7 @@ EventType = Literal[
     "fork.merged",
     "retry.attempted",
     "goals.re_decomposed",
+    "goals.graph_changed",
     "budget.velocity_alert",
     "usage.charged",
     "attempt.started",

@@ -676,7 +676,7 @@ class Runtime:
             validator = build_validator(vc, store=self.store)
             workspace = self._workspace_for(run)
             decision = await validator.validate(run, session, workspace)
-            await self.store.save_validation(run, session, decision)
+            validation_id = await self.store.save_validation(run, session, decision)
             ev_type = (
                 "validator.passed" if decision.decision == GateAction.CONTINUE
                 else "validator.paused" if decision.decision == GateAction.PAUSE_FOR_HITL
@@ -687,7 +687,12 @@ class Runtime:
                     type=ev_type,  # type: ignore[arg-type]
                     run_id=run.id,
                     session_id=session.id if session else None,
-                    payload={"validator": vc.id, "reason": decision.reason},
+                    goal_id=session.target_goal_id if session else None,
+                    payload={
+                        "validator": vc.id,
+                        "reason": decision.reason,
+                        "validation_id": validation_id,
+                    },
                 )
             )
             decisions.append(decision)
@@ -714,13 +719,17 @@ class Runtime:
             }
             report.action = action_map[run.task.spin_detection.on_spin]
         if report.detected:
-            await self.store.save_spin_report(session, report)
+            spin_report_id = await self.store.save_spin_report(session, report)
             await self.bus.publish(
                 Event(
                     type="spin.detected",
                     run_id=session.run_id,
                     session_id=session.id,
-                    payload={"layer": report.layer, "action": report.action},
+                    payload={
+                        "layer": report.layer,
+                        "action": report.action,
+                        "spin_report_id": spin_report_id,
+                    },
                 )
             )
         return report

@@ -363,3 +363,46 @@ async def test_re_decompose_publishes_event(tmp_path: Path):
     assert evt.run_id == run.id
     assert evt.payload["instruction"] == "Simplify the plan"
     assert evt.payload["new_goal_count"] == 2
+    assert evt.payload["graph_before_version"] < evt.payload["graph_after_version"]
+    assert len(evt.payload["graph_before_digest"]) == 64
+    assert len(evt.payload["graph_after_digest"]) == 64
+    [durable] = await rt.store.list_events(run.id, event_type="goals.re_decomposed")
+    assert durable.payload["graph_after_digest"] == evt.payload["graph_after_digest"]
+
+
+@pytest.mark.asyncio
+async def test_re_decompose_noop_does_not_publish_none(tmp_path: Path):
+    """An unchanged durable graph is a successful no-op, not a bus event."""
+    task = _make_task()
+    run = _make_run(tmp_path, task)
+    _write_goals(run.workspace_path, _minimal_goals_with_done_and_pending())
+    rt = _make_rt_mock(tmp_path)
+    graph = GoalGraph.load(run.workspace_path / "goals.json")
+    await rt.store.create_graph(run.id, graph)
+    published_events = []
+
+    async def capture_publish(event):
+        published_events.append(event)
+
+    rt.bus.publish = capture_publish
+    same_nodes = {
+        node.id: node.model_dump(mode="json")
+        for node in graph.all_nodes()
+        if node.status.value != "done"
+    }
+    strategy = SequentialSubgoals(config={})
+
+    with patch(
+        "horizonx.strategies.sequential.call_llm_json",
+        new=AsyncMock(return_value={"nodes": same_nodes}),
+    ):
+        changed = await strategy._re_decompose(
+            run,
+            rt,
+            graph.get("g.pending"),
+            "Keep the current decomposition",
+        )
+
+    assert changed is True
+    assert published_events == []
+    assert await rt.store.list_events(run.id, event_type="goals.re_decomposed") == []

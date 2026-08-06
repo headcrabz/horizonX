@@ -383,13 +383,22 @@ class SequentialSubgoals:
                             parent.children.append(nid)
 
                 new_graph = GoalGraph(merged_nodes)
-                await rt.store.replace_pending_subgraph(run.id, new_graph)
+                event = await rt.store.replace_pending_subgraph_and_append_event(
+                    run.id,
+                    new_graph,
+                    Event(
+                        type="goals.re_decomposed",
+                        run_id=run.id,
+                        goal_id=current_goal.id,
+                        payload={
+                            "instruction": instruction,
+                            "new_goal_count": len(new_nodes_raw),
+                        },
+                    ),
+                )
                 await rt.store.ensure_goal_projection(run.id, graph_path)
-                await rt.bus.publish(Event(
-                    type="goals.re_decomposed",
-                    run_id=run.id,
-                    payload={"instruction": instruction, "new_goal_count": len(new_nodes_raw)},
-                ))
+                if event is not None:
+                    await rt.bus.publish(event)
                 return True
             except Exception as exc:
                 sys.stderr.write(f"[re_decompose] attempt {attempt + 1} failed: {exc}\n")

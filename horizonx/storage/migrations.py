@@ -90,6 +90,18 @@ CREATE TABLE operator_commands (
 )
 """
 
+_LATEST_GRAPH_SNAPSHOTS_SQL = """
+CREATE TABLE graph_snapshots (
+    run_id          TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    digest          TEXT NOT NULL,
+    snapshot        TEXT NOT NULL,
+    event_sequence  INTEGER,
+    recorded_at     TEXT NOT NULL,
+    PRIMARY KEY (run_id, version)
+)
+"""
+
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
@@ -287,6 +299,32 @@ def ensure_additive_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_commands_idempotency "
             "ON operator_commands(run_id, idempotency_key)"
+        )
+    if _table_exists(conn, "graph_snapshots"):
+        digest_is_unique = False
+        for index in conn.execute("PRAGMA index_list(graph_snapshots)"):
+            if not index[2]:
+                continue
+            snapshot_index_columns: list[str] = [
+                str(row[2])
+                for row in conn.execute(f"PRAGMA index_info('{index[1]}')")
+            ]
+            if snapshot_index_columns == ["run_id", "digest"]:
+                digest_is_unique = True
+                break
+        if digest_is_unique:
+            conn.execute("ALTER TABLE graph_snapshots RENAME TO graph_snapshots_v8")
+            conn.execute(_LATEST_GRAPH_SNAPSHOTS_SQL)
+            conn.execute(
+                "INSERT INTO graph_snapshots "
+                "(run_id, version, digest, snapshot, event_sequence, recorded_at) "
+                "SELECT run_id, version, digest, snapshot, event_sequence, recorded_at "
+                "FROM graph_snapshots_v8"
+            )
+            conn.execute("DROP TABLE graph_snapshots_v8")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_graph_snapshots_playback "
+            "ON graph_snapshots(run_id, event_sequence, version)"
         )
 
 
