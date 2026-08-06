@@ -11,11 +11,13 @@ from pathlib import Path
 
 import click
 import yaml
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
 from horizonx import RepositoryConfig, Run, RunStatus, Runtime, Task
 from horizonx.environments.base import WorkspaceError
+from horizonx.project import CONFIG_FILENAME, ProjectConfig
 from horizonx.storage import SqliteStore
 
 console = Console()
@@ -24,15 +26,67 @@ console = Console()
 @click.group()
 @click.option(
     "--db",
-    default="horizonx.db",
+    default=None,
     envvar="HORIZONX_DB",
     help="Path to the local SQLite database",
 )
 @click.pass_context
-def main(ctx: click.Context, db: str) -> None:
+def main(ctx: click.Context, db: str | None) -> None:
     """HorizonX — long-horizon agent execution harness."""
     ctx.ensure_object(dict)
-    ctx.obj["db"] = db
+    try:
+        project = ProjectConfig.find_in(Path.cwd())
+    except (OSError, ValidationError, yaml.YAMLError) as exc:
+        raise click.ClickException(
+            f"invalid {CONFIG_FILENAME}: {exc}. Fix the file or run horizonx init --force."
+        ) from None
+    ctx.obj["db"] = db or (project.db_path if project else Path("horizonx.db"))
+    ctx.obj["workspace_root"] = project.workspace_root if project else None
+
+
+@main.command()
+@click.argument("directory", default=".", type=click.Path(path_type=Path))
+@click.option("--force", is_flag=True, help="Overwrite existing project files")
+def init(directory: Path, force: bool) -> None:
+    """Create a local HorizonX project configuration and example task."""
+    if directory.exists() and not directory.is_dir():
+        raise click.ClickException(f"project directory is not a directory: {directory}")
+
+    config_path = directory / CONFIG_FILENAME
+    example_path = directory / "tasks" / "example.yaml"
+    existing = [path for path in (config_path, example_path) if path.exists()]
+    if existing and not force:
+        names = ", ".join(str(path) for path in existing)
+        raise click.ClickException(
+            f"refusing to overwrite {names}; rerun with --force to replace them"
+        )
+
+    directory.mkdir(parents=True, exist_ok=True)
+    example_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(ProjectConfig().to_yaml())
+    example_path.write_text(_example_task_yaml())
+    click.echo(f"Initialized HorizonX project in {directory.resolve()}")
+
+
+def _example_task_yaml() -> str:
+    task = {
+        "id": "example",
+        "name": "Example mock task",
+        "description": "A local smoke test that needs no external provider.",
+        "prompt": "Confirm that HorizonX can run this mock task.",
+        "strategy": {"kind": "single"},
+        "agent": {
+            "type": "mock",
+            "model": "mock",
+            "extra": {
+                "steps": [
+                    {"type": "thought", "content": {"text": "Mock task completed."}}
+                ],
+                "status": "completed",
+            },
+        },
+    }
+    return yaml.safe_dump(task, sort_keys=False, default_flow_style=False)
 
 
 def _load_task_from_path(path: Path) -> Task:
@@ -86,7 +140,10 @@ def run(
     elif branch is not None or base_ref != "HEAD" or submodules:
         raise click.ClickException("--ref, --branch, and --submodules require --repo")
     if workspace_root is None:
-        if task.repository is not None and task.repository.path is not None:
+        configured_workspace = ctx.obj["workspace_root"]
+        if configured_workspace is not None:
+            workspace_root = configured_workspace
+        elif task.repository is not None and task.repository.path is not None:
             source = task.repository.path.resolve()
             workspace_root = source.parent / f".{source.name}-horizonx-workspaces"
         else:
@@ -291,9 +348,9 @@ def checkpoint(ctx: click.Context) -> None:
 @main.command()
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8765, type=int, show_default=True)
-@click.option("--workspace-root", default="./horizonx-workspaces", type=Path)
+@click.option("--workspace-root", default=None, type=Path)
 @click.pass_context
-def serve(ctx: click.Context, host: str, port: int, workspace_root: Path) -> None:
+def serve(ctx: click.Context, host: str, port: int, workspace_root: Path | None) -> None:
     """Start the web dashboard (requires horizonx[dashboard])."""
     try:
         import uvicorn
@@ -303,7 +360,10 @@ def serve(ctx: click.Context, host: str, port: int, workspace_root: Path) -> Non
         raise click.ClickException(
             "Dashboard extras not installed. Run: pip install horizonx[dashboard]"
         ) from exc
-    app = create_app(db_path=ctx.obj["db"], workspace_root=workspace_root)
+    app = create_app(
+        db_path=ctx.obj["db"],
+        workspace_root=workspace_root or ctx.obj["workspace_root"] or Path("horizonx-workspaces"),
+    )
     console.print(f"[bold cyan]HorizonX[/] dashboard → http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="info")
 
