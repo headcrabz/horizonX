@@ -34,6 +34,11 @@ console = Console()
 def main(ctx: click.Context, db: str | None) -> None:
     """HorizonX — long-horizon agent execution harness."""
     ctx.ensure_object(dict)
+    if ctx.invoked_subcommand == "init":
+        # Init must be able to replace a malformed config in the current directory.
+        ctx.obj["db"] = db or Path("horizonx.db")
+        ctx.obj["workspace_root"] = None
+        return
     try:
         project = ProjectConfig.find_in(Path.cwd())
     except (OSError, ValidationError, yaml.YAMLError) as exc:

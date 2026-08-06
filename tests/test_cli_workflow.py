@@ -71,6 +71,18 @@ def test_init_refuses_to_overwrite_without_force(tmp_path: Path) -> None:
     assert ProjectConfig.load(config_path).version == 1
 
 
+def test_force_init_repairs_malformed_config_in_current_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "horizonx.yaml").write_text("version: not-a-version\n")
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(main, ["init", "--force", "."])
+
+    assert result.exit_code == 0, result.output
+    assert ProjectConfig.load(tmp_path / "horizonx.yaml").version == 1
+
+
 def test_initialized_example_runs_with_the_mock_provider(tmp_path: Path) -> None:
     project_dir = tmp_path / "project"
     runner = CliRunner()
