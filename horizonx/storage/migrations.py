@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 _REQUIRED_GOAL_COLUMNS = {
     "run_id",
@@ -206,6 +206,12 @@ def prepare_schema(conn: sqlite3.Connection) -> None:
 
 def ensure_additive_schema(conn: sqlite3.Connection) -> None:
     """Add columns and indexes that SQLite can upgrade without table replacement."""
+    if _table_exists(conn, "runs"):
+        run_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(runs)")
+        }
+        if "active_hitl_request_id" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN active_hitl_request_id TEXT")
     if _table_exists(conn, "validations"):
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(validations)")
@@ -312,6 +318,20 @@ def repair_hitl_requested_events(conn: sqlite3.Connection) -> None:
         )
 
 
+def repair_active_hitl_requests(conn: sqlite3.Connection) -> None:
+    """Link only legacy pauses with one unambiguous unresolved request."""
+    if not _table_exists(conn, "runs") or not _table_exists(conn, "hitl_events"):
+        return
+    conn.execute(
+        "UPDATE runs SET active_hitl_request_id=("
+        "SELECT MIN(h.id) FROM hitl_events AS h "
+        "WHERE h.run_id=runs.id AND h.resolved_at IS NULL"
+        ") WHERE status='paused_hitl' AND active_hitl_request_id IS NULL "
+        "AND (SELECT COUNT(*) FROM hitl_events AS h "
+        "WHERE h.run_id=runs.id AND h.resolved_at IS NULL)=1"
+    )
+
+
 def record_current_schema(conn: sqlite3.Connection) -> None:
     goal_columns = {row[1] for row in conn.execute("PRAGMA table_info(goals)")}
     missing_goal_columns = _REQUIRED_GOAL_COLUMNS - goal_columns
@@ -358,6 +378,11 @@ def record_current_schema(conn: sqlite3.Connection) -> None:
     if "usd_known" not in usage_columns:
         raise SchemaMigrationError(
             "current workspace_usage schema is missing usd_known"
+        )
+    run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    if "active_hitl_request_id" not in run_columns:
+        raise SchemaMigrationError(
+            "current runs schema is missing active_hitl_request_id"
         )
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",

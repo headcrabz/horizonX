@@ -44,6 +44,7 @@ from horizonx.storage.migrations import (
     prepare_schema,
     read_schema_version,
     record_current_schema,
+    repair_active_hitl_requests,
     repair_hitl_requested_events,
 )
 
@@ -248,6 +249,7 @@ CREATE TABLE IF NOT EXISTS runs (
     workspace_path  TEXT NOT NULL,
     started_at      TEXT NOT NULL,
     completed_at    TEXT,
+    active_hitl_request_id TEXT,
     current_session_id TEXT,
     goal_graph_root TEXT NOT NULL,
     cumulative      TEXT NOT NULL DEFAULT '{}'
@@ -484,9 +486,12 @@ class SqliteStore:
     def _sync_init_schema(self) -> None:
         with self._conn() as c:
             prepare_schema(c)
+            previous_version = read_schema_version(c)
             c.executescript(SCHEMA)
             ensure_additive_schema(c)
             repair_hitl_requested_events(c)
+            if previous_version < 7:
+                repair_active_hitl_requests(c)
             record_current_schema(c)
 
     async def _run_sync(self, fn: Callable[..., _T], *args: Any) -> _T:
@@ -727,8 +732,9 @@ class SqliteStore:
             c.execute(
                 """\
                 INSERT INTO runs (id, parent_run_id, task_snapshot, status, workspace_path,
-                                 started_at, completed_at, current_session_id, goal_graph_root, cumulative)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                                 started_at, completed_at, active_hitl_request_id,
+                                 current_session_id, goal_graph_root, cumulative)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=CASE
                         WHEN runs.status IN ('completed', 'failed', 'aborted',
@@ -738,6 +744,12 @@ class SqliteStore:
                         WHEN runs.status IN ('completed', 'failed', 'aborted',
                                              'timed_out', 'budget_exceeded')
                         THEN runs.completed_at ELSE excluded.completed_at END,
+                    active_hitl_request_id=CASE
+                        WHEN runs.status IN ('completed', 'failed', 'aborted',
+                                             'timed_out', 'budget_exceeded')
+                          OR excluded.status IN ('completed', 'failed', 'aborted',
+                                                'timed_out', 'budget_exceeded')
+                        THEN NULL ELSE runs.active_hitl_request_id END,
                     workspace_path=excluded.workspace_path,
                     current_session_id=excluded.current_session_id,
                     cumulative=excluded.cumulative
@@ -750,6 +762,7 @@ class SqliteStore:
                     str(run.workspace_path),
                     run.started_at.isoformat(),
                     run.completed_at.isoformat() if run.completed_at else None,
+                    None,
                     run.current_session_id,
                     run.goal_graph_root,
                     run.cumulative.model_dump_json(),
@@ -769,7 +782,8 @@ class SqliteStore:
             current = RunStatus(row["status"])
             if current not in TERMINAL_RUN_STATUSES:
                 c.execute(
-                    "UPDATE runs SET status=?, completed_at=COALESCE(completed_at, ?) "
+                    "UPDATE runs SET status=?, completed_at=COALESCE(completed_at, ?), "
+                    "active_hitl_request_id=NULL "
                     "WHERE id=? AND status NOT IN "
                     "('completed', 'failed', 'aborted', 'timed_out', 'budget_exceeded')",
                     (to_status.value, utcnow().isoformat(), run_id),
@@ -795,6 +809,7 @@ class SqliteStore:
             workspace_path=Path(row["workspace_path"]),
             started_at=row["started_at"],
             completed_at=row["completed_at"],
+            active_hitl_request_id=row["active_hitl_request_id"],
             current_session_id=row["current_session_id"],
             goal_graph_root=row["goal_graph_root"],
             cumulative=CumulativeMetrics.model_validate_json(row["cumulative"] or "{}"),
@@ -1899,16 +1914,37 @@ class SqliteStore:
     ) -> tuple[str, Any]:
         from uuid import uuid4
 
+        event_id = hitl_id or str(uuid4())
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
-            run = c.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            run = c.execute(
+                "SELECT status, active_hitl_request_id FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
             if run is None:
                 raise KeyError(f"run not found: {run_id}")
-            if run["status"] != RunStatus.RUNNING.value:
+            if (
+                run["status"] != RunStatus.RUNNING.value
+                or run["active_hitl_request_id"] is not None
+            ):
                 raise HITLTransitionError(run_id, run["status"])
+            existing = c.execute(
+                "SELECT run_id FROM hitl_events WHERE id=?", (event_id,)
+            ).fetchone()
+            if existing is not None:
+                raise HITLTransitionError(
+                    run_id,
+                    f"request {event_id!r} already belongs to run {existing['run_id']!r}",
+                )
             changed = c.execute(
-                "UPDATE runs SET status=? WHERE id=? AND status=?",
-                (RunStatus.PAUSED_HITL.value, run_id, RunStatus.RUNNING.value),
+                "UPDATE runs SET status=?, active_hitl_request_id=? "
+                "WHERE id=? AND status=? AND active_hitl_request_id IS NULL",
+                (
+                    RunStatus.PAUSED_HITL.value,
+                    event_id,
+                    run_id,
+                    RunStatus.RUNNING.value,
+                ),
             )
             if changed.rowcount != 1:  # pragma: no cover - write lock fences races
                 current = c.execute(
@@ -1916,7 +1952,7 @@ class SqliteStore:
                 ).fetchone()
                 raise HITLTransitionError(run_id, current["status"])
             return self._insert_hitl_request(
-                c, run_id, trigger, context, hitl_id or str(uuid4()), actor,
+                c, run_id, trigger, context, event_id, actor,
                 instruction,
             )
 
@@ -1928,6 +1964,79 @@ class SqliteStore:
         return await self._run_sync(
             self._sync_enter_hitl, run_id, trigger, context, hitl_id, actor,
             instruction,
+        )
+
+    def _sync_apply_hitl_decision(
+        self,
+        run_id: str,
+        expected_request_id: str,
+        to_status: RunStatus,
+    ) -> Run:
+        if to_status != RunStatus.RUNNING and to_status not in TERMINAL_RUN_STATUSES:
+            raise StoreError(f"invalid HITL transition target: {to_status.value}")
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            run = c.execute(
+                "SELECT status, active_hitl_request_id FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"run not found: {run_id}")
+            if (
+                run["status"] != RunStatus.PAUSED_HITL.value
+                or run["active_hitl_request_id"] != expected_request_id
+            ):
+                raise HITLTransitionError(
+                    run_id,
+                    "active HITL request does not match "
+                    f"{expected_request_id!r} (status={run['status']!r}, "
+                    f"active={run['active_hitl_request_id']!r})",
+                )
+            request = c.execute(
+                "SELECT run_id, resolved_at FROM hitl_events WHERE id=?",
+                (expected_request_id,),
+            ).fetchone()
+            if (
+                request is None
+                or request["run_id"] != run_id
+                or request["resolved_at"] is None
+            ):
+                raise HITLTransitionError(
+                    run_id,
+                    f"active HITL request {expected_request_id!r} is not a resolved "
+                    "request owned by the run",
+                )
+            completed_at = (
+                utcnow().isoformat() if to_status in TERMINAL_RUN_STATUSES else None
+            )
+            changed = c.execute(
+                "UPDATE runs SET status=?, completed_at=?, active_hitl_request_id=NULL "
+                "WHERE id=? AND status=? AND active_hitl_request_id=?",
+                (
+                    to_status.value,
+                    completed_at,
+                    run_id,
+                    RunStatus.PAUSED_HITL.value,
+                    expected_request_id,
+                ),
+            )
+            if changed.rowcount != 1:  # pragma: no cover - write lock fences races
+                raise HITLTransitionError(run_id, "active HITL request changed")
+        return self._sync_load_run(run_id)
+
+    async def apply_hitl_decision(
+        self,
+        run_id: str,
+        *,
+        expected_request_id: str,
+        to_status: RunStatus,
+    ) -> Run:
+        """Consume one resolved active HITL generation and clear its run link."""
+        return await self._run_sync(
+            self._sync_apply_hitl_decision,
+            run_id,
+            expected_request_id,
+            to_status,
         )
 
     async def save_hitl_event(
@@ -2031,6 +2140,32 @@ class SqliteStore:
     async def find_hitl_event(self, event_id: str) -> dict[str, Any]:
         return await self._run_sync(self._sync_find_hitl_event, event_id)
 
+    def _sync_find_active_hitl_event(
+        self, run_id: str, event_id: str
+    ) -> dict[str, Any]:
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                "SELECT h.* FROM hitl_events AS h "
+                "JOIN runs AS r ON r.id=h.run_id "
+                "WHERE r.id=? AND r.status=? AND r.active_hitl_request_id=? "
+                "AND h.id=?",
+                (run_id, RunStatus.PAUSED_HITL.value, event_id, event_id),
+            ).fetchone()
+            if row is None:
+                raise HITLTransitionError(
+                    run_id, f"active HITL request does not match {event_id!r}"
+                )
+            return dict(row)
+
+    async def find_active_hitl_event(
+        self, run_id: str, event_id: str
+    ) -> dict[str, Any]:
+        """Return a request only while it owns the run's current pause."""
+        return await self._run_sync(
+            self._sync_find_active_hitl_event, run_id, event_id
+        )
+
     def _sync_resolve_hitl_event(
         self,
         event_id: str,
@@ -2039,11 +2174,33 @@ class SqliteStore:
         reason: str,
         instruction: str,
         idempotency_key: str,
+        expected_run_id: str | None = None,
     ) -> tuple[dict[str, Any], bool, Any]:
         from horizonx.core.event_bus import Event
 
         now = utcnow().isoformat()
         with self._conn() as c:
+            if expected_run_id is not None:
+                c.execute("BEGIN IMMEDIATE")
+                run = c.execute(
+                    "SELECT status, active_hitl_request_id FROM runs WHERE id=?",
+                    (expected_run_id,),
+                ).fetchone()
+                if run is None:
+                    raise KeyError(f"run not found: {expected_run_id}")
+                request = c.execute(
+                    "SELECT run_id FROM hitl_events WHERE id=?", (event_id,)
+                ).fetchone()
+                if (
+                    run["status"] != RunStatus.PAUSED_HITL.value
+                    or run["active_hitl_request_id"] != event_id
+                    or request is None
+                    or request["run_id"] != expected_run_id
+                ):
+                    raise HITLTransitionError(
+                        expected_run_id,
+                        f"active HITL request does not match {event_id!r}",
+                    )
             cursor = c.execute(
                 "UPDATE hitl_events SET resolved_at=?, decision=?, operator=?, reason=?, "
                 "instruction=?, resolution_idempotency_key=? "
@@ -2117,6 +2274,22 @@ class SqliteStore:
         return await self._run_sync(
             self._sync_resolve_hitl_event, event_id, action, actor, reason,
             instruction, idempotency_key,
+        )
+
+    async def resolve_active_hitl_event_and_event(
+        self, run_id: str, event_id: str, *, action: str, actor: str,
+        reason: str, instruction: str, idempotency_key: str,
+    ) -> tuple[dict[str, Any], bool, Any]:
+        """Resolve only the request that durably owns the run's current pause."""
+        return await self._run_sync(
+            self._sync_resolve_hitl_event,
+            event_id,
+            action,
+            actor,
+            reason,
+            instruction,
+            idempotency_key,
+            run_id,
         )
 
     @staticmethod
@@ -2284,10 +2457,19 @@ class SqliteStore:
             raise KeyError(f"operator command not found: {command_id}")
         if command["kind"] != "cancel":
             raise StoreError("operator command is not a cancellation")
-        request = c.execute(
-            "SELECT * FROM hitl_events WHERE run_id=? AND resolved_at IS NULL "
-            "ORDER BY triggered_at DESC LIMIT 1", (command["run_id"],),
+        run = c.execute(
+            "SELECT active_hitl_request_id FROM runs WHERE id=?",
+            (command["run_id"],),
         ).fetchone()
+        if run is None:
+            raise KeyError(f"run not found: {command['run_id']}")
+        request = None
+        if run["active_hitl_request_id"] is not None:
+            request = c.execute(
+                "SELECT * FROM hitl_events "
+                "WHERE id=? AND run_id=? AND resolved_at IS NULL",
+                (run["active_hitl_request_id"], command["run_id"]),
+            ).fetchone()
         if request is not None:
             c.execute(
                 "UPDATE hitl_events SET resolved_at=?, decision='abort', operator=?, "
@@ -2317,7 +2499,8 @@ class SqliteStore:
                  attempt["id"]),
             )
         c.execute(
-            "UPDATE runs SET status='aborted', completed_at=COALESCE(completed_at, ?) "
+            "UPDATE runs SET status='aborted', completed_at=COALESCE(completed_at, ?), "
+            "active_hitl_request_id=NULL "
             "WHERE id=? AND status NOT IN "
             "('completed','failed','aborted','timed_out','budget_exceeded')",
             (now, command["run_id"]),
@@ -2344,6 +2527,7 @@ class SqliteStore:
     def _sync_apply_cancel_command(self, command_id: str) -> dict[str, Any]:
         now = utcnow().isoformat()
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             return self._apply_cancel_in_transaction(c, command_id, now)
 
     async def apply_cancel_command(self, command_id: str) -> dict[str, Any]:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -284,6 +284,51 @@ class RecoveryCoordinator:
                     )
         return decisions
 
+    async def _apply_recovery_hitl_transition(
+        self,
+        run: Run,
+        request_id: str,
+        to_status: RunStatus,
+        lease: LeaseRecord,
+        latest: AttemptRecord | None,
+    ) -> Run | None:
+        from horizonx.storage.sqlite import HITLTransitionError
+
+        try:
+            return cast(
+                Run,
+                await self.store.apply_hitl_decision(
+                    run.id,
+                    expected_request_id=request_id,
+                    to_status=to_status,
+                ),
+            )
+        except HITLTransitionError:
+            persisted = await self.store.load_run(run.id)
+            if persisted.status in TERMINAL_RUN_STATUSES:
+                action = "preserve_terminal"
+                reason = "terminal_won_before_hitl_consumption"
+            else:
+                persisted = await self.store.transition_run(run.id, RunStatus.FAILED)
+                action = "fail_run"
+                reason = "active_hitl_request_changed_before_consumption"
+            await self.store.append_event(
+                Event(
+                    id=f"recovery-{run.id}-{lease.version}",
+                    type="recovery.planned",
+                    run_id=run.id,
+                    attempt_id=latest.id if latest else None,
+                    payload={
+                        "action": action,
+                        "reason": reason,
+                        "status": persisted.status.value,
+                        "lease_owner": lease.owner,
+                        "lease_version": lease.version,
+                    },
+                )
+            )
+            return None
+
     async def _recover_paused_hitl(
         self,
         run: Run,
@@ -292,8 +337,15 @@ class RecoveryCoordinator:
         now: datetime,
     ) -> RecoveryDecision | None:
         """Apply durable operator state left behind when a HITL waiter died."""
-        requests = await self.store.list_hitl_events(run.id)
-        request = requests[-1] if requests else None
+        request_id = run.active_hitl_request_id
+        request = None
+        if request_id is not None:
+            try:
+                candidate = await self.store.find_hitl_event(request_id)
+            except KeyError:
+                candidate = None
+            if candidate is not None and candidate["run_id"] == run.id:
+                request = candidate
         commands = await self.store.list_operator_commands(
             run.id, unconsumed_only=True
         )
@@ -307,7 +359,11 @@ class RecoveryCoordinator:
                     attempt_id=latest.id if latest else None,
                     payload={
                         "action": "fail_run",
-                        "reason": "paused_hitl_missing_request",
+                        "reason": (
+                            "paused_hitl_missing_active_request"
+                            if request_id is None
+                            else "paused_hitl_invalid_active_request"
+                        ),
                         "lease_owner": lease.owner,
                         "lease_version": lease.version,
                     },
@@ -322,7 +378,8 @@ class RecoveryCoordinator:
         ]
         if request["resolved_at"] is None and decision_commands:
             command = decision_commands[0]
-            request, _ = await self.store.resolve_hitl_event(
+            request, _, _ = await self.store.resolve_active_hitl_event_and_event(
+                run.id,
                 request["id"],
                 action=str(command.payload["action"]),
                 actor=command.actor,
@@ -343,7 +400,11 @@ class RecoveryCoordinator:
                     AttemptStatus.ABORTED,
                     error="operator_aborted_during_hitl",
                 )
-            await self.store.transition_run(run.id, RunStatus.ABORTED)
+            applied = await self._apply_recovery_hitl_transition(
+                run, request["id"], RunStatus.ABORTED, lease, latest
+            )
+            if applied is None:
+                return None
             await self.store.append_event(
                 Event(
                     id=f"recovery-{run.id}-{lease.version}",
@@ -380,7 +441,11 @@ class RecoveryCoordinator:
                 status = RunStatus.FAILED
                 action = "fail_run"
                 reason = "unsupported_recovery_ambiguity_resolution"
-            await self.store.transition_run(run.id, status)
+            applied = await self._apply_recovery_hitl_transition(
+                run, request["id"], status, lease, latest
+            )
+            if applied is None:
+                return None
             await self.store.append_event(
                 Event(
                     id=f"recovery-{run.id}-{lease.version}",
@@ -398,10 +463,12 @@ class RecoveryCoordinator:
                 )
             )
             return None
-        run.status = RunStatus.RUNNING
-        run.completed_at = None
-        await self.store.save_run(run)
-        return await self._decision(run, latest, lease, now)
+        resumed = await self._apply_recovery_hitl_transition(
+            run, request["id"], RunStatus.RUNNING, lease, latest
+        )
+        if resumed is None:
+            return None
+        return await self._decision(resumed, latest, lease, now)
 
     async def _decision(
         self,

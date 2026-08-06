@@ -382,6 +382,7 @@ class Run(BaseModel):
     status: RunStatus = RunStatus.PENDING
     started_at: datetime = Field(default_factory=utcnow)
     completed_at: datetime | None = None
+    active_hitl_request_id: str | None = None
     workspace_path: Path
     current_session_id: str | None = None
     goal_graph_root: str = "g.root"

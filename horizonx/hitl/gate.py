@@ -58,6 +58,17 @@ async def await_decision(
         start_time = time.monotonic()
         timeout_secs = (cfg.timeout_minutes or 0) * 60
         while True:
+            persisted_run = await store.load_run(run.id)
+            if persisted_run.active_hitl_request_id != request_id:
+                if persisted_run.status.value == "aborted":
+                    return HITLDecision(
+                        action="abort",
+                        instruction="run was cancelled while awaiting HITL",
+                        operator="system:operator-control",
+                    )
+                raise RuntimeError(
+                    f"HITL request is no longer active: {request_id}"
+                )
             commands = await store.list_operator_commands(
                 run.id, unconsumed_only=True
             )
@@ -108,7 +119,8 @@ async def await_decision(
                 )
                 actor = "system:timeout"
                 instruction = f"auto-{action} after {cfg.timeout_minutes}m timeout"
-                resolved, _ = await store.resolve_hitl_event(
+                resolved, _, _ = await store.resolve_active_hitl_event_and_event(
+                    run.id,
                     request_id,
                     action=action,
                     actor=actor,

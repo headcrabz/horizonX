@@ -233,11 +233,19 @@ async def test_hitl_resolve_writes_file(
     client: AsyncClient, app, seeded_run: Run, tmp_path: Path
 ) -> None:
     store = SqliteStore(tmp_path / "test.db")
-    request_id = await store.save_hitl_event(
-        seeded_run.id, "validator_paused", {}
+    run = seeded_run.model_copy(
+        update={
+            "id": "run-hitl-resolve",
+            "status": RunStatus.RUNNING,
+            "completed_at": None,
+        }
+    )
+    await store.save_run(run)
+    request_id, _ = await store.enter_hitl(
+        run.id, "validator_paused", {}
     )
     r = await client.post(
-        f"/api/runs/{seeded_run.id}/hitl",
+        f"/api/runs/{run.id}/hitl",
         json={
             "action": "approve",
             "instruction": "",
@@ -253,7 +261,7 @@ async def test_hitl_resolve_writes_file(
     assert decision["action"] == "approve"
     assert decision["operator"] == "test"
     duplicate = await client.post(
-        f"/api/runs/{seeded_run.id}/hitl",
+        f"/api/runs/{run.id}/hitl",
         json={
             "action": "approve",
             "instruction": "",
@@ -264,7 +272,7 @@ async def test_hitl_resolve_writes_file(
     )
     assert duplicate.status_code == 200
     assert duplicate.json()["status"] == "duplicate"
-    events = await store.list_events(seeded_run.id, event_type="hitl.resolved")
+    events = await store.list_events(run.id, event_type="hitl.resolved")
     assert len(events) == 1
     assert isinstance(events[0].sequence, int)
     from horizonx.dashboard.routes_events import _event_gen
@@ -272,7 +280,7 @@ async def test_hitl_resolve_writes_file(
     replay = _event_gen(
         app.state.bus,
         store=store,
-        run_id=seeded_run.id,
+        run_id=run.id,
         after_sequence=0,
     )
     requested = await anext(replay)
@@ -307,17 +315,81 @@ async def test_hitl_resolve_requires_pending_request(
 async def test_hitl_resolve_rejects_request_from_another_run(
     client: AsyncClient, app, seeded_run: Run
 ) -> None:
-    other = seeded_run.model_copy(update={"id": "run-other"})
+    other = seeded_run.model_copy(
+        update={"id": "run-other", "status": RunStatus.RUNNING, "completed_at": None}
+    )
     await app.state.store.save_run(other)
-    other_request = await app.state.store.save_hitl_event(
+    other_request, _ = await app.state.store.enter_hitl(
         other.id, "validator_paused", {}
     )
     response = await client.post(
         f"/api/runs/{seeded_run.id}/hitl",
         json={"action": "approve", "request_id": other_request},
     )
-    assert response.status_code == 404
+    assert response.status_code == 409
     assert (await app.state.store.find_hitl_event(other_request))["resolved_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_hitl_resolve_without_id_uses_active_request_not_newer_history(
+    client: AsyncClient, app, seeded_run: Run
+) -> None:
+    run = seeded_run.model_copy(
+        update={"id": "run-active-omitted", "status": RunStatus.RUNNING,
+                "completed_at": None}
+    )
+    await app.state.store.save_run(run)
+    active_id, _ = await app.state.store.enter_hitl(
+        run.id, "validator_paused", {"generation": "active"}
+    )
+    decoy_id = await app.state.store.save_hitl_event(
+        run.id, "validator_paused", {"generation": "history"}
+    )
+    response = await client.post(
+        f"/api/runs/{run.id}/hitl",
+        json={"action": "approve", "operator": "test"},
+    )
+    assert response.status_code == 200
+    assert response.json()["request_id"] == active_id
+    assert (await app.state.store.find_hitl_event(active_id))["decision"] == "approve"
+    assert (await app.state.store.find_hitl_event(decoy_id))["resolved_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_hitl_stale_duplicate_is_rejected_after_new_pause_generation(
+    client: AsyncClient, app, seeded_run: Run
+) -> None:
+    run = seeded_run.model_copy(
+        update={"id": "run-stale-callback", "status": RunStatus.RUNNING,
+                "completed_at": None}
+    )
+    await app.state.store.save_run(run)
+    first_id, _ = await app.state.store.enter_hitl(
+        run.id, "validator_paused", {"generation": 1}
+    )
+    payload = {
+        "action": "approve",
+        "operator": "test",
+        "request_id": first_id,
+        "idempotency_key": "first-generation",
+    }
+    assert (
+        await client.post(f"/api/runs/{run.id}/hitl", json=payload)
+    ).status_code == 200
+    await app.state.store.apply_hitl_decision(
+        run.id,
+        expected_request_id=first_id,
+        to_status=RunStatus.RUNNING,
+    )
+    second_id, _ = await app.state.store.enter_hitl(
+        run.id, "validator_paused", {"generation": 2}
+    )
+
+    stale = await client.post(f"/api/runs/{run.id}/hitl", json=payload)
+    assert stale.status_code == 409
+    current = await app.state.store.load_run(run.id)
+    assert current.active_hitl_request_id == second_id
+    assert (await app.state.store.find_hitl_event(second_id))["resolved_at"] is None
 
 
 # ---------------------------------------------------------------------------

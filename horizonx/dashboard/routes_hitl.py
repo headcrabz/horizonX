@@ -14,7 +14,11 @@ from horizonx.core.event_bus import InMemoryBus
 from horizonx.core.operator_commands import OperatorCommand, OperatorCommandKind
 from horizonx.core.types import HITLDecision
 from horizonx.hitl.slack_interactions import verify_slack_signature
-from horizonx.storage.sqlite import OperatorCommandConflict, SqliteStore
+from horizonx.storage.sqlite import (
+    HITLTransitionError,
+    OperatorCommandConflict,
+    SqliteStore,
+)
 
 from .deps import get_bus, get_store
 
@@ -69,38 +73,39 @@ async def resolve_hitl(
     supplied_idempotency_key = body.idempotency_key or request.headers.get(
         "idempotency-key"
     )
-    events = await store.list_hitl_events(run_id)
-    unresolved = [e for e in events if e.get("resolved_at") is None]
-    if body.request_id is not None:
-        matching = next(
-            (event for event in events if event["id"] == body.request_id), None
-        )
-        if matching is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"HITL request {body.request_id!r} not found for run {run_id!r}",
-            )
-        if matching["resolved_at"] is not None:
-            actor = decision.operator or "dashboard-operator"
-            if (
-                supplied_idempotency_key is not None
-                and matching["resolution_idempotency_key"]
-                == supplied_idempotency_key
-                and matching["decision"] == decision.action
-                and matching["operator"] == actor
-                and (matching["reason"] or "") == body.reason
-                and (matching["instruction"] or "") == decision.instruction
-            ):
-                decision_path = Path(run.workspace_path) / ".hitl_decision.json"
-                return {
-                    "status": "duplicate",
-                    "path": str(decision_path),
-                    "request_id": body.request_id,
-                }
-            raise HTTPException(status_code=409, detail="HITL request is already resolved")
-    request_id = body.request_id or (unresolved[-1]["id"] if unresolved else None)
+    request_id = body.request_id or run.active_hitl_request_id
     if request_id is None:
-        raise HTTPException(status_code=409, detail="run has no pending HITL request")
+        raise HTTPException(status_code=409, detail="run has no active HITL request")
+    if request_id != run.active_hitl_request_id:
+        raise HTTPException(
+            status_code=409,
+            detail="HITL request does not own the run's current pause",
+        )
+    try:
+        matching = await store.find_active_hitl_event(run_id, request_id)
+    except (HITLTransitionError, KeyError):
+        raise HTTPException(
+            status_code=409, detail="active HITL request is missing"
+        ) from None
+    if matching["run_id"] != run_id:
+        raise HTTPException(status_code=409, detail="active HITL request has wrong owner")
+    if matching["resolved_at"] is not None:
+        actor = decision.operator or "dashboard-operator"
+        if (
+            supplied_idempotency_key is not None
+            and matching["resolution_idempotency_key"] == supplied_idempotency_key
+            and matching["decision"] == decision.action
+            and matching["operator"] == actor
+            and (matching["reason"] or "") == body.reason
+            and (matching["instruction"] or "") == decision.instruction
+        ):
+            decision_path = Path(run.workspace_path) / ".hitl_decision.json"
+            return {
+                "status": "duplicate",
+                "path": str(decision_path),
+                "request_id": request_id,
+            }
+        raise HTTPException(status_code=409, detail="HITL request is already resolved")
     idempotency_key = (
         supplied_idempotency_key or f"web:{uuid4().hex}"
     )
@@ -118,14 +123,20 @@ async def resolve_hitl(
         )
     except OperatorCommandConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    resolved, changed, persisted_event = await store.resolve_hitl_event_and_event(
-        request_id,
-        action=decision.action,
-        actor=command.actor,
-        reason=command.reason,
-        instruction=command.instruction,
-        idempotency_key=command.idempotency_key,
-    )
+    try:
+        resolved, changed, persisted_event = (
+            await store.resolve_active_hitl_event_and_event(
+                run_id,
+                request_id,
+                action=decision.action,
+                actor=command.actor,
+                reason=command.reason,
+                instruction=command.instruction,
+                idempotency_key=command.idempotency_key,
+            )
+        )
+    except HITLTransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
 
     # Compatibility projection for older local CLI waiters; SQLite is authoritative.
     decision_path = Path(run.workspace_path) / ".hitl_decision.json"
@@ -222,6 +233,13 @@ async def slack_interaction(
         raise HTTPException(status_code=401, detail=str(exc)) from None
     user = payload.get("user", {})
     actor = str(user.get("id") or user.get("username") or "slack-operator")
+    try:
+        events = await store.find_active_hitl_event(events["run_id"], request_id)
+    except HITLTransitionError:
+        raise HTTPException(
+            status_code=409,
+            detail="HITL request does not own the run's current pause",
+        ) from None
     if payload_type != "view_submission" and decision == "modify":
         if events["resolved_at"] is not None:
             raise HTTPException(status_code=409, detail="HITL request is already resolved")
@@ -265,14 +283,20 @@ async def slack_interaction(
         )
     except OperatorCommandConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    resolved, changed, persisted_event = await store.resolve_hitl_event_and_event(
-        request_id,
-        action=decision,
-        actor=command.actor,
-        reason=command.reason,
-        instruction=command.instruction,
-        idempotency_key=command.idempotency_key,
-    )
+    try:
+        resolved, changed, persisted_event = (
+            await store.resolve_active_hitl_event_and_event(
+                events["run_id"],
+                request_id,
+                action=decision,
+                actor=command.actor,
+                reason=command.reason,
+                instruction=command.instruction,
+                idempotency_key=command.idempotency_key,
+            )
+        )
+    except HITLTransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     if changed:
         await bus.publish(persisted_event)
     return {"status": "resolved" if changed else "duplicate", "request_id": request_id}

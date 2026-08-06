@@ -28,7 +28,11 @@ from horizonx.core.types import (
     Task,
 )
 from horizonx.hitl.slack_interactions import verify_slack_signature
-from horizonx.storage.sqlite import OperatorCommandConflict, SqliteStore
+from horizonx.storage.sqlite import (
+    HITLTransitionError,
+    OperatorCommandConflict,
+    SqliteStore,
+)
 
 
 def _run(tmp_path: Path) -> Run:
@@ -44,6 +48,194 @@ def _run(tmp_path: Path) -> Run:
         workspace_path=tmp_path,
         status=RunStatus.RUNNING,
     )
+
+
+@pytest.mark.asyncio
+async def test_hitl_entry_owns_exact_request_and_rejects_cross_run_id(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    first = _run(tmp_path).model_copy(update={"id": "run-first"})
+    second = _run(tmp_path).model_copy(update={"id": "run-second"})
+    await store.save_run(first)
+    await store.save_run(second)
+    try:
+        request_id, requested = await store.enter_hitl(
+            first.id, "validator_paused", {"generation": 1}, hitl_id="shared-id"
+        )
+        paused = await store.load_run(first.id)
+        assert paused.status == RunStatus.PAUSED_HITL
+        assert paused.active_hitl_request_id == request_id
+        assert requested.id == f"hitl.requested:{request_id}"
+
+        with pytest.raises(HITLTransitionError, match="request"):
+            await store.enter_hitl(
+                second.id,
+                "validator_paused",
+                {"generation": 2},
+                hitl_id="shared-id",
+            )
+        untouched = await store.load_run(second.id)
+        assert untouched.status == RunStatus.RUNNING
+        assert untouched.active_hitl_request_id is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolution_retains_owner_until_fenced_consumption_clears_once(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    request_id, _ = await store.enter_hitl(
+        run.id, "validator_paused", {"generation": 1}
+    )
+    await store.resolve_hitl_event_and_event(
+        request_id,
+        action="approve",
+        actor="alice",
+        reason="safe",
+        instruction="continue",
+        idempotency_key="approve-generation-1",
+    )
+    try:
+        resolved_but_active = await store.load_run(run.id)
+        assert resolved_but_active.status == RunStatus.PAUSED_HITL
+        assert resolved_but_active.active_hitl_request_id == request_id
+
+        resumed = await store.apply_hitl_decision(
+            run.id, expected_request_id=request_id, to_status=RunStatus.RUNNING
+        )
+        assert resumed.status == RunStatus.RUNNING
+        assert resumed.active_hitl_request_id is None
+        with pytest.raises(HITLTransitionError, match="active HITL request"):
+            await store.apply_hitl_decision(
+                run.id, expected_request_id=request_id, to_status=RunStatus.RUNNING
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_winner_fences_late_hitl_consumption(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    request_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
+    await store.resolve_hitl_event_and_event(
+        request_id,
+        action="approve",
+        actor="alice",
+        reason="safe",
+        instruction="",
+        idempotency_key="late-approval",
+    )
+    await store.transition_run(run.id, RunStatus.ABORTED)
+    try:
+        with pytest.raises(HITLTransitionError):
+            await store.apply_hitl_decision(
+                run.id, expected_request_id=request_id,
+                to_status=RunStatus.COMPLETED,
+            )
+        winner = await store.load_run(run.id)
+        assert winner.status == RunStatus.ABORTED
+        assert winner.active_hitl_request_id is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_active_request_lookup_rejects_prior_generation(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    first_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
+    await store.resolve_hitl_event_and_event(
+        first_id,
+        action="approve",
+        actor="alice",
+        reason="safe",
+        instruction="",
+        idempotency_key="lookup-first",
+    )
+    try:
+        assert (await store.find_active_hitl_event(run.id, first_id))["id"] == first_id
+        await store.apply_hitl_decision(
+            run.id,
+            expected_request_id=first_id,
+            to_status=RunStatus.RUNNING,
+        )
+        second_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
+        with pytest.raises(HITLTransitionError):
+            await store.find_active_hitl_event(run.id, first_id)
+        assert (await store.find_active_hitl_event(run.id, second_id))["id"] == second_id
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_resolves_only_active_request_and_clears_owner(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    active_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
+    historical_id = await store.save_hitl_event(
+        run.id, "validator_paused", {"not_active": True}
+    )
+    try:
+        _, created, result = await store.submit_cancel_command(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.CANCEL,
+                actor="alice",
+                reason="stop",
+                idempotency_key="cancel-active-only",
+            )
+        )
+        assert created is True
+        assert result["request_id"] == active_id
+        requests = {
+            request["id"]: request
+            for request in await store.list_hitl_events(run.id)
+        }
+        assert requests[active_id]["decision"] == "abort"
+        assert requests[historical_id]["resolved_at"] is None
+        cancelled = await store.load_run(run.id)
+        assert cancelled.status == RunStatus.ABORTED
+        assert cancelled.active_hitl_request_id is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_does_not_resolve_unowned_request_history(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    historical_id = await store.save_hitl_event(
+        run.id, "validator_paused", {"historical": True}
+    )
+    try:
+        _, _, result = await store.submit_cancel_command(
+            OperatorCommand(
+                run_id=run.id,
+                kind=OperatorCommandKind.CANCEL,
+                actor="alice",
+                reason="stop",
+                idempotency_key="cancel-with-history",
+            )
+        )
+        assert result["request_id"] is None
+        [historical] = await store.list_hitl_events(run.id)
+        assert historical["id"] == historical_id
+        assert historical["resolved_at"] is None
+        assert (await store.load_run(run.id)).active_hitl_request_id is None
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -378,6 +570,9 @@ async def test_runtime_hitl_persists_request_and_resolution(tmp_path: Path) -> N
         decision = await __import__("asyncio").wait_for(decision_task, timeout=1)
         assert decision.operator == "alice"
         assert decision.instruction == "continue carefully"
+        resumed = await store.load_run(run.id)
+        assert resumed.status == RunStatus.RUNNING
+        assert resumed.active_hitl_request_id is None
     finally:
         await store.close()
 
@@ -431,7 +626,7 @@ async def test_slack_callback_authenticates_resolves_and_deduplicates(
     )
     run = _run(tmp_path)
     await app.state.store.save_run(run)
-    request_id = await app.state.store.save_hitl_event(
+    request_id, _ = await app.state.store.enter_hitl(
         run.id, "validator_paused", {}, hitl_id="slack-request"
     )
     payload = {
@@ -489,9 +684,24 @@ async def test_slack_callback_authenticates_resolves_and_deduplicates(
                 content=conflicting_body,
                 headers={**headers, "x-slack-signature": conflicting_signature},
             )
+            await app.state.store.apply_hitl_decision(
+                run.id,
+                expected_request_id=request_id,
+                to_status=RunStatus.RUNNING,
+            )
+            next_request_id, _ = await app.state.store.enter_hitl(
+                run.id, "validator_paused", {"generation": 2}
+            )
+            stale = await client.post(
+                "/api/hitl/slack/interactions", content=body, headers=headers
+            )
         assert first.json()["status"] == "resolved"
         assert duplicate.json()["status"] == "duplicate"
         assert conflict.status_code == 409
+        assert stale.status_code == 409
+        assert (await app.state.store.load_run(run.id)).active_hitl_request_id == (
+            next_request_id
+        )
         resolved = await app.state.store.find_hitl_event(request_id)
         assert resolved["operator"] == "U123"
         commands = await app.state.store.list_operator_commands(run.id)
@@ -575,7 +785,7 @@ async def test_cancel_acceptance_atomically_wins_and_fences_lease(tmp_path: Path
     store = SqliteStore(tmp_path / "state.db")
     run = _run(tmp_path)
     await store.save_run(run)
-    request_id = await store.save_hitl_event(run.id, "validator_paused", {})
+    request_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
     leases = LeaseManager(store)
     lease = await leases.acquire(f"run:{run.id}", owner="worker", ttl_seconds=30)
     assert lease is not None
@@ -870,7 +1080,9 @@ async def test_slack_modify_opens_modal_then_submission_resolves(
     app.state.runtime = Runtime(app.state.store, app.state.bus, tmp_path / "workspaces")
     run = _run(tmp_path)
     await app.state.store.save_run(run)
-    request_id = await app.state.store.save_hitl_event(run.id, "validator_paused", {})
+    request_id, _ = await app.state.store.enter_hitl(
+        run.id, "validator_paused", {}
+    )
     opened: list[tuple[str, str]] = []
 
     async def fake_open(trigger_id: str, modal_request_id: str) -> None:

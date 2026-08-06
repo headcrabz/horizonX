@@ -764,6 +764,7 @@ class Runtime:
                 operator="system:operator-control",
             )
         run.status = RunStatus.PAUSED_HITL
+        run.active_hitl_request_id = request_id
         if isinstance(self.bus, DurableEventBus):
             await self.bus.downstream.publish(requested_event)
         else:
@@ -790,16 +791,27 @@ class Runtime:
                 await self.bus.downstream.publish(persisted_event)
             else:
                 await self.bus.publish(persisted_event)
-        if decision.action == "abort":
-            run.status = RunStatus.ABORTED
-            persisted = await self.store.transition_run(run.id, RunStatus.ABORTED)
-            run.completed_at = persisted.completed_at
-        else:
-            run.status = RunStatus.RUNNING
-            await self.store.save_run(run)
+        target = (
+            RunStatus.ABORTED if decision.action == "abort" else RunStatus.RUNNING
+        )
+        try:
+            persisted = await self.store.apply_hitl_decision(
+                run.id,
+                expected_request_id=request_id,
+                to_status=target,
+            )
+        except HITLTransitionError:
             persisted = await self.store.load_run(run.id)
-            run.status = persisted.status
-            run.completed_at = persisted.completed_at
+            if persisted.status not in TERMINAL_RUN_STATUSES:
+                persisted = await self.store.transition_run(run.id, RunStatus.FAILED)
+                decision = HITLDecision(
+                    action="abort",
+                    instruction="active HITL generation changed before consumption",
+                    operator="system:operator-control",
+                )
+        run.status = persisted.status
+        run.completed_at = persisted.completed_at
+        run.active_hitl_request_id = persisted.active_hitl_request_id
         return decision
 
     # ---------------------------------------------------------------

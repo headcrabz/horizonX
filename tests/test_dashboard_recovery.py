@@ -149,7 +149,7 @@ async def test_restarted_reconciler_resumes_resolved_hitl_and_releases_lease(
             agent=AgentConfig(type="mock", model="mock"),
         ),
         workspace_path=tmp_path / "workspace",
-        status=RunStatus.PAUSED_HITL,
+        status=RunStatus.RUNNING,
     )
     await store.save_run(run)
     session = Session(id="sess-hitl", run_id=run.id, sequence_index=0)
@@ -164,7 +164,7 @@ async def test_restarted_reconciler_resumes_resolved_hitl_and_releases_lease(
             workspace_path=run.workspace_path,
         )
     )
-    request_id = await store.save_hitl_event(run.id, "validator_paused", {})
+    request_id, _ = await store.enter_hitl(run.id, "validator_paused", {})
     await store.resolve_hitl_event(
         request_id,
         action="approve",
@@ -210,7 +210,7 @@ async def test_restarted_reconciler_consumes_cancel_while_hitl_paused(
             agent=AgentConfig(type="mock", model="mock"),
         ),
         workspace_path=tmp_path / "workspace",
-        status=RunStatus.PAUSED_HITL,
+            status=RunStatus.RUNNING,
     )
     await store.save_run(run)
     session = Session(id="sess-hitl-cancel", run_id=run.id, sequence_index=0)
@@ -276,7 +276,7 @@ async def test_http_cancel_is_consumed_by_replacement_after_owner_expires(
             agent=AgentConfig(type="mock", model="mock"),
         ),
         workspace_path=tmp_path / "workspace",
-        status=RunStatus.PAUSED_HITL,
+        status=RunStatus.RUNNING,
     )
     await app.state.store.save_run(run)
     session = Session(id="sess-http-cancel", run_id=run.id, sequence_index=0)
@@ -291,7 +291,7 @@ async def test_http_cancel_is_consumed_by_replacement_after_owner_expires(
             workspace_path=run.workspace_path,
         )
     )
-    await app.state.store.save_hitl_event(run.id, "validator_paused", {})
+    await app.state.store.enter_hitl(run.id, "validator_paused", {})
     dead_lease = await LeaseManager(app.state.store).acquire(
         f"run:{run.id}", owner="dead-owner", ttl_seconds=0.05
     )

@@ -462,7 +462,7 @@ async def test_hitl_pause_is_not_relaunched(tmp_path: Path) -> None:
         events = await store.list_events(run.id, event_type="recovery.planned")
         assert events[-1].payload == {
             "action": "fail_run",
-            "reason": "paused_hitl_missing_request",
+            "reason": "paused_hitl_missing_active_request",
             "lease_owner": "recovery-worker",
             "lease_version": 1,
         }
@@ -648,15 +648,115 @@ async def test_authenticated_recovery_resolution_never_replays_completed_attempt
                 },
             )
         assert response.status_code == 200
+        resolved_but_unconsumed = await store.load_run(run.id)
+        assert resolved_but_unconsumed.status == RunStatus.PAUSED_HITL
+        assert resolved_but_unconsumed.active_hitl_request_id == request["id"]
 
         assert await coordinator.plan(owner="recovery-worker") == []
-        assert (await store.load_run(run.id)).status == expected_status
+        recovered = await store.load_run(run.id)
+        assert recovered.status == expected_status
+        assert recovered.active_hitl_request_id is None
         assert (await store.latest_attempt(run.id)).id == completed.id
         assert len(await store.list_attempts(run.id)) == 1
         events = await store.list_events(run.id, event_type="recovery.planned")
         assert events[-1].payload["action"] == (
             "complete_run" if action == "approve" else "abort_run"
         )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_replay_resolved_history_without_active_owner(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    old_request = await store.save_hitl_event(
+        run.id, "validator_paused", {"generation": "old"}
+    )
+    await store.resolve_hitl_event_and_event(
+        old_request,
+        action="approve",
+        actor="old-operator",
+        reason="old approval",
+        instruction="",
+        idempotency_key="old-approval",
+    )
+    run.status = RunStatus.PAUSED_HITL
+    await store.save_run(run)
+    await _attempt(store, run, status=AttemptStatus.PAUSED_HITL)
+    try:
+        assert await RecoveryCoordinator(store).plan(owner="recovery-worker") == []
+        failed = await store.load_run(run.id)
+        assert failed.status == RunStatus.FAILED
+        assert failed.active_hitl_request_id is None
+        events = await store.list_events(run.id, event_type="recovery.planned")
+        assert events[-1].payload["reason"] == "paused_hitl_missing_active_request"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_uses_new_active_request_not_older_resolution(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    old_request = await store.save_hitl_event(
+        run.id, "validator_paused", {"generation": "old"}
+    )
+    await store.resolve_hitl_event_and_event(
+        old_request,
+        action="approve",
+        actor="old-operator",
+        reason="old approval",
+        instruction="",
+        idempotency_key="old-active-approval",
+    )
+    active_request, _ = await store.enter_hitl(
+        run.id, "validator_paused", {"generation": "current"}
+    )
+    await store.resolve_hitl_event_and_event(
+        active_request,
+        action="abort",
+        actor="current-operator",
+        reason="stop current generation",
+        instruction="",
+        idempotency_key="current-abort",
+    )
+    try:
+        assert await RecoveryCoordinator(store).plan(owner="recovery-worker") == []
+        recovered = await store.load_run(run.id)
+        assert recovered.status == RunStatus.ABORTED
+        assert recovered.active_hitl_request_id is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_fails_closed_for_cross_run_active_request(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    owner = _run(tmp_path).model_copy(update={"id": "run-owner"})
+    victim = _run(tmp_path).model_copy(update={"id": "run-victim"})
+    await store.save_run(owner)
+    await store.save_run(victim)
+    foreign_request = await store.save_hitl_event(owner.id, "validator_paused", {})
+    await store.transition_run(owner.id, RunStatus.ABORTED)
+    with store._conn() as connection:
+        connection.execute(
+            "UPDATE runs SET status='paused_hitl', active_hitl_request_id=? WHERE id=?",
+            (foreign_request, victim.id),
+        )
+    try:
+        assert await RecoveryCoordinator(store).plan(owner="recovery-worker") == []
+        failed = await store.load_run(victim.id)
+        assert failed.status == RunStatus.FAILED
+        assert failed.active_hitl_request_id is None
+        events = await store.list_events(victim.id, event_type="recovery.planned")
+        assert events[-1].payload["reason"] == "paused_hitl_invalid_active_request"
     finally:
         await store.close()
 
@@ -776,6 +876,45 @@ async def test_terminal_transition_winning_hitl_entry_race_is_preserved(
         assert (await store.load_run(run.id)).status == RunStatus.ABORTED
         assert await store.list_hitl_events(run.id) == []
         assert await store.get_lease(f"run:{run.id}") is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_winner_during_recovery_hitl_consumption_is_preserved(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "horizonx.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    completed = await _attempt(store, run, status=AttemptStatus.COMPLETED)
+    await RecoveryCoordinator(store).plan(owner="recovery-worker")
+    [request] = await store.list_hitl_events(run.id)
+    await store.resolve_hitl_event_and_event(
+        request["id"],
+        action="approve",
+        actor="operator",
+        reason="accept",
+        instruction="",
+        idempotency_key="racing-approval",
+    )
+    apply_hitl = store.apply_hitl_decision
+
+    async def abort_before_consumption(*args: object, **kwargs: object) -> object:
+        await store.transition_run(run.id, RunStatus.ABORTED)
+        return await apply_hitl(*args, **kwargs)
+
+    store.apply_hitl_decision = abort_before_consumption  # type: ignore[method-assign]
+    try:
+        assert await RecoveryCoordinator(store).plan(owner="replacement") == []
+        winner = await store.load_run(run.id)
+        assert winner.status == RunStatus.ABORTED
+        assert winner.active_hitl_request_id is None
+        assert (await store.latest_attempt(run.id)).id == completed.id
+        events = await store.list_events(run.id, event_type="recovery.planned")
+        assert events[-1].payload["reason"] == (
+            "terminal_won_before_hitl_consumption"
+        )
     finally:
         await store.close()
 

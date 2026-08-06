@@ -91,7 +91,7 @@ async def test_v01_goal_schema_migrates_without_losing_stored_fields(tmp_path: P
 
     store = SqliteStore(path)
     try:
-        assert await store.schema_version() == 6
+        assert await store.schema_version() == 7
 
         root = await store.load_goal("legacy-run", "g.root")
         child = await store.load_goal("legacy-run", "g.child")
@@ -211,7 +211,7 @@ async def test_v5_global_command_idempotency_migrates_to_run_scope(
             }
         assert ("run_id", "idempotency_key") in unique_columns
         assert ("idempotency_key",) not in unique_columns
-        assert await migrated.schema_version() == 6
+        assert await migrated.schema_version() == 7
     finally:
         await migrated.close()
 
@@ -309,7 +309,7 @@ async def test_startup_repairs_requested_events_for_every_legacy_run_status(
 
     repaired = SqliteStore(path)
     try:
-        assert await repaired.schema_version() == 6
+        assert await repaired.schema_version() == 7
         first = await repaired.list_all_events(limit=100)
         requested = [event for event in first if event.type == "hitl.requested"]
         assert {event.id for event in requested} == {
@@ -321,13 +321,94 @@ async def test_startup_repairs_requested_events_for_every_legacy_run_status(
 
     reopened = SqliteStore(path)
     try:
-        assert await reopened.schema_version() == 6
+        assert await reopened.schema_version() == 7
         second = [
             event for event in await reopened.list_all_events(limit=100)
             if event.type == "hitl.requested"
         ]
         assert len(second) == 3
         assert {event.id: event.sequence for event in second} == first_sequences
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_active_hitl_request_column_round_trips_on_runs(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "active-hitl.db")
+    run = Run(
+        id="run-active-column",
+        task=Task(
+            id="task-active-column", name="active", prompt="wait",
+            strategy=StrategyConfig(kind="single"),
+            agent=AgentConfig(type="mock", model="mock"),
+        ),
+        workspace_path=tmp_path / "active",
+        status=RunStatus.RUNNING,
+    )
+    try:
+        await store.save_run(run)
+        loaded = await store.load_run(run.id)
+        assert loaded.active_hitl_request_id is None
+        with sqlite3.connect(store.db_path) as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(runs)")
+            }
+        assert "active_hitl_request_id" in columns
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_links_only_unambiguous_unresolved_paused_hitl(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-active-hitl.db"
+    legacy = SqliteStore(path)
+    request_ids: dict[str, list[str]] = {}
+    for suffix in ("single", "resolved", "ambiguous"):
+        run = Run(
+            id=f"run-{suffix}",
+            task=Task(
+                id=f"task-{suffix}", name=suffix, prompt="wait",
+                strategy=StrategyConfig(kind="single"),
+                agent=AgentConfig(type="mock", model="mock"),
+            ),
+            workspace_path=tmp_path / suffix,
+            status=RunStatus.PAUSED_HITL,
+        )
+        await legacy.save_run(run)
+        request_ids[suffix] = [
+            await legacy.save_hitl_event(run.id, "validator_paused", {"n": 1})
+        ]
+    await legacy.update_hitl_event(
+        request_ids["resolved"][0], "approve", "legacy", "old decision"
+    )
+    request_ids["ambiguous"].append(
+        await legacy.save_hitl_event(
+            "run-ambiguous", "validator_paused", {"n": 2}
+        )
+    )
+    await legacy.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version=7")
+
+    migrated = SqliteStore(path)
+    try:
+        assert (await migrated.load_run("run-single")).active_hitl_request_id == (
+            request_ids["single"][0]
+        )
+        assert (await migrated.load_run("run-resolved")).active_hitl_request_id is None
+        assert (await migrated.load_run("run-ambiguous")).active_hitl_request_id is None
+    finally:
+        await migrated.close()
+
+    reopened = SqliteStore(path)
+    try:
+        assert (await reopened.load_run("run-single")).active_hitl_request_id == (
+            request_ids["single"][0]
+        )
+        assert (await reopened.load_run("run-resolved")).active_hitl_request_id is None
+        assert (await reopened.load_run("run-ambiguous")).active_hitl_request_id is None
     finally:
         await reopened.close()
 
