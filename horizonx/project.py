@@ -19,6 +19,7 @@ class ProjectConfig(BaseModel):
     version: Literal[1] = 1
     db_path: Path = Path("horizonx.db")
     workspace_root: Path = Path("horizonx-workspaces")
+    generated_state_paths: bool = False
 
     @field_validator("db_path", mode="before")
     @classmethod
