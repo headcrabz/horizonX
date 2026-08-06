@@ -725,19 +725,16 @@ class Runtime:
             )
         run.status = RunStatus.PAUSED_HITL
         await self.store.save_run(run)
-        request_id = await self.store.save_hitl_event(
+        request_id, requested_event = await self.store.save_hitl_event_and_event(
             run.id,
             reason,
             context,
             actor="system",
         )
-        await self.bus.publish(
-            Event(
-                type="hitl.requested",
-                run_id=run.id,
-                payload={"request_id": request_id, "reason": reason, "context": context},
-            )
-        )
+        if isinstance(self.bus, DurableEventBus):
+            await self.bus.downstream.publish(requested_event)
+        else:
+            await self.bus.publish(requested_event)
         from horizonx.hitl.gate import await_decision
 
         decision = await await_decision(

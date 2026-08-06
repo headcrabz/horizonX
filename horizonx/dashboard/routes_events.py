@@ -13,6 +13,7 @@ from horizonx.storage.sqlite import SqliteStore
 from .deps import get_bus, get_store
 
 router = APIRouter()
+_PAGE_SIZE = 1000
 
 
 def _parse_cursor(request: Request) -> int | None:
@@ -42,57 +43,64 @@ async def _event_gen(
     )
     live_task: asyncio.Future[Event] = asyncio.ensure_future(anext(subscription))
     await asyncio.sleep(0)
-    try:
-        if store is not None:
-            while True:
-                replay = (
-                    await store.list_events(
-                        run_id, after_sequence=cursor, limit=1000
-                    )
-                    if run_id is not None
-                    else await store.list_all_events(
-                        after_sequence=cursor, limit=1000
-                    )
+
+    async def drain_durable(
+        *, through_sequence: int | None = None
+    ) -> AsyncGenerator[Event, None]:
+        nonlocal cursor
+        if store is None:
+            return
+        while through_sequence is None or cursor < through_sequence:
+            page = (
+                await store.list_events(
+                    run_id, after_sequence=cursor, limit=_PAGE_SIZE
                 )
-                for event in replay:
-                    cursor = max(cursor, event.sequence or 0)
-                    yield {
-                        "id": str(event.sequence),
-                        "event": event.type,
-                        "data": event.model_dump_json(),
-                    }
-                if len(replay) < 1000:
-                    break
+                if run_id is not None
+                else await store.list_all_events(
+                    after_sequence=cursor, limit=_PAGE_SIZE
+                )
+            )
+            if not page:
+                return
+            for persisted in page:
+                sequence = persisted.sequence or 0
+                if sequence <= cursor:
+                    continue
+                cursor = sequence
+                yield persisted
+                if through_sequence is not None and cursor >= through_sequence:
+                    return
+            if len(page) < _PAGE_SIZE:
+                return
+
+    def as_sse(event: Event) -> dict[str, str]:
+        return {
+            "id": str(event.sequence) if event.sequence is not None else event.id,
+            "event": event.type,
+            "data": event.model_dump_json(),
+        }
+
+    try:
+        async for persisted in drain_durable():
+            yield as_sse(persisted)
         while True:
             try:
                 event = await asyncio.wait_for(asyncio.shield(live_task), timeout=0.1)
                 live_task = asyncio.ensure_future(anext(subscription))
             except TimeoutError:
-                if store is None:
-                    continue
-                replay = (
-                    await store.list_events(run_id, after_sequence=cursor, limit=1000)
-                    if run_id is not None
-                    else await store.list_all_events(after_sequence=cursor, limit=1000)
-                )
-                for persisted in replay:
-                    cursor = max(cursor, persisted.sequence or 0)
-                    yield {
-                        "id": str(persisted.sequence),
-                        "event": persisted.type,
-                        "data": persisted.model_dump_json(),
-                    }
+                async for persisted in drain_durable():
+                    yield as_sse(persisted)
                 continue
             if event.sequence is None and store is not None:
                 event = await store.append_event(event)
-            if event.sequence is not None and event.sequence <= cursor:
-                continue
-            cursor = event.sequence or cursor
-            yield {
-                "id": str(event.sequence) if event.sequence is not None else event.id,
-                "event": event.type,
-                "data": event.model_dump_json(),
-            }
+            if store is not None and event.sequence is not None:
+                async for persisted in drain_durable(
+                    through_sequence=event.sequence
+                ):
+                    yield as_sse(persisted)
+            elif event.sequence is None or event.sequence > cursor:
+                cursor = event.sequence or cursor
+                yield as_sse(event)
     finally:
         live_task.cancel()
         await asyncio.gather(live_task, return_exceptions=True)

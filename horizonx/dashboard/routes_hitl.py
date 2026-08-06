@@ -151,7 +151,7 @@ def _slack_instruction(payload: dict[str, Any]) -> str:
 async def _open_slack_modify_modal(trigger_id: str, request_id: str) -> None:
     import httpx
 
-    token = os.environ.get("HORIZONX_SLACK_BOT_TOKEN")
+    token = _slack_modal_token()
     if not token:
         raise HTTPException(status_code=503, detail="Slack bot token is not configured")
     view = {
@@ -176,6 +176,13 @@ async def _open_slack_modify_modal(trigger_id: str, request_id: str) -> None:
     data = response.json()
     if not response.is_success or not data.get("ok"):
         raise HTTPException(status_code=502, detail="Slack rejected the modify modal")
+
+
+def _slack_modal_token() -> str | None:
+    """Prefer the modal-specific override, retaining the deployed Slack token."""
+    return os.environ.get("HORIZONX_SLACK_BOT_TOKEN") or os.environ.get(
+        "HORIZONX_SLACK_TOKEN"
+    )
 
 
 @router.post("/hitl/slack/interactions")

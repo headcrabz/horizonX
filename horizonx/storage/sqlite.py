@@ -1845,10 +1845,13 @@ class SqliteStore:
         hitl_id: str | None,
         actor: str,
         instruction: str,
-    ) -> str:
+    ) -> tuple[str, Any]:
         from uuid import uuid4
 
+        from horizonx.core.event_bus import Event
+
         event_id = hitl_id or str(uuid4())
+        triggered_at = utcnow().isoformat()
         with self._conn() as c:
             c.execute(
                 "INSERT OR IGNORE INTO hitl_events "
@@ -1857,7 +1860,7 @@ class SqliteStore:
                 (
                     event_id,
                     run_id,
-                    utcnow().isoformat(),
+                    triggered_at,
                     trigger,
                     json.dumps(context, default=str),
                     actor,
@@ -1865,7 +1868,43 @@ class SqliteStore:
                     instruction,
                 ),
             )
-        return event_id
+            request = c.execute(
+                "SELECT * FROM hitl_events WHERE id=?", (event_id,)
+            ).fetchone()
+            if request is None:  # pragma: no cover
+                raise StoreError(f"HITL request disappeared after insert: {event_id}")
+            requested_id = f"hitl.requested:{event_id}"
+            c.execute(
+                "INSERT OR IGNORE INTO events "
+                "(id, type, run_id, timestamp, payload) VALUES (?,?,?,?,?)",
+                (
+                    requested_id,
+                    "hitl.requested",
+                    request["run_id"],
+                    request["triggered_at"],
+                    json.dumps(
+                        {
+                            "request_id": event_id,
+                            "reason": request["trigger"],
+                            "context": json.loads(request["context"] or "{}"),
+                            "actor": request["request_actor"],
+                            "instruction": request["request_instruction"] or "",
+                        },
+                        default=str,
+                    ),
+                ),
+            )
+            event_row = c.execute(
+                "SELECT * FROM events WHERE id=?", (requested_id,)
+            ).fetchone()
+        assert event_row is not None
+        return event_id, Event(
+            id=event_row["id"], sequence=event_row["sequence"],
+            type=event_row["type"], run_id=event_row["run_id"],
+            attempt_id=event_row["attempt_id"], session_id=event_row["session_id"],
+            goal_id=event_row["goal_id"], timestamp=event_row["timestamp"],
+            payload=json.loads(event_row["payload"] or "{}"),
+        )
 
     async def save_hitl_event(
         self,
@@ -1876,7 +1915,7 @@ class SqliteStore:
         actor: str = "system",
         instruction: str = "",
     ) -> str:
-        return await self._run_sync(
+        event_id, _ = await self._run_sync(
             self._sync_save_hitl_event,
             run_id,
             trigger,
@@ -1885,6 +1924,35 @@ class SqliteStore:
             actor,
             instruction,
         )
+        return event_id
+
+    async def save_hitl_event_and_event(
+        self, run_id: str, trigger: str, context: dict[str, Any],
+        hitl_id: str | None = None, actor: str = "system", instruction: str = "",
+    ) -> tuple[str, Any]:
+        """Persist a HITL request and its stable ledger event atomically."""
+        return await self._run_sync(
+            self._sync_save_hitl_event, run_id, trigger, context, hitl_id,
+            actor, instruction,
+        )
+
+    def _sync_ensure_hitl_requested_event(self, request_id: str) -> Any:
+        with self._conn() as c:
+            request = c.execute(
+                "SELECT * FROM hitl_events WHERE id=?", (request_id,)
+            ).fetchone()
+            if request is None:
+                raise KeyError(f"HITL request not found: {request_id}")
+        _, event = self._sync_save_hitl_event(
+            request["run_id"], request["trigger"],
+            json.loads(request["context"] or "{}"), request_id,
+            request["request_actor"], request["request_instruction"] or "",
+        )
+        return event
+
+    async def ensure_hitl_requested_event(self, request_id: str) -> Any:
+        """Idempotently backfill the stable request event for legacy rows."""
+        return await self._run_sync(self._sync_ensure_hitl_requested_event, request_id)
 
     def _sync_update_hitl_event(
         self,

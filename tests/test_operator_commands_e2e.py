@@ -626,6 +626,63 @@ async def test_connected_sse_observes_store_only_append(tmp_path: Path) -> None:
         await store.close()
 
 
+@pytest.mark.asyncio
+async def test_sse_drains_store_burst_before_later_live_event(tmp_path: Path) -> None:
+    import asyncio
+
+    from horizonx.core.event_bus import Event, InMemoryBus
+    from horizonx.dashboard.routes_events import _event_gen
+
+    store = SqliteStore(tmp_path / "state.db")
+    bus = InMemoryBus()
+    run = _run(tmp_path)
+    await store.save_run(run)
+    stream = _event_gen(bus, store=store, run_id=run.id)
+    first_pending = asyncio.create_task(anext(stream))
+    try:
+        await asyncio.sleep(0.02)
+        persisted = [
+            await store.append_event(Event(type="step.recorded", run_id=run.id))
+            for _ in range(1005)
+        ]
+        live = await store.append_event(Event(type="run.completed", run_id=run.id))
+        await bus.publish(live)
+        received = [await asyncio.wait_for(first_pending, timeout=2)]
+        for _ in range(1005):
+            received.append(await asyncio.wait_for(anext(stream), timeout=2))
+        assert [int(item["id"]) for item in received] == [
+            event.sequence for event in [*persisted, live]
+        ]
+        await asyncio.wait_for(stream.aclose(), timeout=1)
+    finally:
+        await stream.aclose()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_hitl_request_and_requested_event_survive_before_publish_crash(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    run = _run(tmp_path)
+    await store.save_run(run)
+    request_id, requested = await store.save_hitl_event_and_event(
+        run.id, "validator_paused", {"risk": "high"}, actor="system"
+    )
+    assert requested.id == f"hitl.requested:{request_id}"
+    assert isinstance(requested.sequence, int)
+    await store.close()
+
+    restarted = SqliteStore(tmp_path / "state.db")
+    try:
+        assert (await restarted.find_hitl_event(request_id))["trigger"] == "validator_paused"
+        events = await restarted.list_events(run.id, event_type="hitl.requested")
+        assert [event.id for event in events] == [requested.id]
+        assert events[0].sequence == requested.sequence
+    finally:
+        await restarted.close()
+
+
 def test_runtime_directly_signals_and_cleans_active_cancel_tokens(tmp_path: Path) -> None:
     from horizonx.agents.base import CancelToken
 
@@ -741,6 +798,49 @@ async def test_slack_modify_opens_modal_then_submission_resolves(
         assert resolved["instruction"] == "Use the safe path"
     finally:
         await app.state.store.close()
+
+
+@pytest.mark.asyncio
+async def test_slack_modal_token_falls_back_to_existing_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    from horizonx.dashboard.routes_hitl import (
+        _open_slack_modify_modal,
+        _slack_modal_token,
+    )
+
+    captured_headers: dict[str, str] = {}
+
+    class FakeResponse:
+        is_success = True
+
+        @staticmethod
+        def json() -> dict[str, bool]:
+            return {"ok": True}
+
+    class FakeClient:
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __aexit__(self, *args):  # type: ignore[no-untyped-def]
+            return None
+
+        async def post(self, _url, *, headers, json):  # type: ignore[no-untyped-def]
+            captured_headers.update(headers)
+            assert json["trigger_id"] == "trigger-existing-token"
+            return FakeResponse()
+
+    monkeypatch.delenv("HORIZONX_SLACK_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("HORIZONX_SLACK_TOKEN", "xoxb-existing")
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    assert _slack_modal_token() == "xoxb-existing"
+    await _open_slack_modify_modal("trigger-existing-token", "request-1")
+    assert captured_headers == {"authorization": "Bearer xoxb-existing"}
+
+    monkeypatch.setenv("HORIZONX_SLACK_BOT_TOKEN", "xoxb-override")
+    assert _slack_modal_token() == "xoxb-override"
 
 
 @pytest.mark.asyncio
