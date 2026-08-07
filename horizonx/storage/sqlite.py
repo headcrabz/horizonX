@@ -41,6 +41,7 @@ from horizonx.core.types import (
     utcnow,
 )
 from horizonx.storage.migrations import (
+    CURRENT_SCHEMA_VERSION,
     ensure_additive_schema,
     prepare_schema,
     read_schema_version,
@@ -513,7 +514,7 @@ class SqliteStore:
             c.executescript(SCHEMA)
             ensure_additive_schema(c)
             repair_hitl_requested_events(c)
-            if previous_version < 7:
+            if previous_version < CURRENT_SCHEMA_VERSION:
                 repair_active_hitl_requests(c)
             record_current_schema(c)
 

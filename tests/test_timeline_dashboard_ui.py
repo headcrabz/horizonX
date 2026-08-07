@@ -96,3 +96,13 @@ def test_live_graph_reload_and_playback_exit_are_explicit() -> None:
     assert "window.returnToCurrentGraph = () =>" in script
     assert "state.timelineSelectedSequence = null" in script
     assert "loadGoals(state.currentRunId)" in script
+
+
+def test_live_stream_does_not_render_raw_event_payloads() -> None:
+    """Only selected-event detail may render a durable event payload."""
+    script = (STATIC_DIR / "app.js").read_text()
+    append_start = script.index("function appendEvent")
+    append_end = script.index("// ─────────────────────────────────────────────────────────────────────────────\n// Center tab", append_start)
+
+    assert "liveEventMetadata" in script[append_start:append_end]
+    assert "JSON.stringify(event.payload)" not in script[append_start:append_end]

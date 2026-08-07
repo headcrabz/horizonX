@@ -454,6 +454,14 @@ function recordLiveTimelineEvent(event) {
   renderTimelineEvents();
 }
 
+function liveEventMetadata(event) {
+  const entities = summarizeLiveTimelineEvent(event).entities;
+  return Object.entries(entities)
+    .filter(([key, value]) => key !== 'run_id' && value)
+    .map(([key, value]) => `${key.replace(/_id$/, '').replace('_', ' ')}:${String(value).slice(0, 80)}`)
+    .join(' · ');
+}
+
 function timelineEventState(type) {
   if (type.startsWith('recovery.')) return ' recovery';
   if (type.startsWith('fork.')) return ' fork';
@@ -593,7 +601,7 @@ async function selectTimelineEvent(sequence) {
   if (!runId || !Number.isInteger(sequence)) return;
   state.timelineSelectedSequence = sequence;
   renderTimelineEvents();
-  setCenterTab('goals');
+  window.setCenterTab('goals');
   renderTimelineDetail(null);
   const detailBody = $('timeline-detail-body');
   if (detailBody) detailBody.innerHTML = '<div class="empty-state timeline-empty"><div class="spinner"></div><p>Loading durable event detail…</p></div>';
@@ -785,11 +793,10 @@ function appendEvent(event) {
   if (!container) return;
   const el = document.createElement('div');
   el.className = `event-row ${evCls(event.type)}`;
-  const pay = event.payload && Object.keys(event.payload).length
-    ? ' · ' + JSON.stringify(event.payload).slice(0,100) : '';
+  const metadata = liveEventMetadata(event);
   el.innerHTML = `<span class="event-time">${new Date(event.timestamp).toLocaleTimeString()}</span>
     <span class="event-type">${esc(event.type)}</span>
-    <span class="event-payload">${esc(pay)}</span>`;
+    <span class="event-payload">${metadata ? ` · ${esc(metadata)}` : ''}</span>`;
   const pinned = $('pin-scroll')?.checked;
   pinned ? container.prepend(el) : (container.appendChild(el), container.scrollTop=container.scrollHeight);
 

@@ -12,11 +12,12 @@ function element() {
     textContent: '',
     checked: true,
     scrollTop: 0,
+    children: [],
     setAttribute() {},
     querySelectorAll() { return []; },
     addEventListener() {},
-    appendChild() {},
-    prepend() {},
+    appendChild(child) { this.children.push(child); },
+    prepend(child) { this.children.unshift(child); },
     classList: { toggle() {}, remove() {} },
   };
 }
@@ -85,6 +86,29 @@ const context = {
     if (parsed.pathname === '/api/runs/timeline-run/timeline' && initialTimelineFetchFails) {
       return { ok: false, status: 503, statusText: 'Unavailable', json: async () => ({}) };
     }
+    if (parsed.pathname === '/api/runs/timeline-run/timeline/1001') {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({
+          sequence: 1001,
+          id: 'event-1001',
+          type: 'recovery.planned',
+          timestamp: '2026-08-06T12:00:00Z',
+          entities: { run_id: 'timeline-run' },
+          payload: { secret: 'selected-detail-secret', tool_text: 'selected detail only' },
+        }),
+      };
+    }
+    if (parsed.pathname === '/api/runs/timeline-run/timeline/playback') {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({ run_id: 'timeline-run', sequence: 1001, graph: null }),
+      };
+    }
     if (parsed.pathname !== '/api/runs/timeline-run/timeline') {
       return { ok: true, status: 200, statusText: 'OK', json: async () => [] };
     }
@@ -107,7 +131,7 @@ const appSource = fs.readFileSync(
   path.join(__dirname, '..', 'horizonx', 'dashboard', 'static', 'app.js'), 'utf8',
 );
 vm.runInNewContext(
-  `${appSource}\nglobalThis.__timelineTest = { state, loadTimelinePage, loadRunDetailData, appendEvent, connectEventSource, renderTimelineStatus };`,
+  `${appSource}\nglobalThis.__timelineTest = { state, loadTimelinePage, loadRunDetailData, appendEvent, connectEventSource, selectTimelineEvent, renderTimelineStatus };`,
   context,
 );
 
@@ -126,7 +150,11 @@ async function main() {
     type: 'recovery.planned',
     timestamp: '2026-08-06T12:00:00Z',
     run_id: 'timeline-run',
-    payload: { hidden: 'must not enter the timeline list' },
+    payload: {
+      hidden: 'must not enter the timeline list',
+      secret: 'live-stream-secret',
+      tool_text: 'live tool output must remain private',
+    },
   });
 
   assert.strictEqual(app.state.timelineEvents.at(-1).sequence, 1001);
@@ -135,8 +163,14 @@ async function main() {
   assert.strictEqual(app.state.timelineEvents.length, 101);
   assert.ok(!app.state.timelineEvents.some(event => event.sequence > 100 && event.sequence < 1001));
   assert.ok(app.state.timelineEvents.every(event => !Object.hasOwn(event, 'payload')));
+  const liveRow = getElement('panel-stream').children[0].innerHTML;
+  assert.ok(!liveRow.includes('live-stream-secret'));
+  assert.ok(!liveRow.includes('live tool output must remain private'));
+  await app.selectTimelineEvent(1001);
+  assert.ok(getElement('timeline-detail-body').innerHTML.includes('selected-detail-secret'));
 
   app.state.centerTab = 'goals';
+  app.state.timelineSelectedSequence = null;
   app.appendEvent({
     sequence: 1002,
     id: 'event-1002',

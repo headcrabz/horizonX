@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from horizonx.core.types import AgentConfig, GoalNode, Run, RunStatus, StrategyConfig, Task
-from horizonx.storage.migrations import SchemaMigrationError
+from horizonx.storage.migrations import CURRENT_SCHEMA_VERSION, SchemaMigrationError
 from horizonx.storage.sqlite import SqliteStore, StoreBusyError
 
 LEGACY_GOALS_SCHEMA = """
@@ -91,7 +91,7 @@ async def test_v01_goal_schema_migrates_without_losing_stored_fields(tmp_path: P
 
     store = SqliteStore(path)
     try:
-        assert await store.schema_version() == 7
+        assert await store.schema_version() == CURRENT_SCHEMA_VERSION
 
         root = await store.load_goal("legacy-run", "g.root")
         child = await store.load_goal("legacy-run", "g.child")
@@ -211,7 +211,7 @@ async def test_v5_global_command_idempotency_migrates_to_run_scope(
             }
         assert ("run_id", "idempotency_key") in unique_columns
         assert ("idempotency_key",) not in unique_columns
-        assert await migrated.schema_version() == 7
+        assert await migrated.schema_version() == CURRENT_SCHEMA_VERSION
     finally:
         await migrated.close()
 
@@ -309,7 +309,7 @@ async def test_startup_repairs_requested_events_for_every_legacy_run_status(
 
     repaired = SqliteStore(path)
     try:
-        assert await repaired.schema_version() == 7
+        assert await repaired.schema_version() == CURRENT_SCHEMA_VERSION
         first = await repaired.list_all_events(limit=100)
         requested = [event for event in first if event.type == "hitl.requested"]
         assert {event.id for event in requested} == {
@@ -321,7 +321,7 @@ async def test_startup_repairs_requested_events_for_every_legacy_run_status(
 
     reopened = SqliteStore(path)
     try:
-        assert await reopened.schema_version() == 7
+        assert await reopened.schema_version() == CURRENT_SCHEMA_VERSION
         second = [
             event for event in await reopened.list_all_events(limit=100)
             if event.type == "hitl.requested"
@@ -390,7 +390,10 @@ async def test_migration_links_only_unambiguous_unresolved_paused_hitl(
     )
     await legacy.close()
     with sqlite3.connect(path) as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version=7")
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version=?",
+            (CURRENT_SCHEMA_VERSION,),
+        )
 
     migrated = SqliteStore(path)
     try:

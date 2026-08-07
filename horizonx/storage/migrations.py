@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 _REQUIRED_GOAL_COLUMNS = {
     "run_id",
@@ -313,6 +313,9 @@ def ensure_additive_schema(conn: sqlite3.Connection) -> None:
                 digest_is_unique = True
                 break
         if digest_is_unique:
+            # SQLite keeps a named index attached to the renamed legacy table.
+            # Drop it first so the rebuilt table receives its playback index.
+            conn.execute("DROP INDEX IF EXISTS idx_graph_snapshots_playback")
             conn.execute("ALTER TABLE graph_snapshots RENAME TO graph_snapshots_v8")
             conn.execute(_LATEST_GRAPH_SNAPSHOTS_SQL)
             conn.execute(

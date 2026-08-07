@@ -341,6 +341,10 @@ async def test_graph_snapshot_migration_removes_legacy_digest_uniqueness(tmp_pat
             "digest TEXT NOT NULL, snapshot TEXT NOT NULL, event_sequence INTEGER, "
             "recorded_at TEXT NOT NULL, PRIMARY KEY (run_id, version), UNIQUE (run_id, digest))"
         )
+        conn.execute(
+            "CREATE INDEX idx_graph_snapshots_playback "
+            "ON graph_snapshots(run_id, event_sequence, version)"
+        )
     store = SqliteStore(db_path)
     with sqlite3.connect(db_path) as conn:
         indexes = conn.execute("PRAGMA index_list(graph_snapshots)").fetchall()
@@ -349,6 +353,7 @@ async def test_graph_snapshot_migration_removes_legacy_digest_uniqueness(tmp_pat
             for index in indexes if index[2]
         }
     assert ("run_id", "digest") not in unique_sets
+    assert "idx_graph_snapshots_playback" in {index[1] for index in indexes}
     await store.close()
 
 
