@@ -203,8 +203,23 @@
     <!-- 3-column grid -->
     <div class="run-detail-grid" style="flex:1;min-height:0;">
 
-      <!-- COL 1: Sessions + Steps -->
+      <!-- COL 1: Durable timeline + sessions + steps -->
       <div class="panel-col">
+        <div class="card timeline-panel" id="timeline-panel">
+          <div class="card-header">
+            <span class="card-header-title">Durable Timeline</span>
+            <span class="timeline-status" id="timeline-status">Loading…</span>
+          </div>
+          <div class="timeline-events" id="timeline-events" role="listbox"
+               aria-label="Run timeline" aria-busy="true">
+            <div class="empty-state timeline-empty"><div class="spinner"></div></div>
+          </div>
+          <div class="timeline-actions">
+            <button class="btn btn-ghost" id="timeline-load-more" onclick="loadMoreTimeline()"
+                    style="display:none;">Load more events</button>
+          </div>
+        </div>
+
         <div class="card" style="flex:0 0 auto;">
           <div class="card-header">
             <span class="card-header-title">Sessions</span>
@@ -256,7 +271,10 @@
               <span class="dag-legend active">▶ active</span>
               <span class="dag-legend pending">○ pending</span>
               <span class="dag-legend failed">✕ failed</span>
+              <span class="timeline-playback-meta" id="timeline-playback-meta">Select an event to replay</span>
               <div style="margin-left:auto;display:flex;gap:6px;">
+                <button class="dag-btn" id="timeline-return-current" onclick="returnToCurrentGraph()"
+                        title="Return to current graph" aria-label="Return to current graph" style="display:none;">↺</button>
                 <button class="dag-btn" onclick="dagZoom(0.15)" title="Zoom in">+</button>
                 <button class="dag-btn" onclick="dagZoom(-0.15)" title="Zoom out">−</button>
                 <button class="dag-btn" onclick="dagFit()" title="Fit">⊡</button>
@@ -282,8 +300,18 @@
         </div>
       </div>
 
-      <!-- COL 3: Metrics / Spin / HITL -->
-      <div class="panel-col">
+      <!-- COL 3: Selected event / Metrics / Spin / HITL -->
+      <div class="panel-col timeline-side-col">
+
+        <div class="card timeline-detail" id="timeline-detail" aria-live="polite">
+          <div class="card-header">
+            <span class="card-header-title">Selected Event</span>
+            <span id="timeline-detail-sequence" class="timeline-detail-sequence">—</span>
+          </div>
+          <div class="timeline-detail-body" id="timeline-detail-body">
+            <div class="empty-state timeline-empty"><p>Select an event to inspect its durable record.</p></div>
+          </div>
+        </div>
 
         <!-- Budget gauge -->
         <div class="card">

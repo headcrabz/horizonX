@@ -8,9 +8,57 @@ const state = {
   currentSessionId: null,
   eventSource: null,
   pollTimer: null,
+  timelineRefreshTimer: null,
+  timelineEvents: [],
+  timelineNextAfter: null,
+  timelineLiveAfter: 0,
+  timelineLatestSequence: 0,
+  timelineSelectedSequence: null,
+  timelineRunStatus: null,
+  runDetailLifecycleRunId: null,
   centerTab: 'stream',
   runsFilter: '',
 };
+
+// Keep named SSE listeners aligned with horizonx.core.event_bus.EventType.
+// Named SSE events bypass EventSource.onmessage, so every durable type belongs here.
+const DASHBOARD_EVENT_TYPES = [
+  'run.started',
+  'run.completed',
+  'run.failed',
+  'run.paused_hitl',
+  'session.started',
+  'session.completed',
+  'session.timeout',
+  'session.stall_nudge',
+  'session.stall_abort',
+  'session.spin_nudge',
+  'session.spin_nudge_unsupported',
+  'step.recorded',
+  'goal.in_progress',
+  'goal.done',
+  'goal.failed',
+  'validator.passed',
+  'validator.failed',
+  'validator.paused',
+  'spin.detected',
+  'strategy.switched',
+  'hitl.requested',
+  'hitl.resolved',
+  'budget.threshold',
+  'summary.created',
+  'fork.created',
+  'fork.merged',
+  'retry.attempted',
+  'goals.re_decomposed',
+  'goals.graph_changed',
+  'budget.velocity_alert',
+  'usage.charged',
+  'attempt.started',
+  'attempt.completed',
+  'attempt.failed',
+  'recovery.planned',
+];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilities
@@ -225,8 +273,9 @@ async function showRunDetail(runId) {
 }
 
 async function loadRunDetailData(runId) {
+  let run;
   try {
-    const run = await api(`/api/runs/${runId}`);
+    run = await api(`/api/runs/${runId}`);
     renderRunHeader(run);
     renderHitlBanner(run);
   } catch (e) {
@@ -234,7 +283,18 @@ async function loadRunDetailData(runId) {
     return;
   }
   loadSessions(runId);
+  state.timelineRunStatus = run.status;
+  renderTimelineStatus();
+  ensureRunDetailLifecycle(runId);
+  const timelineLoaded = await loadTimelinePage(runId, { reset: true });
+  if (!timelineLoaded || state.currentRunId !== runId) return;
   connectEventSource(runId);
+}
+
+function ensureRunDetailLifecycle(runId) {
+  if (state.runDetailLifecycleRunId === runId) return;
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  state.runDetailLifecycleRunId = runId;
   loadSpinReports(runId);
   loadHitlHistory(runId);
 
@@ -243,12 +303,14 @@ async function loadRunDetailData(runId) {
       const run = await api(`/api/runs/${runId}`);
       renderRunHeader(run);
       renderHitlBanner(run);
-      if (['completed','failed','aborted','timed_out'].includes(run.status))
+      state.timelineRunStatus = run.status;
+      renderTimelineStatus();
+      if (['completed','failed','aborted','timed_out','budget_exceeded'].includes(run.status))
         clearInterval(state.pollTimer);
     } catch { /* ignore */ }
   }, 5000);
 
-  setCenterTab(state.centerTab);
+  window.setCenterTab(state.centerTab);
 }
 
 function renderRunHeader(run) {
@@ -304,6 +366,287 @@ function renderHitlBanner(run) {
   const banner = $('hitl-banner');
   if (!banner) return;
   banner.style.display = run.status === 'paused_hitl' ? '' : 'none';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Durable timeline playback
+// ─────────────────────────────────────────────────────────────────────────────
+function deriveTimelineRunState() {
+  const types = new Set(state.timelineEvents.map(event => event.type));
+  if (types.has('fork.created') || types.has('fork.merged')) return 'forked';
+  if (types.has('recovery.planned')) return 'recovered';
+  return null;
+}
+
+function timelineStatusLabel(status, timelineState) {
+  const marker = timelineState === 'forked' ? 'fork lineage'
+    : timelineState === 'recovered' ? 'recovery recorded' : null;
+  if (['completed', 'failed', 'aborted', 'timed_out', 'budget_exceeded'].includes(status))
+    return `Terminal · ${status}${marker ? ` · ${marker}` : ''}`;
+  if (marker) return `${marker[0].toUpperCase()}${marker.slice(1)} · durable events`;
+  if (status === 'running') return 'Live · durable events';
+  return status ? esc(status) : 'Loading…';
+}
+
+function renderTimelineStatus() {
+  const el = $('timeline-status');
+  if (el) el.textContent = timelineStatusLabel(state.timelineRunStatus, deriveTimelineRunState());
+}
+
+function timelineEntitiesSummary(entities = {}) {
+  const labels = [];
+  if (entities.goal_id) labels.push('goal');
+  if (entities.attempt_id) labels.push('attempt');
+  if (entities.session_id) labels.push('session');
+  if (entities.validation_id) labels.push('validation');
+  if (entities.evidence_id) labels.push('evidence');
+  if (entities.hitl_id) labels.push('HITL');
+  if (entities.spin_report_id) labels.push('spin');
+  if (entities.command_id) labels.push('command');
+  return labels.length ? labels.join(' · ') : 'run event';
+}
+
+function timelineEntityId(value) {
+  return typeof value === 'string' && value ? value : null;
+}
+
+function summarizeLiveTimelineEvent(event) {
+  const payload = event.payload || {};
+  return {
+    sequence: event.sequence,
+    id: event.id,
+    type: event.type,
+    timestamp: event.timestamp,
+    entities: {
+      run_id: timelineEntityId(event.run_id) || state.currentRunId,
+      goal_id: timelineEntityId(event.goal_id) || timelineEntityId(payload.goal_id),
+      attempt_id: timelineEntityId(event.attempt_id),
+      session_id: timelineEntityId(event.session_id),
+      validation_id: timelineEntityId(payload.validation_id),
+      evidence_id: timelineEntityId(payload.evidence_id),
+      hitl_id: timelineEntityId(payload.hitl_id) || timelineEntityId(payload.request_id),
+      spin_report_id: timelineEntityId(payload.spin_report_id),
+      command_id: timelineEntityId(payload.command_id),
+    },
+  };
+}
+
+function mergeTimelineEvents(events) {
+  const bySequence = new Map(state.timelineEvents.map(event => [event.sequence, event]));
+  events.forEach(event => {
+    if (!Number.isInteger(event.sequence)) return;
+    const existing = bySequence.get(event.sequence);
+    const entities = { ...(existing?.entities || {}) };
+    Object.entries(event.entities || {}).forEach(([key, value]) => {
+      if (value != null) entities[key] = value;
+    });
+    bySequence.set(event.sequence, { ...existing, ...event, entities });
+  });
+  state.timelineEvents = [...bySequence.values()].sort((a, b) => a.sequence - b.sequence);
+}
+
+function recordLiveTimelineEvent(event) {
+  if (!Number.isInteger(event.sequence)) return;
+  mergeTimelineEvents([summarizeLiveTimelineEvent(event)]);
+  state.timelineLiveAfter = Math.max(state.timelineLiveAfter, event.sequence);
+  state.timelineLatestSequence = Math.max(state.timelineLatestSequence, event.sequence);
+  renderTimelineStatus();
+  renderTimelineEvents();
+}
+
+function timelineEventState(type) {
+  if (type.startsWith('recovery.')) return ' recovery';
+  if (type.startsWith('fork.')) return ' fork';
+  if (type.startsWith('run.') && /completed|failed|aborted|timed_out/.test(type)) return ' terminal';
+  return '';
+}
+
+function renderTimelineEvents() {
+  const container = $('timeline-events');
+  const more = $('timeline-load-more');
+  if (!container) return;
+  container.setAttribute('aria-busy', 'false');
+  if (!state.timelineEvents.length) {
+    container.innerHTML = `<div class="empty-state timeline-empty"><div class="empty-icon">◷</div><p>No durable events recorded yet.</p><p class="timeline-help">This view updates when the run records its first event.</p></div>`;
+  } else {
+    container.innerHTML = state.timelineEvents.map(event => `
+      <button class="timeline-event${timelineEventState(event.type)}${event.sequence === state.timelineSelectedSequence ? ' selected' : ''}"
+              type="button" role="option" aria-selected="${event.sequence === state.timelineSelectedSequence}"
+              data-timeline-sequence="${event.sequence}">
+        <span class="timeline-event-sequence">#${event.sequence}</span>
+        <span class="timeline-event-type">${esc(event.type)}</span>
+        <span class="timeline-event-time">${reltime(event.timestamp)}</span>
+        <span class="timeline-event-entities">${esc(timelineEntitiesSummary(event.entities))}</span>
+      </button>`).join('');
+    container.querySelectorAll('[data-timeline-sequence]').forEach(button => {
+      button.addEventListener('click', () => selectTimelineEvent(Number(button.dataset.timelineSequence)));
+      button.addEventListener('keydown', event => handleTimelineKeydown(event, Number(button.dataset.timelineSequence)));
+    });
+  }
+  if (more) more.style.display = state.timelineNextAfter == null ? 'none' : '';
+}
+
+async function loadTimelinePage(runId, { reset = false, live = false } = {}) {
+  const container = $('timeline-events');
+  if (!runId || !container) return false;
+  if (reset) {
+    state.timelineEvents = [];
+    state.timelineNextAfter = null;
+    state.timelineLiveAfter = 0;
+    state.timelineLatestSequence = 0;
+    state.timelineSelectedSequence = null;
+    container.setAttribute('aria-busy', 'true');
+    container.innerHTML = '<div class="empty-state timeline-empty"><div class="spinner"></div></div>';
+    renderTimelineDetail();
+    renderTimelinePlayback(null);
+  }
+  const after = reset ? 0 : live ? state.timelineLiveAfter : state.timelineNextAfter;
+  if (!reset && after == null) return;
+  try {
+    const page = await api(`/api/runs/${runId}/timeline?after=${after}&limit=100`);
+    if (state.currentRunId !== runId) return;
+    mergeTimelineEvents(page.events);
+    if (reset || !live) state.timelineNextAfter = page.next_after;
+    const latestVisibleSequence = state.timelineEvents.length
+      ? state.timelineEvents[state.timelineEvents.length - 1].sequence : 0;
+    const latestSequence = Number.isInteger(page.latest_sequence)
+      ? page.latest_sequence : latestVisibleSequence;
+    state.timelineLatestSequence = Math.max(state.timelineLatestSequence, latestSequence);
+    state.timelineLiveAfter = Math.max(state.timelineLiveAfter, latestSequence);
+    state.timelineRunStatus = page.run_status;
+    renderTimelineStatus();
+    renderTimelineEvents();
+    return true;
+  } catch (e) {
+    if (state.currentRunId !== runId) return;
+    container.setAttribute('aria-busy', 'false');
+    container.innerHTML = `<div class="timeline-message error"><strong>Timeline unavailable</strong><br>${esc(e.message)}<br><button class="btn btn-ghost" type="button" onclick="retryTimeline('${esc(runId)}')">Retry</button></div>`;
+    const more = $('timeline-load-more'); if (more) more.style.display = 'none';
+    return false;
+  }
+}
+
+window.loadMoreTimeline = () => loadTimelinePage(state.currentRunId);
+window.retryTimeline = async runId => {
+  const loaded = await loadTimelinePage(runId, { reset: true });
+  if (loaded && state.currentRunId === runId) connectEventSource(runId);
+  return loaded;
+};
+
+function renderTimelineDetail(detail = null, error = null) {
+  const body = $('timeline-detail-body');
+  const sequence = $('timeline-detail-sequence');
+  if (!body || !sequence) return;
+  if (error) {
+    sequence.textContent = 'Unavailable';
+    body.innerHTML = `<div class="timeline-message error"><strong>Event detail unavailable</strong><br>${esc(error.message)}</div>`;
+    return;
+  }
+  if (!detail) {
+    sequence.textContent = '—';
+    body.innerHTML = '<div class="empty-state timeline-empty"><p>Select an event to inspect its durable record.</p></div>';
+    return;
+  }
+  sequence.textContent = `#${detail.sequence}`;
+  const entities = Object.entries(detail.entities || {}).filter(([key, value]) => key !== 'run_id' && value);
+  const relationships = entities.length
+    ? entities.map(([key, value]) => `<div class="timeline-entity"><span>${esc(key.replace(/_id$/, '').replace('_', ' '))}</span><code>${esc(value)}</code></div>`).join('')
+    : '<p class="timeline-help">No linked record IDs.</p>';
+  const payload = Object.keys(detail.payload || {}).length
+    ? `<details class="timeline-payload"><summary>Durable payload</summary><pre>${esc(JSON.stringify(detail.payload, null, 2))}</pre></details>`
+    : '<p class="timeline-help">No payload recorded.</p>';
+  body.innerHTML = `
+    <div class="timeline-detail-type">${esc(detail.type)}</div>
+    <div class="timeline-detail-time">${esc(new Date(detail.timestamp).toLocaleString())}</div>
+    <div class="timeline-entities">${relationships}</div>
+    ${payload}`;
+}
+
+function renderTimelinePlayback(playback, error = null) {
+  const meta = $('timeline-playback-meta');
+  const canvas = $('dag-canvas');
+  const returnToCurrent = $('timeline-return-current');
+  if (returnToCurrent)
+    returnToCurrent.style.display = state.timelineSelectedSequence == null ? 'none' : '';
+  if (meta) meta.textContent = error
+    ? 'Playback unavailable'
+    : playback?.graph ? `Graph v${playback.graph_version} · ${String(playback.graph_digest || '').slice(0, 10)}`
+      : playback ? 'No graph at this event' : 'Select an event to replay';
+  if (!canvas || error) {
+    if (canvas && error) canvas.innerHTML = `<div class="timeline-message error">${esc(error.message)}</div>`;
+    return;
+  }
+  if (!playback) {
+    canvas.innerHTML = '<div class="empty-state"><div class="empty-icon">◈</div><p>Select a timeline event to replay its graph state.</p></div>';
+    return;
+  }
+  const nodes = playback.graph?.nodes;
+  if (!nodes) {
+    canvas.innerHTML = '<div class="empty-state"><div class="empty-icon">◈</div><p>No graph had been recorded at this event.</p></div>';
+    return;
+  }
+  renderGoalDAG(Array.isArray(nodes) ? nodes : Object.values(nodes));
+}
+
+async function selectTimelineEvent(sequence) {
+  const runId = state.currentRunId;
+  if (!runId || !Number.isInteger(sequence)) return;
+  state.timelineSelectedSequence = sequence;
+  renderTimelineEvents();
+  setCenterTab('goals');
+  renderTimelineDetail(null);
+  const detailBody = $('timeline-detail-body');
+  if (detailBody) detailBody.innerHTML = '<div class="empty-state timeline-empty"><div class="spinner"></div><p>Loading durable event detail…</p></div>';
+  try {
+    const [detailResult, playbackResult] = await Promise.allSettled([
+      api(`/api/runs/${runId}/timeline/${sequence}`),
+      api(`/api/runs/${runId}/timeline/playback?sequence=${sequence}`),
+    ]);
+    if (state.currentRunId !== runId || state.timelineSelectedSequence !== sequence) return;
+    if (detailResult.status === 'fulfilled') renderTimelineDetail(detailResult.value);
+    else renderTimelineDetail(null, detailResult.reason);
+    if (playbackResult.status === 'fulfilled') renderTimelinePlayback(playbackResult.value);
+    else renderTimelinePlayback(null, playbackResult.reason);
+  } catch (e) {
+    if (state.currentRunId !== runId || state.timelineSelectedSequence !== sequence) return;
+    renderTimelineDetail(null, e);
+    renderTimelinePlayback(null, e);
+  }
+}
+
+window.returnToCurrentGraph = () => {
+  if (!state.currentRunId) return;
+  state.timelineSelectedSequence = null;
+  renderTimelineEvents();
+  renderTimelineDetail();
+  renderTimelineStatus();
+  const meta = $('timeline-playback-meta');
+  if (meta) meta.textContent = 'Current graph';
+  const returnToCurrent = $('timeline-return-current');
+  if (returnToCurrent) returnToCurrent.style.display = 'none';
+  window.setCenterTab('goals');
+};
+
+function handleTimelineKeydown(event, sequence) {
+  const index = state.timelineEvents.findIndex(item => item.sequence === sequence);
+  if (index < 0) return;
+  let target = null;
+  if (event.key === 'ArrowDown') target = state.timelineEvents[index + 1];
+  if (event.key === 'ArrowUp') target = state.timelineEvents[index - 1];
+  if (!target) return;
+  event.preventDefault();
+  selectTimelineEvent(target.sequence);
+  document.querySelector(`[data-timeline-sequence="${target.sequence}"]`)?.focus();
+}
+
+function scheduleTimelineRefresh(sequence) {
+  if (Number.isInteger(sequence))
+    state.timelineLiveAfter = Math.max(state.timelineLiveAfter, sequence);
+  if (!state.currentRunId || state.timelineRefreshTimer) return;
+  state.timelineRefreshTimer = setTimeout(() => {
+    state.timelineRefreshTimer = null;
+    loadTimelinePage(state.currentRunId, { live: true });
+  }, 250);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -418,17 +761,13 @@ function renderSteps(steps) {
 // ─────────────────────────────────────────────────────────────────────────────
 function connectEventSource(runId) {
   if (state.eventSource) state.eventSource.close();
-  state.eventSource = new EventSource(`/api/runs/${runId}/events`);
+  state.eventSource = new EventSource(
+    `/api/runs/${runId}/events?cursor=${state.timelineLatestSequence}`
+  );
   state.eventSource.onmessage = e => appendEvent(JSON.parse(e.data));
-  [
-    'run.started','run.completed','run.failed','run.paused_hitl',
-    'session.started','session.completed','session.timeout',
-    'step.recorded','goal.in_progress','goal.done','goal.failed',
-    'validator.passed','validator.failed','validator.paused',
-    'spin.detected','hitl.requested','hitl.resolved',
-    'budget.threshold','budget.velocity_alert',
-    'goals.re_decomposed','summary.created','retry.attempted',
-  ].forEach(t => state.eventSource.addEventListener(t, e => appendEvent(JSON.parse(e.data))));
+  DASHBOARD_EVENT_TYPES.forEach(t =>
+    state.eventSource.addEventListener(t, e => appendEvent(JSON.parse(e.data)))
+  );
   state.eventSource.onerror = () => {};
 }
 
@@ -440,6 +779,8 @@ function evCls(type) {
 }
 
 function appendEvent(event) {
+  recordLiveTimelineEvent(event);
+  scheduleTimelineRefresh(event.sequence);
   const container = $('panel-stream');
   if (!container) return;
   const el = document.createElement('div');
@@ -454,8 +795,8 @@ function appendEvent(event) {
 
   if (event.type.startsWith('session.') || event.type==='step.recorded')
     if (state.currentRunId) loadSessions(state.currentRunId);
-  if (event.type.startsWith('goal.') || event.type==='goals.re_decomposed')
-    if (state.centerTab==='goals' && state.currentRunId) loadGoals(state.currentRunId);
+  if (event.type.startsWith('goal.') || event.type==='goals.re_decomposed' || event.type==='goals.graph_changed')
+    if (state.centerTab==='goals' && state.currentRunId && state.timelineSelectedSequence == null) loadGoals(state.currentRunId);
   if (event.type.startsWith('validator.'))
     if (state.centerTab==='validations' && state.currentRunId) loadValidations(state.currentRunId);
   if (event.type==='spin.detected' && state.currentRunId)
@@ -480,7 +821,7 @@ window.setCenterTab = tab => {
     const pan = $(`panel-${t}`); if (pan) pan.style.display = t===tab ? (t==='goals' ? 'flex' : '') : 'none';
   });
   if (!state.currentRunId) return;
-  if (tab==='goals')       loadGoals(state.currentRunId);
+  if (tab==='goals' && state.timelineSelectedSequence == null) loadGoals(state.currentRunId);
   if (tab==='validations') loadValidations(state.currentRunId);
 };
 
@@ -1151,8 +1492,16 @@ window.submitLaunch = async () => {
 function clearRunDetail() {
   if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
   if (state.pollTimer)   { clearInterval(state.pollTimer); state.pollTimer = null; }
+  if (state.timelineRefreshTimer) { clearTimeout(state.timelineRefreshTimer); state.timelineRefreshTimer = null; }
   state.currentRunId = null;
   state.currentSessionId = null;
+  state.timelineEvents = [];
+  state.timelineNextAfter = null;
+  state.timelineLiveAfter = 0;
+  state.timelineLatestSequence = 0;
+  state.timelineSelectedSequence = null;
+  state.timelineRunStatus = null;
+  state.runDetailLifecycleRunId = null;
   const ps = $('panel-stream');
   if (ps) ps.innerHTML = '';
 }

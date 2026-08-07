@@ -3354,6 +3354,54 @@ class SqliteStore:
             self._sync_list_event_summaries, run_id, after_sequence, limit
         )
 
+    def _sync_list_event_summaries_with_high_water(
+        self, run_id: str, after_sequence: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Read one page and its SSE cursor from the same SQLite snapshot."""
+        with self._conn() as c:
+            c.execute("BEGIN")
+            rows = c.execute(
+                "SELECT sequence, id, type, run_id, attempt_id, session_id, "
+                "COALESCE(goal_id, json_extract(payload, '$.goal_id')) AS goal_id, timestamp, "
+                "json_extract(payload, '$.validation_id') AS validation_id, "
+                "json_extract(payload, '$.evidence_id') AS evidence_id, "
+                "COALESCE(json_extract(payload, '$.hitl_id'), "
+                "json_extract(payload, '$.request_id')) AS hitl_id, "
+                "json_extract(payload, '$.spin_report_id') AS spin_report_id, "
+                "json_extract(payload, '$.command_id') AS command_id "
+                "FROM events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?",
+                (run_id, after_sequence, limit),
+            ).fetchall()
+            high_water = c.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS latest_sequence "
+                "FROM events WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        return [dict(row) for row in rows], int(high_water["latest_sequence"])
+
+    async def list_event_summaries_with_high_water(
+        self, run_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> tuple[list[dict[str, Any]], int]:
+        return await self._run_sync(
+            self._sync_list_event_summaries_with_high_water,
+            run_id,
+            after_sequence,
+            limit,
+        )
+
+    def _sync_latest_event_sequence(self, run_id: str) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS latest_sequence "
+                "FROM events WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        return int(row["latest_sequence"])
+
+    async def latest_event_sequence(self, run_id: str) -> int:
+        """Return a run's durable event high-water without reading event payloads."""
+        return await self._run_sync(self._sync_latest_event_sequence, run_id)
+
     def _sync_get_event(self, run_id: str, sequence: int) -> Any | None:
         from horizonx.core.event_bus import Event
 

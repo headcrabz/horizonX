@@ -291,6 +291,81 @@ button:focus { outline: none; }
   overflow: hidden; min-height: 0; height: 100%;
 }
 
+.timeline-panel {
+  flex: 0 0 260px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.timeline-status,
+.timeline-detail-sequence,
+.timeline-playback-meta {
+  margin-left: auto;
+  color: var(--faint);
+  font-family: monospace;
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.timeline-playback-meta { margin-left: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.timeline-events {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.timeline-event {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  column-gap: 7px;
+  text-align: left;
+  padding: 7px 10px;
+  border-left: 2px solid transparent;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+.timeline-event:hover,
+.timeline-event:focus-visible { background: var(--surface2); }
+.timeline-event.selected { background: rgba(99,102,241,0.12); border-left-color: var(--accent); }
+.timeline-event.recovery { border-left-color: var(--yellow); }
+.timeline-event.recovery .timeline-event-type { color: var(--yellow); }
+.timeline-event.fork { border-left-color: var(--purple); }
+.timeline-event.fork .timeline-event-type { color: var(--purple); }
+.timeline-event.terminal { border-left-color: var(--green); }
+.timeline-event.terminal .timeline-event-type { color: var(--green); }
+.timeline-event-sequence { color: var(--faint); font: 10.5px monospace; align-self: center; }
+.timeline-event-type { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 600 11.5px monospace; color: var(--accent-lt); }
+.timeline-event-time { color: var(--faint); font-size: 10.5px; white-space: nowrap; }
+.timeline-event-entities { grid-column: 2 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 10.5px; }
+
+.timeline-actions { display: flex; justify-content: center; padding: 7px; border-top: 1px solid var(--border); }
+.timeline-actions .btn { font-size: 11px; padding: 4px 9px; }
+.timeline-empty { padding: 20px 12px; }
+.timeline-help { color: var(--faint); font-size: 11px; margin-top: 5px; }
+
+.timeline-side-col { overflow-y: auto; padding-right: 2px; }
+.timeline-side-col > .card { flex-shrink: 0; }
+.timeline-detail { flex: 0 0 auto; }
+.timeline-detail-body { padding: 11px 13px; max-height: 260px; overflow-y: auto; }
+.timeline-detail-type { font: 700 12px monospace; color: var(--accent-lt); overflow-wrap: anywhere; }
+.timeline-detail-time { margin-top: 3px; color: var(--faint); font-size: 10.5px; }
+.timeline-entities { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 5px; }
+.timeline-entity { display: flex; gap: 8px; justify-content: space-between; padding: 4px 0; font-size: 11px; }
+.timeline-entity span { color: var(--faint); text-transform: capitalize; }
+.timeline-entity code { max-width: 65%; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+.timeline-payload { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; color: var(--muted); font-size: 11px; }
+.timeline-payload summary { cursor: pointer; color: var(--accent-lt); }
+.timeline-payload pre { margin-top: 7px; max-height: 160px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--faint); font: 10.5px/1.45 monospace; }
+.timeline-message { padding: 14px; color: var(--muted); font-size: 12px; }
+.timeline-message.error { color: var(--red); }
+.timeline-message .btn { margin-top: 9px; }
+
 /* ── HITL banner ─────────────────────────────────── */
 .hitl-banner {
   border: 1px solid rgba(245,158,11,0.4);

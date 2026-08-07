@@ -460,6 +460,56 @@ async def test_timeline_next_after_requires_an_additional_event(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_timeline_page_exposes_durable_high_water_beyond_current_page(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "timeline.db")
+    run = Run(
+        id="high-water-run", task=_task(), workspace_path=tmp_path / "high-water", status=RunStatus.RUNNING
+    )
+    await store.save_run(run)
+    for _ in range(1_000):
+        await store.append_event(Event(type="step.recorded", run_id=run.id))
+
+    page = await TimelineProjection(store).page(run.id, after=0, limit=100)
+    empty = await TimelineProjection(store).page(run.id, after=0, limit=100)
+    empty_run = Run(
+        id="empty-timeline-run", task=_task(), workspace_path=tmp_path / "empty", status=RunStatus.RUNNING
+    )
+    await store.save_run(empty_run)
+    empty_page = await TimelineProjection(store).page(empty_run.id, after=0, limit=100)
+
+    assert page.next_after == 100
+    assert page.latest_sequence == 1_000
+    assert empty.latest_sequence == 1_000
+    assert empty_page.latest_sequence == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_timeline_page_high_water_is_a_safe_sse_boundary(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "timeline.db")
+    run = Run(
+        id="atomic-high-water-run", task=_task(), workspace_path=tmp_path / "atomic", status=RunStatus.RUNNING
+    )
+    await store.save_run(run)
+    for _ in range(100):
+        await store.append_event(Event(type="step.recorded", run_id=run.id))
+
+    rows, high_water = await store.list_event_summaries_with_high_water(
+        run.id, after_sequence=0, limit=100
+    )
+    appended = await store.append_event(Event(type="step.recorded", run_id=run.id))
+    after_boundary = await store.list_event_summaries(
+        run.id, after_sequence=high_water, limit=100
+    )
+
+    assert len(rows) == 100
+    assert high_water == 100
+    assert rows[-1]["sequence"] == high_water
+    assert [row["sequence"] for row in after_boundary] == [appended.sequence]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_real_hitl_resolution_and_operator_command_are_linked(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "timeline.db")
     run = await _seed(store, tmp_path)

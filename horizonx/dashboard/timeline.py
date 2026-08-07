@@ -36,6 +36,7 @@ class TimelinePage(BaseModel):
     run_status: str
     events: list[TimelineEventSummary]
     next_after: int | None = None
+    latest_sequence: int = 0
 
 
 class TimelineEventDetail(BaseModel):
@@ -80,7 +81,7 @@ class TimelineProjection:
 
     async def page(self, run_id: str, *, after: int, limit: int) -> TimelinePage:
         status = await self._run_status(run_id)
-        rows = await self.store.list_event_summaries(
+        rows, latest_sequence = await self.store.list_event_summaries_with_high_water(
             run_id, after_sequence=after, limit=limit + 1
         )
         has_more = len(rows) > limit
@@ -95,6 +96,7 @@ class TimelineProjection:
         return TimelinePage(
             run_id=run_id, run_status=status, events=events,
             next_after=events[-1].sequence if has_more and events else None,
+            latest_sequence=latest_sequence,
         )
 
     async def event_detail(self, run_id: str, sequence: int) -> TimelineEventDetail:
