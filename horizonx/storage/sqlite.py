@@ -1376,7 +1376,8 @@ class SqliteStore:
     ) -> dict[str, Any] | None:
         row = c.execute(
             "SELECT version, digest, snapshot, event_sequence FROM graph_snapshots "
-            "WHERE run_id=? ORDER BY version DESC LIMIT 1",
+            "WHERE run_id=? AND event_sequence IS NOT NULL "
+            "ORDER BY version DESC LIMIT 1",
             (run_id,),
         ).fetchone()
         if row is None:
@@ -1472,20 +1473,30 @@ class SqliteStore:
         after_snapshot, after_digest = self._graph_snapshot(after)
         if before is None and latest is not None:
             raise StoreError("graph mutation has no durable snapshot baseline")
-        if before is not None and latest is None:
-            raise StoreError("existing graph has no durable snapshot baseline")
         if latest is not None and before_digest != latest["digest"]:
             raise StoreError("graph mutation is not based on the latest durable snapshot")
         if before is not None and before_digest == after_digest:
             return None
+        if latest is None:
+            # Legacy snapshots without an event sequence cannot be replayed.
+            # Discard them as the first real graph mutation establishes v1.
+            c.execute(
+                "DELETE FROM graph_snapshots "
+                "WHERE run_id=? AND event_sequence IS NULL",
+                (run_id,),
+            )
+        # A pre-GE04 durable graph has no replayable baseline. Its first real
+        # mutation establishes version 1 at this event, with no invented
+        # before state; prior playback therefore remains graphless.
         before_version = latest["version"] if latest is not None else None
+        payload_before_digest = before_digest if latest is not None else None
         after_version = (int(before_version) if before_version is not None else 0) + 1
         graph_event = event or Event(type="goals.graph_changed", run_id=run_id)
         payload = dict(graph_event.payload)
         payload.update(
             {
                 "graph_before_version": before_version,
-                "graph_before_digest": before_digest,
+                "graph_before_digest": payload_before_digest,
                 "graph_after_version": after_version,
                 "graph_after_digest": after_digest,
             }

@@ -215,18 +215,37 @@ async def test_public_save_goal_creates_initial_graph_event_and_snapshot(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_redecomposition_rejects_existing_graph_without_snapshot_baseline(tmp_path: Path) -> None:
+async def test_legacy_graph_without_snapshots_resumes_at_first_real_mutation(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "timeline.db")
     run = await _seed(store, tmp_path)
     with store._conn() as connection:
         connection.execute("DELETE FROM graph_snapshots WHERE run_id=?", (run.id,))
-    graph = await store.load_graph(run.id)
-    assert graph is not None
-
-    with pytest.raises(StoreError, match="no durable snapshot baseline"):
-        await store.replace_pending_subgraph_and_append_event(
-            run.id, graph, Event(type="goals.re_decomposed", run_id=run.id)
+        connection.execute(
+            "DELETE FROM events WHERE run_id=? AND type='goals.graph_changed'", (run.id,)
         )
+    legacy_graph = await store.load_graph(run.id)
+    assert legacy_graph is not None
+    snapshot, digest = store._graph_snapshot(legacy_graph)
+    with store._conn() as connection:
+        connection.execute(
+            "INSERT INTO graph_snapshots "
+            "(run_id, version, digest, snapshot, event_sequence, recorded_at) "
+            "VALUES (?, 1, ?, ?, NULL, ?)",
+            (run.id, digest, snapshot, "2026-01-01T00:00:00+00:00"),
+        )
+    before_mutation = await store.append_event(Event(type="run.started", run_id=run.id))
+
+    assert await store.claim_goal(run.id, "g.root", "resumed-session") is True
+    [mutation] = await store.list_events(run.id, event_type="goals.graph_changed")
+    projection = TimelineProjection(store)
+    before = await projection.playback(run.id, sequence=before_mutation.sequence or 0)
+    after = await projection.playback(run.id, sequence=mutation.sequence or 0)
+
+    assert mutation.payload["graph_before_version"] is None
+    assert mutation.payload["graph_before_digest"] is None
+    assert mutation.payload["graph_after_version"] == 1
+    assert before.graph is None
+    assert after.graph and after.graph["nodes"]["g.root"]["status"] == "in_progress"
 
     await store.close()
 
